@@ -906,6 +906,8 @@ class Collection {
     for (const [, index] of this._indexes) index.add(newDoc);
     this._dirty = true;
     this._dirtyIds.add(newDoc._id);
+    // Emit watch event
+    if (this._store?._emit) this._store._emit(this.name, { type: 'insert', doc: newDoc, collection: this._name });
     return _clone(newDoc);
   }
 
@@ -1081,6 +1083,7 @@ class Collection {
     for (const [, index] of this._indexes) index.add(newDoc);
     this._dirty = true;
     this._dirtyIds.add(id);
+    if (this._store?._emit) this._store._emit(this.name, { type: 'update', doc: newDoc, collection: this._name });
     return 1;
   }
 
@@ -1110,7 +1113,8 @@ class Collection {
     for (const [, index] of this._indexes) index.remove(doc);
     this._docs.delete(id);
     this._dirty = true;
-    this._dirtyIds.add(id); // track deletion
+    this._dirtyIds.add(id);
+    if (this._store?._emit) this._store._emit(this.name, { type: 'delete', doc, collection: this._name });
     return 1;
   }
 
@@ -1189,6 +1193,20 @@ class DocStore {
       ? new FileStorageAdapter(dirOrAdapter)
       : dirOrAdapter;
     this._collections = new Map();
+    this._watchers = new Map(); // collection name -> Set<callback>
+
+    // Proxy: db.users === db.collection('users')
+    return new Proxy(this, {
+      get(target, prop, receiver) {
+        // Known properties/methods — pass through
+        if (prop in target || typeof prop === 'symbol') return Reflect.get(target, prop, receiver);
+        // Proxy access: db.users -> db.collection('users')
+        return target.collection(prop);
+      },
+      has(target, prop) {
+        return prop in target || target._collections.has(prop);
+      },
+    });
   }
 
   collection(name) {
@@ -1202,7 +1220,6 @@ class DocStore {
     const col = this._collections.get(name);
     if (col) {
       col._ensureLoaded();
-      // Delete all files
       this._adapter.delete(col._dataFile());
       this._adapter.delete(col._metaFile());
       for (const [field, index] of col._indexes) {
@@ -1219,6 +1236,31 @@ class DocStore {
 
   flush() {
     for (const [, col] of this._collections) col.flush();
+  }
+
+  // ─── WATCH (reactive observation) ─────────────────────────
+
+  /**
+   * Watch a collection for changes.
+   * @param {string} collectionName
+   * @param {Function} callback - (event) => void, event: { type: 'insert'|'update'|'delete', doc, collection }
+   * @returns {Function} unsubscribe
+   */
+  watch(collectionName, callback) {
+    if (!this._watchers.has(collectionName)) {
+      this._watchers.set(collectionName, new Set());
+    }
+    this._watchers.get(collectionName).add(callback);
+    return () => this._watchers.get(collectionName)?.delete(callback);
+  }
+
+  /** Emit a change event (called internally by Collection) */
+  _emit(collectionName, event) {
+    const watchers = this._watchers.get(collectionName);
+    if (!watchers) return;
+    for (const cb of watchers) {
+      try { cb(event); } catch {}
+    }
   }
 }
 
