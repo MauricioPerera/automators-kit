@@ -14,6 +14,8 @@ import { termRoutes } from './routes/terms.js';
 import { userRoutes } from './routes/users.js';
 import { schemaRoutes } from './routes/schema.js';
 import { a2eRoutes } from './routes/a2e.js';
+import { workflowRoutes } from './routes/workflows.js';
+import { WorkflowEngine } from './core/workflow.js';
 
 /**
  * Create a fully configured CMS application.
@@ -73,6 +75,13 @@ export async function createApp(opts = {}) {
   router.route('/api/schema', schemaRoutes(cms));
   router.route('/api/a2e', a2eRoutes(cms));
 
+  // Workflow engine (n8n-style)
+  const workflowEngine = new WorkflowEngine(cms.db, {
+    masterKey: opts.secret || 'akit-dev-secret',
+  });
+  await workflowEngine.init();
+  router.route('/api/workflows', workflowRoutes(cms, workflowEngine));
+
   // 5. Load plugins
   if (opts.plugins) {
     await loadPlugins(cms, opts.plugins, hooks, pluginRegistry, routeRegistry);
@@ -109,7 +118,10 @@ export async function createApp(opts = {}) {
   // Execute system:ready hook
   await hooks.execute('system:ready', {});
 
-  return { handle: router.handle, cms, router };
+  // Start workflow triggers
+  workflowEngine.start();
+
+  return { handle: router.handle, cms, router, workflowEngine };
 }
 
 // Re-export core modules for library usage
@@ -127,3 +139,7 @@ export { Connector, ConnectorError, slack, discord, restApi, apiKey } from './co
 export { WorkflowExecutor, AuditMiddleware, CacheMiddleware, HANDLERS as A2E_HANDLERS } from './core/a2e.js';
 export { HNSWIndex } from './core/hnsw.js';
 export { AgentMemory, MemoryType, TaskOutcome } from './core/memory.js';
+export { WorkflowEngine } from './core/workflow.js';
+export { NodeRegistry, BUILTIN_NODES } from './core/nodes.js';
+export { TriggerManager, TriggerType } from './core/triggers.js';
+export { CredentialVault } from './core/credentials.js';
