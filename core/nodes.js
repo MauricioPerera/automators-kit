@@ -58,6 +58,39 @@ export class NodeRegistry {
   }
 
   /**
+   * Export all nodes as ARDF descriptors.
+   * @returns {Array<object>}
+   */
+  toARDF() {
+    return this.list().map(n => ({
+      schema_version: '1.0.0',
+      resource_id: n.type,
+      resource_type: 'tool',
+      description: n.description || '',
+      when_to_use: `Use ${n.name || n.type} in workflow automation`,
+      content: {
+        type: 'tool/io',
+        data: {
+          inputs: (n.inputs || []).map(i => ({
+            name: i.name, type: i.type || 'any',
+            required: !!i.required,
+            ...(i.default !== undefined ? { default: i.default } : {}),
+          })),
+          outputs: {
+            success: `${n.type} completed`,
+          },
+        },
+      },
+      metadata: {
+        category: n.category || 'general',
+        tags: [n.category, n.type.split('.')[0]].filter(Boolean),
+        maturity: 'stable',
+      },
+      ...(n.credentials ? { prerequisites: { credentials: n.credentials } } : {}),
+    }));
+  }
+
+  /**
    * Execute a node.
    * @param {string} type - Node type
    * @param {object} inputs - Input values

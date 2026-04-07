@@ -279,6 +279,68 @@ export class CommandRegistry {
 
   /** Count commands */
   get size() { return this._commands.size; }
+
+  /**
+   * Export all commands as ARDF descriptors (Agent Resource Description Format).
+   * Compatible with https://ardf.io/schema/v1
+   * @returns {Array<object>}
+   */
+  toARDF() {
+    return this.list().map(def => ({
+      schema_version: '1.0.0',
+      resource_id: def.id,
+      resource_type: 'tool',
+      description: def.description || '',
+      when_to_use: def.when_to_use || `Use when you need to ${def.description?.toLowerCase() || def.id}`,
+      content: {
+        type: 'tool/io',
+        data: {
+          inputs: (def.params || []).map(p => ({
+            name: p.name,
+            type: p.type || 'string',
+            description: p.description || '',
+            required: !!p.required,
+            ...(p.default !== undefined ? { default: p.default } : {}),
+          })),
+          outputs: {
+            success: `${def.id} executed successfully`,
+          },
+        },
+      },
+      metadata: {
+        version: def.version || '1.0.0',
+        category: def.category || def.namespace || 'general',
+        tags: def.tags || [def.namespace, def.name].filter(Boolean),
+        maturity: 'stable',
+      },
+      ...(def.example ? { examples: [{ name: 'default', input: {}, narrative: def.example }] } : {}),
+    }));
+  }
+
+  /**
+   * Import ARDF descriptors and register as commands.
+   * @param {Array<object>} descriptors - ARDF descriptors
+   * @param {Function} handlerFactory - (descriptor) => async handler function
+   */
+  fromARDF(descriptors, handlerFactory) {
+    for (const desc of descriptors) {
+      if (desc.resource_type !== 'tool') continue;
+      const [ns, name] = (desc.resource_id || '').includes(':')
+        ? desc.resource_id.split(':')
+        : ['imported', desc.resource_id];
+
+      const inputs = desc.content?.data?.inputs || [];
+      this.register(ns, name, {
+        description: desc.description,
+        when_to_use: desc.when_to_use,
+        params: inputs.map(i => ({ name: i.name, type: i.type, required: i.required, default: i.default })),
+        tags: desc.metadata?.tags || [],
+        category: desc.metadata?.category,
+        version: desc.metadata?.version,
+      }, handlerFactory ? handlerFactory(desc) : async () => ({ error: 'No handler provided' }));
+    }
+    return this;
+  }
 }
 
 // ---------------------------------------------------------------------------
