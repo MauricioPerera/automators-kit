@@ -1,14 +1,14 @@
 # AGENTS.md - Automators Kit
 
-Zero-dependency hackeable toolkit: CMS + automation engine + A2E workflow executor + agent memory.
-By automators.work | 189 tests | 0 deps | 13.6K lines
+Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
+By automators.work | 263 tests | 0 deps | 16K lines | 19 core modules
 
 ## Architecture
 
 ```
-Core (14 modules, zero deps, vanilla JS, multi-runtime: Bun/Deno/Node.js)
+Core (19 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
 
-db.js              Document DB: MongoDB queries, indices, auth (JWT), encryption (AES-256-GCM)
+db.js              Document DB: MongoDB queries, indices, JWT auth, AES-256-GCM encryption
 vector.js          Vector DB: Float32/Int8/Polar3bit/Binary, IVF, Matryoshka, BM25
 hnsw.js            HNSW index: O(log n) approximate nearest neighbor search
 http.js            HTTP router: Request/Response, middleware, params, sub-routers, CORS
@@ -18,6 +18,11 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history
+nodes.js           Node registry: 20 built-in nodes (core, communication, data, AI)
+triggers.js        Trigger system: manual, webhook, cron, polling with change detection
+credentials.js     Credential vault: AES-256-GCM encrypted storage
+shell.js           Agent shell: command gateway, parser, pipeline, JQ filter, RBAC
 queue.js           Job queue: async, retries, backoff, dead letter, concurrency
 cron.js            Cron scheduler: 5-field expressions, tick, enable/disable
 connector.js       HTTP client: auth presets, retries, timeout (Slack/Discord/REST)
@@ -28,7 +33,7 @@ memory.js          Agent memory: semantic + episodic + working, recall with deca
 
 ```bash
 bun seed.js              # create admin + default content types
-bun server-bun.js        # start API server
+bun server-bun.js        # start API at http://localhost:3000
 bun mcp.js               # start MCP server (stdio)
 bun cli.js help          # CLI reference
 ```
@@ -57,7 +62,6 @@ bun cli.js entries list --type post
 bun cli.js entries create --type post --title "Hello" --json '{"body":"Content"}'
 bun cli.js entries publish --id ID
 bun cli.js content-types list
-bun cli.js content-types create --name Product --slug product --fields-json '[{"name":"price","type":"number"}]'
 bun cli.js taxonomies list
 bun cli.js terms list --taxonomy category
 bun cli.js users list
@@ -99,46 +103,101 @@ bun cli.js seed --file seed.json
 - GET/PUT/DELETE /api/users[/:id]
 
 ### A2E Workflows
-- POST /api/a2e/execute - execute workflow
+- POST /api/a2e/execute - execute A2E workflow
 - POST /api/a2e/validate - validate without executing
 - GET /api/a2e/operations - list 19 operations
 
-## A2E Workflow Executor
+### Workflow Engine (n8n-style)
+- POST /api/workflows - create workflow
+- GET /api/workflows - list
+- PUT /api/workflows/:id - update
+- DELETE /api/workflows/:id - delete
+- POST /api/workflows/:id/run - execute manually
+- POST /api/workflows/:id/toggle - activate/deactivate
+- GET /api/workflows/:id/executions - execution history
+- POST /api/workflows/webhook/:path - trigger via webhook
+- GET /api/workflows/nodes/list - available nodes
+- POST /api/workflows/credentials - store encrypted credentials
+- GET /api/workflows/credentials - list (no decryption)
 
-Agent-to-Execution protocol. Agents describe WHAT, executor handles HOW.
+### Agent Shell (command gateway)
+- POST /api/shell/exec - execute command string
+- GET /api/shell/help - interaction protocol
+- GET /api/shell/commands - list registered commands
+- GET /api/shell/signatures - AI-optimized format
+- GET /api/shell/describe/:id - command definition
+- GET /api/shell/history - command history
+- GET/POST /api/shell/context - session context
 
-### Compact JSON format
+## Agent Shell
 
-```json
-{
-  "operations": [
-    { "id": "data", "op": "SetData", "value": [{"name":"Alice","age":30}] },
-    { "id": "adults", "op": "FilterData", "input": "data", "conditions": [{"field":"age","operator":">=","value":18}] },
-    { "id": "sorted", "op": "TransformData", "input": "adults", "transform": "sort", "field": "age" }
-  ],
-  "execute": "data"
-}
+AI-first command gateway. 2 MCP tools = ~600 constant tokens regardless of command count.
+
+```javascript
+import { Shell } from './core/shell.js';
+const shell = new Shell();
+
+shell.registry.register('users', 'list', {
+  description: 'List users',
+  params: [{ name: 'limit', type: 'number', default: 50 }],
+}, async (args) => db.find({}).limit(args.limit).toArray());
+
+await shell.exec('users:list --limit 10');           // execute
+await shell.exec('users:list | .[0].name');           // JQ filter
+await shell.exec('users:list >> json:filter --expression ".active"'); // pipeline
+await shell.exec('batch [users:count, orders:count]'); // parallel
+await shell.exec('users:list --dry-run');              // simulate
+await shell.exec('search create user');                // discover
+await shell.exec('describe users:list');               // definition
 ```
 
-### 19 Operations
+RBAC profiles: admin (full), operator (CRUD+shell+http), reader (read-only), restricted (public only)
 
-API: ApiCall, ExecuteN8nWorkflow
-Data: SetData, FilterData, TransformData, MergeData, StoreData
-DateTime: DateTime (now/convert/calculate), GetCurrentDateTime, ConvertTimezone, DateCalculation
-Text: FormatText (upper/lower/title/template/replace), ExtractText (regex)
-Validation: ValidateData (email/url/number/phone/date/custom)
-Math: Calculate (add/subtract/multiply/divide/sum/average/round/ceil/floor/abs/max/min)
-Encoding: EncodeDecode (base64/url/html)
-Flow: Conditional (if/else), Loop (iterate), Wait (delay)
+## Workflow Engine (n8n-style)
 
-### Execution model
+```javascript
+import { WorkflowEngine } from './core/workflow.js';
+const engine = new WorkflowEngine(db, { masterKey: 'secret' });
+await engine.init();
 
-- DAG parallel: dependency levels run via Promise.all
-- Sequential fallback on cycles
-- onError fallback: transparent to downstream
-- Data model: /workflow/key, /store/key, /loop/current
-- Middleware: AuditMiddleware, CacheMiddleware
-- Custom handlers: executor.registerHandler('MyOp', fn)
+engine.create({
+  name: 'Notify on publish',
+  trigger: { type: 'webhook', config: { path: 'on-publish' } },
+  nodes: [
+    { id: 'msg', type: 'text.template', inputs: { template: 'Published: {{_trigger.title}}', data: '{{_trigger}}' } },
+    { id: 'send', type: 'slack.send', inputs: { message: '{{msg}}' }, credentials: 'slack' },
+  ],
+});
+
+await engine.run(workflowId, { title: 'My Post' });
+```
+
+### 20 Built-in Nodes
+
+Core: http.request, code.run, set.value, filter, merge, wait, if
+Communication: slack.send, discord.send, email.send
+Data: json.parse, json.stringify, text.template, base64.encode, base64.decode, math.calc, datetime.now
+AI: openai.chat, anthropic.chat
+
+Custom nodes: `engine.nodes.add({ type: 'my.node', handler: async (inputs, creds) => ... })`
+
+### Triggers
+- manual: `engine.run(id, data)`
+- webhook: `POST /api/workflows/webhook/:path`
+- cron: `{ type: 'cron', config: { expression: '0 9 * * *' } }`
+- poll: `{ type: 'poll', config: { url: '...', interval: 60000 } }`
+
+### Credential Vault
+```javascript
+await engine.vault.store('slack', { webhookUrl: 'https://hooks.slack.com/...' });
+// Encrypted with AES-256-GCM, decrypted only at execution time
+```
+
+## A2E Workflow Executor
+
+19 operations: SetData, FilterData, TransformData, MergeData, StoreData, ApiCall, ExecuteN8nWorkflow, DateTime, GetCurrentDateTime, ConvertTimezone, DateCalculation, FormatText, ExtractText, ValidateData, Calculate, EncodeDecode, Conditional, Loop, Wait
+
+DAG parallel execution, onError fallback, middleware (audit, cache), custom handlers.
 
 ```javascript
 import { WorkflowExecutor } from './core/a2e.js';
@@ -149,193 +208,75 @@ const result = await ex.execute();
 
 ## HNSW Index
 
-Approximate nearest neighbor search in O(log n). Ported from minimemory (Rust).
-
 ```javascript
 import { HNSWIndex } from './core/hnsw.js';
-
-const hnsw = new HNSWIndex({ m: 16, efConstruction: 200, efSearch: 50, metric: 'cosine' });
+const hnsw = new HNSWIndex({ m: 16, efConstruction: 200, efSearch: 50 });
 hnsw.add('doc-1', embedding);
-hnsw.add('doc-2', embedding2);
-
 const results = hnsw.search(queryVector, 10);
-// [{ id: 'doc-1', score: 0.95, distance: 0.05 }, ...]
-
-hnsw.remove('doc-1');
-hnsw.setEfSearch(100); // higher = better recall, slower
-hnsw.stats(); // { count, levels, m, efSearch, entryPoint }
+// [{ id, score, distance }]
 ```
-
-Parameters:
-- m: connections per node (default 16). Higher = better recall, more memory
-- efConstruction: beam width during build (default 200). Higher = better graph
-- efSearch: beam width during search (default 50). Tunable at runtime
-- metric: 'cosine' or 'euclidean'
 
 ## Agent Memory
 
-Semantic + episodic + working memory for AI agents. Ported from minimemory (Rust).
-
 ```javascript
-import { AgentMemory, TaskOutcome } from './core/memory.js';
-import { DocStore, MemoryStorageAdapter } from './core/db.js';
-
-const db = new DocStore(new MemoryStorageAdapter());
+import { AgentMemory } from './core/memory.js';
 const mem = new AgentMemory(db);
-```
 
-### Episodic (task experiences)
+mem.learnTask({ task: 'Implement auth', outcome: 'success', learnings: ['Use Web Crypto'] });
+mem.storeSnippet({ code: '...', description: 'JWT signing', language: 'javascript' });
+mem.storeError({ error: 'Token expired', solution: 'Check exp claim' });
 
-```javascript
-mem.learnTask({
-  task: 'Implement JWT auth',
-  outcome: TaskOutcome.SUCCESS,
-  learnings: ['Use Web Crypto API', 'HMAC-SHA256 for signing'],
-  code: 'async function sign(payload) { ... }',
-  language: 'javascript',
-  project: 'automators-kit',
-  tags: ['auth', 'security'],
-});
+mem.recall('authentication JWT');        // search with time decay + access boost
+mem.recallError('token expired');        // find similar errors
+mem.recallSnippets('hashing', 'javascript');
 
-mem.getEpisodes('success');
-mem.getProjectEpisodes('automators-kit');
-```
-
-### Semantic (knowledge)
-
-```javascript
-mem.storeSnippet({ code: '...', description: 'SHA-256 hashing', language: 'javascript' });
-mem.storeApiKnowledge({ library: 'Web Crypto', function: 'subtle.sign', description: '...' });
-mem.storeError({ error: 'Token expired', solution: 'Check exp claim', language: 'javascript' });
-mem.storePattern({ name: 'Builder', description: 'Fluent API', language: 'javascript' });
-mem.storeDoc({ title: 'HNSW Algorithm', content: '...' });
-```
-
-### Recall (search with time decay)
-
-```javascript
-mem.recall('authentication JWT');           // search all memories
-mem.recallError('token expired');           // find similar errors
-mem.recallSnippets('hashing', 'javascript'); // find code snippets
-mem.recallExperiences('build auth system');  // find past tasks
-```
-
-Recall features:
-- Keyword matching across all memory fields
-- Time decay: older memories score lower (configurable rate)
-- Access boost: frequently accessed memories rank higher
-- Filters: type, language, project, outcome
-
-### Working memory (ephemeral context)
-
-```javascript
 mem.setProject('automators-kit');
-mem.setTask('Implement vector search');
+mem.setTask('Add vector search');
 mem.openFile('core/hnsw.js');
-mem.addGoal('Pass all tests');
-mem.logAction('Created HNSWIndex class');
-mem.setNote('approach', 'Port from Rust minimemory');
-
 mem.getWorkingContext();
-// { currentProject, currentTask, openFiles, goals, recentActions, notes }
-
-mem.clearWorkingMemory();
-```
-
-### Maintenance
-
-```javascript
-mem.stats();          // counts by type
-mem.prune(30*24*3600*1000); // remove old low-value memories
-mem.export();         // JSON dump
-mem.import(data);     // restore
 ```
 
 ## Automation Engine
 
 ### Job Queue
-
 ```javascript
 import { JobQueue } from './core/queue.js';
 const queue = new JobQueue(db, { concurrency: 5, maxRetries: 3 });
 queue.register('send-email', async (data) => { /* ... */ });
 queue.enqueue('send-email', { to: 'a@b.com' });
-queue.delay('send-email', data, 60000);
 queue.start();
-queue.stats(); // { pending, processing, completed, failed, dead, running }
-queue.deadLetter(); // failed jobs
-queue.retry(jobId);  // retry dead letter job
-queue.purge();       // clean old completed
 ```
 
 ### Cron Scheduler
-
 ```javascript
 import { CronScheduler } from './core/cron.js';
 const cron = new CronScheduler();
 cron.add('cleanup', '0 * * * *', async () => { /* hourly */ });
-cron.add('report', '0 9 * * 1', async () => { /* Mon 9am */ });
 cron.start();
-cron.list();  // all jobs with stats
-cron.run('cleanup'); // manual trigger
-cron.toggle('report', false); // disable
 ```
 
-### Connectors (HTTP client)
-
+### Connectors
 ```javascript
-import { Connector, slack, restApi, apiKey } from './core/connector.js';
-
-const api = new Connector('https://api.example.com', {
-  auth: { type: 'bearer', token: 'sk_...' },
-  retries: 3, timeout: 10000,
-});
-await api.get('/users');
-await api.post('/data', { key: 'value' });
-
-await slack('https://hooks.slack.com/...').post('', { text: 'Hello!' });
+import { Connector, slack, restApi } from './core/connector.js';
 await restApi('https://api.github.com', 'ghp_...').get('/user');
-await apiKey('https://api.openai.com', 'sk-...', 'Authorization').post('/v1/chat/completions', body);
+await slack('https://hooks.slack.com/...').post('', { text: 'Hello!' });
 ```
-
-### Webhooks (plugin)
-
-- POST /api/plugins/webhooks - register outbound webhook
-- GET /api/plugins/webhooks - list
-- POST /api/plugins/webhooks/in/:name - receive inbound
-- GET /api/plugins/webhooks/deliveries - delivery log
-- GET /api/plugins/webhooks/events - available events
-
-Outbound: HMAC-SHA256 signed, retries with backoff, delivery tracking.
-Inbound: receive POST from external services, trigger custom handlers.
-
-### Automations (plugin)
-
-- POST /api/plugins/automations - create workflow
-- GET /api/plugins/automations - list
-- GET /api/plugins/automations/templates/list - templates
-- POST /api/plugins/automations/templates/:name - create from template
-
-Templates: content-notify, lead-capture, data-sync
 
 ## Portable Text
 
 Block types: heading, paragraph, image, code, list, quote, divider, embed, table, custom
 Render: toHTML(blocks), toMarkdown(blocks), toPlainText(blocks)
 Parse: fromMarkdown(md)
-Helpers: extractText(blocks), findBlocks(blocks, type), wordCount(blocks), validateBlocks(blocks)
-
-## Vector Search
-
-VectorStore (Float32), QuantizedStore (Int8), PolarQuantizedStore (3-bit 21x), BinaryQuantizedStore (1-bit 32x)
-IVF index, Matryoshka search, cross-collection search, BM25 full-text, HybridSearch, Reranker
-
-For large datasets use HNSWIndex (core/hnsw.js) for O(log n) approximate search.
 
 ## Query Operators
 
 $eq $ne $gt $gte $lt $lte $in $nin $between $exists $regex $contains $containsAny $containsNone $size $len $type $finite $elemMatch $and $or $not
 Dot notation: { 'address.city': 'Madrid' }
+
+## Vector Search
+
+VectorStore (Float32), QuantizedStore (Int8), PolarQuantizedStore (3-bit 21x), BinaryQuantizedStore (1-bit 32x)
+IVF index, Matryoshka search, cross-collection search, BM25 full-text, HybridSearch
 
 ## Roles
 
@@ -354,3 +295,17 @@ system:{ready|shutdown}
 
 Restrict plugin access: { "capabilities": ["entries:read", "entries:write"] }
 Empty = unrestricted.
+
+## Security
+
+- JWT auth with PBKDF2-SHA256 password hashing (Web Crypto)
+- AES-256-GCM encryption (database-level and field-level)
+- Timing-safe password comparison (byte-level XOR)
+- Credential vault with encrypted storage
+- RBAC: 4 roles (CMS) + 4 agent profiles (Shell)
+- Plugin capability manifest
+- code.run keyword blocklist (process, require, eval, fetch)
+- Session auto-cleanup
+- Webhook HMAC-SHA256 signing
+- Rate limiting in triggers
+- 2 full security audits, 26 fixes applied
