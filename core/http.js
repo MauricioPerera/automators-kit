@@ -318,3 +318,67 @@ export function logger() {
     console.log(`${ctx.method} ${ctx.path} ${ms}ms`);
   };
 }
+
+/**
+ * Rate limiter middleware (sliding window).
+ * Inspired by Syntra's rate-limit middleware.
+ * @param {object} opts
+ * @param {number} opts.max - Max requests per window (default: 120)
+ * @param {number} opts.windowMs - Window size in ms (default: 60000 = 1 min)
+ * @param {Function} opts.keyFn - (ctx) => string, key to rate limit by (default: IP or 'global')
+ */
+export function rateLimit(opts = {}) {
+  const max = opts.max || 120;
+  const windowMs = opts.windowMs || 60000;
+  const keyFn = opts.keyFn || (() => 'global');
+  const windows = new Map(); // key -> number[]
+
+  // Cleanup old entries periodically
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, timestamps] of windows) {
+      const valid = timestamps.filter(t => now - t < windowMs);
+      if (valid.length === 0) windows.delete(key);
+      else windows.set(key, valid);
+    }
+  }, windowMs);
+
+  return async (ctx, next) => {
+    const key = keyFn(ctx);
+    const now = Date.now();
+
+    if (!windows.has(key)) windows.set(key, []);
+    const timestamps = windows.get(key);
+
+    // Remove expired
+    while (timestamps.length > 0 && now - timestamps[0] >= windowMs) {
+      timestamps.shift();
+    }
+
+    const remaining = max - timestamps.length;
+
+    if (remaining <= 0) {
+      const retryAfter = Math.ceil((timestamps[0] + windowMs - now) / 1000);
+      return json({
+        error: 'Too many requests',
+        retryAfter,
+      }, 429, {
+        'Retry-After': String(retryAfter),
+        'X-RateLimit-Limit': String(max),
+        'X-RateLimit-Remaining': '0',
+        'X-RateLimit-Reset': String(timestamps[0] + windowMs),
+      });
+    }
+
+    timestamps.push(now);
+
+    // Set rate limit headers on response (via state for now)
+    ctx.state._rateLimitHeaders = {
+      'X-RateLimit-Limit': String(max),
+      'X-RateLimit-Remaining': String(remaining - 1),
+      'X-RateLimit-Reset': String(timestamps[0] + windowMs),
+    };
+
+    return next();
+  };
+}

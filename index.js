@@ -18,6 +18,7 @@ import { workflowRoutes } from './routes/workflows.js';
 import { WorkflowEngine } from './core/workflow.js';
 import { Shell } from './core/shell.js';
 import { shellRoutes } from './routes/shell.js';
+import { collectionRoutes } from './routes/collections.js';
 
 /**
  * Create a fully configured CMS application.
@@ -88,6 +89,9 @@ export async function createApp(opts = {}) {
   const shell = new Shell({ profile: opts.shellProfile || 'admin' });
   router.route('/api/shell', shellRoutes(shell));
 
+  // Generic collection REST API (PostgREST-style)
+  router.route('/api/db', collectionRoutes(cms));
+
   // 5. Load plugins
   if (opts.plugins) {
     await loadPlugins(cms, opts.plugins, hooks, pluginRegistry, routeRegistry);
@@ -134,7 +138,7 @@ export async function createApp(opts = {}) {
 export { CMS, ROLE_PERMISSIONS, hasPermission } from './core/cms.js';
 export { DocStore, Collection, Auth, Table, EncryptedAdapter, FieldCrypto, generateId } from './core/db.js';
 export { VectorStore, QuantizedStore, BinaryQuantizedStore, PolarQuantizedStore, IVFIndex } from './core/vector.js';
-export { Router, json, error, cors } from './core/http.js';
+export { Router, json, error, cors, rateLimit } from './core/http.js';
 export { validate, validateBody, createValidator } from './core/validate.js';
 export { HookSystem, PluginRegistry, createPluginAPI } from './core/plugins.js';
 export { toHTML, toMarkdown, toPlainText, fromMarkdown, validateBlocks, extractText, findBlocks, wordCount } from './core/portable-text.js';
