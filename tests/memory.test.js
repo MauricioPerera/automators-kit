@@ -10,7 +10,7 @@ let db, mem;
 
 beforeEach(() => {
   db = new DocStore(new MemoryStorageAdapter());
-  mem = new AgentMemory(db);
+  mem = new AgentMemory(db, { agentId: 'test-agent', userId: 'user1', dedupThreshold: 0.4 });
 });
 
 describe('Episodic Memory', () => {
@@ -196,11 +196,175 @@ describe('Stats & Maintenance', () => {
     expect(exported.semantic.length).toBe(1);
     expect(exported.episodic.length).toBe(1);
 
-    // Import into fresh memory
+    // Import into fresh memory (same scope)
     const db2 = new DocStore(new MemoryStorageAdapter());
-    const mem2 = new AgentMemory(db2);
+    const mem2 = new AgentMemory(db2, { agentId: 'test-agent', userId: 'user1' });
     const count = mem2.import(exported);
     expect(count).toBe(2);
     expect(mem2.stats().episodic).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Scoping
+// ---------------------------------------------------------------------------
+
+describe('Scoping', () => {
+  it('different agents have isolated memories', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    const memA = new AgentMemory(db, { agentId: 'agent-a', userId: 'u1' });
+    const memB = new AgentMemory(db, { agentId: 'agent-b', userId: 'u1' });
+
+    memA.learnTask({ task: 'Task for A' });
+    memB.learnTask({ task: 'Task for B' });
+
+    expect(memA.getEpisodes().length).toBe(1);
+    expect(memA.getEpisodes()[0].task).toBe('Task for A');
+    expect(memB.getEpisodes().length).toBe(1);
+    expect(memB.getEpisodes()[0].task).toBe('Task for B');
+  });
+
+  it('different users have isolated memories', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    const memU1 = new AgentMemory(db, { agentId: 'agent', userId: 'user1' });
+    const memU2 = new AgentMemory(db, { agentId: 'agent', userId: 'user2' });
+
+    memU1.storeSnippet({ code: 'x', description: 'For user1' });
+    memU2.storeSnippet({ code: 'y', description: 'For user2' });
+
+    expect(memU1.stats().semantic).toBe(1);
+    expect(memU2.stats().semantic).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deduplication
+// ---------------------------------------------------------------------------
+
+describe('Deduplication', () => {
+  it('saveOrUpdate creates new when no match', () => {
+    const result = mem.saveOrUpdate('semantic', {
+      type: MemoryType.CODE_SNIPPET,
+      code: 'console.log("hello")',
+      description: 'Print hello to console',
+      tags: ['javascript'],
+    });
+    expect(result.deduplicated).toBe(false);
+    expect(result.entry._id).toBeDefined();
+  });
+
+  it('saveOrUpdate merges when similar exists', () => {
+    // Insert original
+    mem.storeSnippet({
+      code: 'console.log("hello world")',
+      description: 'Print hello world to console',
+      tags: ['javascript', 'logging'],
+    });
+
+    // Try to save similar
+    const result = mem.saveOrUpdate('semantic', {
+      type: MemoryType.CODE_SNIPPET,
+      code: 'console.log("hello world")',
+      description: 'Print hello world to the console output',
+      tags: ['javascript', 'debug'],
+    });
+
+    // Should deduplicate
+    expect(result.deduplicated).toBe(true);
+    // Tags should be merged
+    expect(result.entry.tags).toContain('logging');
+    expect(result.entry.tags).toContain('debug');
+    // Should still be only 1 entry
+    expect(mem.stats().semantic).toBe(1);
+  });
+
+  it('saveOrUpdate creates new when below threshold', () => {
+    mem.storeSnippet({ code: 'x', description: 'Completely different topic about databases' });
+    const result = mem.saveOrUpdate('semantic', {
+      type: MemoryType.CODE_SNIPPET,
+      code: 'y',
+      description: 'Something about quantum physics and space exploration',
+      tags: ['science'],
+    });
+    expect(result.deduplicated).toBe(false);
+    expect(mem.stats().semantic).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dream Cycle
+// ---------------------------------------------------------------------------
+
+describe('Dream Cycle', () => {
+  it('dream with too few entries returns early', async () => {
+    mem.learnTask({ task: 'Only one task' });
+    const report = await mem.dream();
+    expect(report.kept).toBe(1);
+    expect(report.merged).toBe(0);
+    expect(report.log.some(l => l.message?.includes('Too few'))).toBe(true);
+  });
+
+  it('dream heuristic merges duplicates', async () => {
+    // Create 3 similar episodes
+    mem.learnTask({ task: 'Deploy to production using git push', learnings: ['Use main branch'], tags: ['deploy'] });
+    mem.learnTask({ task: 'Deploy to production via git push origin main', learnings: ['Check CI first'], tags: ['deploy', 'git'] });
+    mem.learnTask({ task: 'Deploy production: git push origin main', learnings: ['Wait for CI'], tags: ['deploy', 'production'] });
+    // Create 1 unique episode
+    mem.learnTask({ task: 'Setup database migrations', tags: ['database'] });
+
+    expect(mem.stats().episodic).toBe(4);
+
+    // Dream without LLM (heuristic mode)
+    const report = await mem.dream();
+
+    expect(report.duration_ms).toBeGreaterThan(0);
+    expect(report.agentId).toBe('test-agent');
+    expect(report.log.length).toBeGreaterThan(0);
+    // Should have reduced entries
+    expect(report.kept).toBeLessThan(4);
+    expect(report.removed).toBeGreaterThan(0);
+  });
+
+  it('dream with LLM uses AI consolidation', async () => {
+    // Mock LLM
+    const mockLlm = async (prompt) => {
+      // Extract IDs from prompt and return merge decision
+      const idMatches = prompt.match(/ID: ([^\n]+)/g) || [];
+      const ids = idMatches.map(m => m.replace('ID: ', '').trim());
+      if (ids.length >= 2) {
+        return JSON.stringify({
+          keep: ids[0],
+          remove: ids.slice(1),
+          mergedContent: 'Consolidated memory',
+          mergedTags: ['consolidated'],
+        });
+      }
+      return '{}';
+    };
+
+    const db2 = new DocStore(new MemoryStorageAdapter());
+    const mem2 = new AgentMemory(db2, { agentId: 'ai-agent', userId: 'u1', llmFn: mockLlm, dedupThreshold: 0.5 });
+
+    mem2.learnTask({ task: 'Deploy app', tags: ['deploy'] });
+    mem2.learnTask({ task: 'Deploy application', tags: ['deploy'] });
+    mem2.learnTask({ task: 'Unique task about testing', tags: ['test'] });
+
+    const report = await mem2.dream();
+    expect(report.log.some(l => l.phase === 'consolidate')).toBe(true);
+    expect(report.log.some(l => l.phase === 'verify')).toBe(true);
+  });
+
+  it('dream report has correct structure', async () => {
+    mem.learnTask({ task: 'A' });
+    mem.learnTask({ task: 'B' });
+    const report = await mem.dream();
+
+    expect(report.agentId).toBe('test-agent');
+    expect(report.userId).toBe('user1');
+    expect(typeof report.duration_ms).toBe('number');
+    expect(typeof report.merged).toBe('number');
+    expect(typeof report.removed).toBe('number');
+    expect(typeof report.kept).toBe('number');
+    expect(Array.isArray(report.log)).toBe(true);
   });
 });

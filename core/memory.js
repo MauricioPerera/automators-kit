@@ -43,18 +43,29 @@ export class AgentMemory {
   /**
    * @param {import('./db.js').DocStore} db - DocStore instance
    * @param {object} opts
+   * @param {string} opts.agentId - Agent ID for scoping (default: 'default')
+   * @param {string} opts.userId - User ID for scoping (default: null)
    * @param {number} opts.maxWorkingMemory - Max items in working memory (default: 50)
    * @param {number} opts.decayRate - Score decay per hour (default: 0.01)
+   * @param {number} opts.dedupThreshold - Similarity threshold for dedup (default: 0.85)
+   * @param {Function} opts.similarityFn - (textA, textB) => score 0-1 (for dedup without vectors)
+   * @param {Function} opts.llmFn - async (prompt) => string (for dream consolidation)
    */
   constructor(db, opts = {}) {
     this.db = db;
+    this.agentId = opts.agentId || 'default';
+    this.userId = opts.userId || null;
     this.maxWorkingMemory = opts.maxWorkingMemory || 50;
     this.decayRate = opts.decayRate || 0.01;
+    this.dedupThreshold = opts.dedupThreshold || 0.85;
+    this._similarityFn = opts.similarityFn || null;
+    this._llmFn = opts.llmFn || null;
 
-    // Collections
-    this._semantic = db.collection('_memory_semantic');
-    this._episodic = db.collection('_memory_episodic');
-    this._working = db.collection('_memory_working');
+    // Scoped collection names (PHP-style isolation)
+    const scope = this.agentId + (this.userId ? `-${this.userId}` : '');
+    this._semantic = db.collection(`_mem_sem_${scope}`);
+    this._episodic = db.collection(`_mem_ep_${scope}`);
+    this._working = db.collection(`_mem_wk_${scope}`);
 
     // Indices
     try { this._semantic.createIndex('type'); } catch {}
@@ -472,5 +483,272 @@ export class AgentMemory {
     } else {
       this._working.insert({ key, value, updatedAt: Date.now() });
     }
+  }
+
+  // ─── DEDUPLICATION ─────────────────────────────────────────
+
+  /**
+   * Save or update: if similar entry exists (above threshold), merge. Otherwise create new.
+   * Uses keyword similarity by default, or opts.similarityFn for vector-based.
+   * @param {string} collection - 'semantic' or 'episodic'
+   * @param {object} entry - Entry data
+   * @returns {{ entry: object, deduplicated: boolean }}
+   */
+  saveOrUpdate(collection, entry) {
+    const col = collection === 'episodic' ? this._episodic : this._semantic;
+    const searchable = this._extractSearchable(entry);
+    const terms = searchable.split(/\s+/).filter(Boolean);
+
+    // Find most similar existing entry
+    let bestMatch = null;
+    let bestScore = 0;
+
+    const existing = col.find({}).toArray();
+    for (const doc of existing) {
+      let score;
+      if (this._similarityFn) {
+        score = this._similarityFn(searchable, this._extractSearchable(doc));
+      } else {
+        // Keyword-based similarity (Jaccard-like)
+        const docText = this._extractSearchable(doc);
+        const docTerms = new Set(docText.split(/\s+/));
+        const matched = terms.filter(t => docTerms.has(t)).length;
+        score = terms.length > 0 ? matched / Math.max(terms.length, docTerms.size) : 0;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = doc;
+      }
+    }
+
+    // Above threshold: merge into existing
+    if (bestMatch && bestScore >= this.dedupThreshold) {
+      const mergedTags = [...new Set([...(bestMatch.tags || []), ...(entry.tags || [])])];
+      const updates = {
+        ...entry,
+        tags: mergedTags,
+        accessCount: (bestMatch.accessCount || 0) + 1,
+        updatedAt: Date.now(),
+      };
+      // Keep original timestamp and ID
+      delete updates._id;
+      delete updates.timestamp;
+
+      col.update({ _id: bestMatch._id }, { $set: updates });
+      this.db.flush();
+      return { entry: { ...bestMatch, ...updates }, deduplicated: true, mergedWith: bestMatch._id };
+    }
+
+    // Below threshold: create new
+    entry.timestamp = Date.now();
+    entry.accessCount = 0;
+    const inserted = col.insert(entry);
+    this.db.flush();
+    return { entry: inserted, deduplicated: false };
+  }
+
+  // ─── DREAM CYCLE (AI consolidation) ───────────────────────
+
+  /**
+   * Dream: 4-phase memory consolidation inspired by php-agent-memory.
+   * Phase 1: Orient — inventory what exists
+   * Phase 2: Analyze — find duplicate clusters
+   * Phase 3: Consolidate — merge/remove via LLM (or heuristic if no LLM)
+   * Phase 4: Verify — validate integrity
+   *
+   * @returns {Promise<DreamReport>}
+   */
+  async dream() {
+    const start = performance.now();
+    const log = [];
+    const phase = (name) => log.push({ phase: name, ts: Date.now() });
+
+    // Phase 1: Orient
+    phase('orient');
+    const semCount = this._semantic.count();
+    const epCount = this._episodic.count();
+    const total = semCount + epCount;
+    log.push({ message: `Inventory: ${epCount} episodic, ${semCount} semantic, ${total} total` });
+
+    if (total < 2) {
+      log.push({ message: 'Too few entities to consolidate' });
+      return this._dreamReport(log, start, { merged: 0, removed: 0, kept: total });
+    }
+
+    // Phase 2: Analyze — find duplicate clusters
+    phase('analyze');
+    const epDups = this._findDuplicateClusters(this._episodic);
+    const semDups = this._findDuplicateClusters(this._semantic);
+    const totalDups = epDups.length + semDups.length;
+    log.push({ message: `Found ${totalDups} duplicate clusters (${epDups.length} episodic, ${semDups.length} semantic)` });
+
+    // Phase 3: Consolidate
+    phase('consolidate');
+    let merged = 0, removed = 0;
+
+    if (this._llmFn) {
+      // AI-powered consolidation
+      const result = await this._llmConsolidate(epDups, semDups, log);
+      merged = result.merged;
+      removed = result.removed;
+    } else {
+      // Heuristic: merge duplicates keeping the newest, remove others
+      for (const cluster of [...epDups, ...semDups]) {
+        const col = cluster[0]._source === 'episodic' ? this._episodic : this._semantic;
+        // Sort by timestamp desc, keep newest
+        cluster.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+        const keeper = cluster[0];
+        const mergedTags = [...new Set(cluster.flatMap(e => e.tags || []))];
+        col.update({ _id: keeper._id }, { $set: { tags: mergedTags, updatedAt: Date.now() } });
+
+        for (let i = 1; i < cluster.length; i++) {
+          col.removeById(cluster[i]._id);
+          removed++;
+        }
+        merged++;
+      }
+      log.push({ message: `Heuristic: merged=${merged}, removed=${removed}` });
+    }
+
+    // Phase 4: Verify
+    phase('verify');
+    const postTotal = this._semantic.count() + this._episodic.count();
+    const delta = total - postTotal;
+    log.push({ message: `Post-dream: ${postTotal} entities (delta: -${delta})` });
+
+    this.db.flush();
+    return this._dreamReport(log, start, { merged, removed, kept: postTotal });
+  }
+
+  /**
+   * Find clusters of similar entries within a collection.
+   * @returns {Array<Array<object>>} Array of clusters (each cluster = array of similar docs)
+   */
+  _findDuplicateClusters(col) {
+    const docs = col.find({}).toArray();
+    const clusters = [];
+    const used = new Set();
+    const colName = col === this._episodic ? 'episodic' : 'semantic';
+
+    for (let i = 0; i < docs.length; i++) {
+      if (used.has(docs[i]._id)) continue;
+      const cluster = [{ ...docs[i], _source: colName }];
+      const textA = this._extractSearchable(docs[i]);
+      const termsA = textA.split(/\s+/).filter(Boolean);
+
+      for (let j = i + 1; j < docs.length; j++) {
+        if (used.has(docs[j]._id)) continue;
+        const textB = this._extractSearchable(docs[j]);
+
+        let score;
+        if (this._similarityFn) {
+          score = this._similarityFn(textA, textB);
+        } else {
+          const termsB = new Set(textB.split(/\s+/));
+          const matched = termsA.filter(t => termsB.has(t)).length;
+          score = termsA.length > 0 ? matched / Math.max(termsA.length, termsB.size) : 0;
+        }
+
+        if (score >= this.dedupThreshold) {
+          cluster.push({ ...docs[j], _source: colName });
+          used.add(docs[j]._id);
+        }
+      }
+
+      if (cluster.length > 1) {
+        used.add(docs[i]._id);
+        clusters.push(cluster);
+      }
+    }
+
+    return clusters;
+  }
+
+  /**
+   * LLM-powered consolidation: ask the LLM to merge/remove/keep.
+   */
+  async _llmConsolidate(epDups, semDups, log) {
+    let merged = 0, removed = 0;
+
+    for (const [label, clusters, col] of [
+      ['episodic', epDups, this._episodic],
+      ['semantic', semDups, this._semantic],
+    ]) {
+      if (clusters.length === 0) continue;
+
+      for (const cluster of clusters) {
+        const items = cluster.map(e => ({
+          id: e._id,
+          content: e.task || e.code || e.description || e.errorMessage || e.content || e.name || '',
+          tags: e.tags || [],
+          type: e.type || 'unknown',
+        }));
+
+        const prompt = `You are a memory consolidation system. Given these ${items.length} similar entries, decide what to do.
+Return JSON: { "keep": "id_to_keep", "remove": ["id1","id2"], "mergedContent": "combined content", "mergedTags": ["tag1","tag2"] }
+
+Entries:
+${items.map(i => `- ID: ${i.id}\n  Content: ${i.content}\n  Tags: ${i.tags.join(', ')}`).join('\n')}
+
+Rules:
+- Keep the most informative entry
+- Merge unique information from removed entries into mergedContent
+- Combine all unique tags
+- Remove duplicates and outdated info`;
+
+        try {
+          const response = await this._llmFn(prompt);
+          const decision = JSON.parse(response.replace(/```json\n?|\n?```/g, '').trim());
+
+          if (decision.keep && decision.remove?.length > 0) {
+            // Apply merge
+            const keeper = cluster.find(e => e._id === decision.keep);
+            if (keeper) {
+              const contentField = keeper.task ? 'task' : keeper.description ? 'description' : keeper.content ? 'content' : 'task';
+              col.update({ _id: decision.keep }, { $set: {
+                [contentField]: decision.mergedContent || keeper[contentField],
+                tags: decision.mergedTags || keeper.tags,
+                updatedAt: Date.now(),
+              }});
+              merged++;
+            }
+
+            for (const removeId of decision.remove) {
+              if (cluster.some(e => e._id === removeId)) {
+                col.removeById(removeId);
+                removed++;
+              }
+            }
+          }
+        } catch (err) {
+          // LLM failed, fallback to heuristic
+          log.push({ message: `LLM error for ${label} cluster: ${err.message}, using heuristic` });
+          cluster.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+          const mergedTags = [...new Set(cluster.flatMap(e => e.tags || []))];
+          col.update({ _id: cluster[0]._id }, { $set: { tags: mergedTags, updatedAt: Date.now() } });
+          for (let i = 1; i < cluster.length; i++) {
+            col.removeById(cluster[i]._id);
+            removed++;
+          }
+          merged++;
+        }
+      }
+
+      log.push({ message: `${label}: merged=${merged}, removed=${removed}` });
+    }
+
+    return { merged, removed };
+  }
+
+  _dreamReport(log, start, stats) {
+    return {
+      agentId: this.agentId,
+      userId: this.userId,
+      log,
+      ...stats,
+      duration_ms: Math.round(performance.now() - start),
+      timestamp: Date.now(),
+    };
   }
 }
