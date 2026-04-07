@@ -16,6 +16,8 @@ import { schemaRoutes } from './routes/schema.js';
 import { a2eRoutes } from './routes/a2e.js';
 import { workflowRoutes } from './routes/workflows.js';
 import { WorkflowEngine } from './core/workflow.js';
+import { Shell } from './core/shell.js';
+import { shellRoutes } from './routes/shell.js';
 
 /**
  * Create a fully configured CMS application.
@@ -82,6 +84,10 @@ export async function createApp(opts = {}) {
   await workflowEngine.init();
   router.route('/api/workflows', workflowRoutes(cms, workflowEngine));
 
+  // Agent Shell (command gateway)
+  const shell = new Shell({ profile: opts.shellProfile || 'admin' });
+  router.route('/api/shell', shellRoutes(shell));
+
   // 5. Load plugins
   if (opts.plugins) {
     await loadPlugins(cms, opts.plugins, hooks, pluginRegistry, routeRegistry);
@@ -121,7 +127,7 @@ export async function createApp(opts = {}) {
   // Start workflow triggers
   workflowEngine.start();
 
-  return { handle: router.handle, cms, router, workflowEngine };
+  return { handle: router.handle, cms, router, workflowEngine, shell };
 }
 
 // Re-export core modules for library usage
@@ -143,3 +149,4 @@ export { WorkflowEngine } from './core/workflow.js';
 export { NodeRegistry, BUILTIN_NODES } from './core/nodes.js';
 export { TriggerManager, TriggerType } from './core/triggers.js';
 export { CredentialVault } from './core/credentials.js';
+export { Shell, CommandRegistry, parse, applyFilter, AGENT_PROFILES } from './core/shell.js';
