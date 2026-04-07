@@ -154,3 +154,4 @@ export { NodeRegistry, BUILTIN_NODES } from './core/nodes.js';
 export { TriggerManager, TriggerType } from './core/triggers.js';
 export { CredentialVault } from './core/credentials.js';
 export { Shell, CommandRegistry, parse, applyFilter, AGENT_PROFILES } from './core/shell.js';
+export { parallelMerge, parallelRace } from './core/parallel.js';
