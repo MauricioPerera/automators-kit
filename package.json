@@ -1,0 +1,53 @@
+{
+  "name": "automators-kit",
+  "version": "2.0.0",
+  "description": "Zero-dependency hackeable toolkit. Document DB, vector search, REST API, CMS, plugin system. By automators.work",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./core/db": "./core/db.js",
+    "./core/vector": "./core/vector.js",
+    "./core/http": "./core/http.js",
+    "./core/validate": "./core/validate.js",
+    "./core/cms": "./core/cms.js",
+    "./core/plugins": "./core/plugins.js",
+    "./adapters/fs": "./adapters/fs.js",
+    "./adapters/memory": "./adapters/memory.js",
+    "./core/portable-text": "./core/portable-text.js",
+    "./core/mcp": "./core/mcp.js"
+  },
+  "scripts": {
+    "dev": "bun --watch server-bun.js",
+    "dev:node": "node --watch server-node.js",
+    "start": "bun server-bun.js",
+    "start:node": "node server-node.js",
+    "mcp": "bun mcp.js",
+    "mcp:node": "node mcp.js",
+    "cli": "bun cli.js",
+    "seed": "bun seed.js",
+    "seed:json": "bun cli.js seed --file seed.json",
+    "seed:node": "node seed.js",
+    "test": "bun test tests/"
+  },
+  "bin": {
+    "akit": "./cli.js"
+  },
+  "keywords": [
+    "cms",
+    "headless",
+    "zero-dependency",
+    "document-database",
+    "vector-search",
+    "rest-api",
+    "plugin",
+    "hackeable",
+    "bun",
+    "deno",
+    "nodejs"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,38 @@
+{
+  "contentTypes": [
+    {
+      "name": "Post",
+      "slug": "post",
+      "description": "Blog posts",
+      "fields": [
+        { "name": "title", "label": "Title", "type": "text", "required": true },
+        { "name": "excerpt", "label": "Excerpt", "type": "textarea" },
+        { "name": "body", "label": "Body", "type": "richtext", "required": true },
+        { "name": "featuredImage", "label": "Featured Image", "type": "url" }
+      ],
+      "enableDrafts": true
+    },
+    {
+      "name": "Page",
+      "slug": "page",
+      "description": "Static pages",
+      "fields": [
+        { "name": "title", "label": "Title", "type": "text", "required": true },
+        { "name": "body", "label": "Body", "type": "richtext", "required": true },
+        { "name": "template", "label": "Template", "type": "select", "validation": { "options": ["default", "full-width", "sidebar"] } }
+      ],
+      "enableDrafts": true
+    }
+  ],
+  "taxonomies": [
+    { "name": "Category", "slug": "category", "hierarchical": true },
+    { "name": "Tag", "slug": "tag", "hierarchical": false }
+  ],
+  "terms": [
+    { "name": "General", "slug": "general", "taxonomySlug": "category" },
+    { "name": "Tutorial", "slug": "tutorial", "taxonomySlug": "category" },
+    { "name": "News", "slug": "news", "taxonomySlug": "category" },
+    { "name": "javascript", "slug": "javascript", "taxonomySlug": "tag" },
+    { "name": "cms", "slug": "cms", "taxonomySlug": "tag" }
+  ]
+}
