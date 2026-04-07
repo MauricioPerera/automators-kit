@@ -74,6 +74,10 @@ export class AgentMemory {
     try { this._episodic.createIndex('project'); } catch {}
     try { this._working.createIndex('key', { unique: true }); } catch {}
 
+    // Limits
+    this._maxContentSize = 1024 * 1024; // 1MB per entity
+    this._maxTags = 50;
+
     // Working context (in-memory, ephemeral)
     this._context = {
       currentProject: null,
@@ -102,6 +106,7 @@ export class AgentMemory {
    * @param {string[]} episode.tags - Tags
    */
   learnTask(episode) {
+    this._validateEntry(episode);
     const entry = this._episodic.insert({
       type: MemoryType.EPISODE,
       task: episode.task,
@@ -145,6 +150,7 @@ export class AgentMemory {
    * Store a code snippet.
    */
   storeSnippet(snippet) {
+    this._validateEntry(snippet);
     return this._semantic.insert({
       type: MemoryType.CODE_SNIPPET,
       code: snippet.code,
@@ -163,6 +169,7 @@ export class AgentMemory {
    * Store API knowledge.
    */
   storeApiKnowledge(knowledge) {
+    this._validateEntry(knowledge);
     return this._semantic.insert({
       type: MemoryType.API_KNOWLEDGE,
       library: knowledge.library,
@@ -180,6 +187,7 @@ export class AgentMemory {
    * Store an error and its solution.
    */
   storeError(errorSol) {
+    this._validateEntry(errorSol);
     return this._semantic.insert({
       type: MemoryType.ERROR_SOLUTION,
       errorMessage: errorSol.error || errorSol.errorMessage,
@@ -197,6 +205,7 @@ export class AgentMemory {
    * Store a code pattern.
    */
   storePattern(pattern) {
+    this._validateEntry(pattern);
     return this._semantic.insert({
       type: MemoryType.PATTERN,
       name: pattern.name,
@@ -214,6 +223,7 @@ export class AgentMemory {
    * Store documentation.
    */
   storeDoc(doc) {
+    this._validateEntry(doc);
     return this._semantic.insert({
       type: MemoryType.DOCUMENTATION,
       title: doc.title,
@@ -235,6 +245,7 @@ export class AgentMemory {
    * @param {object} filters - { type, language, project, outcome }
    */
   recall(query, limit = 10, filters = {}) {
+    limit = Math.min(Math.max(limit, 1), 200); // bounded: 1-200
     const queryLower = query.toLowerCase();
     const terms = queryLower.split(/\s+/).filter(Boolean);
 
@@ -251,7 +262,9 @@ export class AgentMemory {
           const hoursSince = (Date.now() - doc.timestamp) / 3600000;
           const decayedScore = score * Math.exp(-this.decayRate * hoursSince);
           // Boost by access count
-          const boostedScore = decayedScore * (1 + doc.accessCount * 0.1);
+          let boostedScore = decayedScore * (1 + Math.min(doc.accessCount * 0.1, 2));
+          // Correction boost: corrections surface above regular memories (2x)
+          if (doc.category === 'correction' || doc.type === 'correction') boostedScore *= 2;
           results.push({ ...doc, _source: source, _score: boostedScore });
         }
       }
@@ -476,6 +489,17 @@ export class AgentMemory {
     return terms.length > 0 ? matched / terms.length : 0;
   }
 
+  /** Validate entry content size and tags before save */
+  _validateEntry(entry) {
+    const content = entry.task || entry.code || entry.description || entry.content || entry.errorMessage || '';
+    if (typeof content === 'string' && content.length > this._maxContentSize) {
+      throw new Error(`Content exceeds max size (${this._maxContentSize} bytes)`);
+    }
+    if (Array.isArray(entry.tags) && entry.tags.length > this._maxTags) {
+      entry.tags = entry.tags.slice(0, this._maxTags);
+    }
+  }
+
   _setWorking(key, value) {
     const existing = this._working.findOne({ key });
     if (existing) {
@@ -495,6 +519,7 @@ export class AgentMemory {
    * @returns {{ entry: object, deduplicated: boolean }}
    */
   saveOrUpdate(collection, entry) {
+    this._validateEntry(entry);
     const col = collection === 'episodic' ? this._episodic : this._semantic;
     const searchable = this._extractSearchable(entry);
     const terms = searchable.split(/\s+/).filter(Boolean);
