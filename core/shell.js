@@ -511,12 +511,17 @@ Profiles: admin, operator, reader, restricted (current: ${this.profile})`;
 
   _checkPermission(commandId) {
     if (this.permissions.includes('*')) return true;
+    // Built-in commands (no colon) are always allowed for search/describe/help
+    if (!commandId.includes(':')) {
+      return this.permissions.some(p => p === commandId || p === 'search' || p === 'describe' || p === 'help');
+    }
     const [ns, cmd] = commandId.split(':');
     return this.permissions.some(p => {
-      if (p === commandId) return true;           // exact match: users:list
-      if (p === `${ns}:*`) return true;            // namespace wildcard: users:*
-      if (p === `*:${cmd}`) return true;           // command wildcard: *:list
-      if (p === `${ns}:read` && cmd && ['list', 'get', 'search', 'describe', 'count', 'status'].includes(cmd)) return true;
+      if (p === commandId) return true;           // exact: users:list
+      if (p === `${ns}:*`) return true;            // namespace: users:*
+      if (p === `*:${cmd}`) return true;           // command: *:list
+      if (p === `*:read` && ['list', 'get', 'search', 'describe', 'count', 'status'].includes(cmd)) return true;
+      if (p === `${ns}:read` && ['list', 'get', 'search', 'describe', 'count', 'status'].includes(cmd)) return true;
       return false;
     });
   }

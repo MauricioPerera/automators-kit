@@ -62,11 +62,13 @@ export class TriggerManager {
             });
             const data = await res.json();
             // Check if data changed (simple hash comparison)
+            const poller = this._pollers.get(workflowId);
+            if (!poller) return; // unregistered during poll
             const hash = JSON.stringify(data);
-            const lastHash = this._pollers.get(workflowId)?._lastHash;
-            if (hash !== lastHash) {
-              this._pollers.get(workflowId)._lastHash = hash;
-              if (lastHash !== undefined) { // skip first poll
+            if (hash !== poller._lastHash) {
+              const isFirstPoll = poller._lastHash === undefined;
+              poller._lastHash = hash;
+              if (!isFirstPoll) {
                 this._onTrigger(workflowId, { trigger: 'poll', data });
               }
             }

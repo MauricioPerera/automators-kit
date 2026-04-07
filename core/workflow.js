@@ -178,14 +178,16 @@ export class WorkflowEngine {
           // Get credentials if needed
           let creds = {};
           if (node.credentials) {
-            creds = await this._vault.get(node.credentials) || {};
+            creds = await this._vault.get(node.credentials);
+            if (!creds) throw new Error(`Credential '${node.credentials}' not found`);
           }
 
           // Execute node
           const result = await this._nodeRegistry.execute(node.type, resolvedInputs, creds);
 
           // Store result in context for downstream nodes
-          context[node.id] = result?.data !== undefined ? result.data : result;
+          const nodeResult = (result != null && result.data !== undefined) ? result.data : result;
+          context[node.id] = nodeResult;
           execution.nodeResults[node.id] = {
             status: 'success',
             data: context[node.id],
@@ -209,7 +211,7 @@ export class WorkflowEngine {
         }
       }
 
-      if (execution.status !== 'failed') {
+      if (execution.status === 'running') {
         execution.status = Object.keys(execution.errors).length > 0 ? 'partial' : 'success';
       }
 

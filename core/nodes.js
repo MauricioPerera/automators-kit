@@ -111,8 +111,15 @@ export class NodeRegistry {
       if (!headers['Content-Type']) headers['Content-Type'] = 'application/json';
     }
 
-    // Execute
-    const res = await fetch(url, { method, headers, body });
+    // Execute with timeout
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), inputs.timeout || 30000);
+    let res;
+    try {
+      res = await fetch(url, { method, headers, body, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
     const ct = res.headers.get('content-type') || '';
     const data = ct.includes('json') ? await res.json() : await res.text();
 
@@ -193,10 +200,19 @@ const BUILTIN_NODES = [
     inputs: [{ name: 'data', type: 'any' }],
     outputs: [{ name: 'result', type: 'any' }],
     handler: async (inputs) => {
-      // Sandboxed execution via Function constructor
       if (!inputs.code) return inputs.data;
-      const fn = new Function('data', inputs.code);
-      return fn(inputs.data);
+      // Restricted scope: only 'data' and safe globals available
+      // Block access to process, require, import, fetch, eval
+      const BLOCKED = ['process', 'require', 'import', 'eval', 'Function', 'fetch', 'globalThis', 'Bun', 'Deno'];
+      for (const b of BLOCKED) {
+        if (inputs.code.includes(b)) throw new Error(`Blocked keyword in code: ${b}`);
+      }
+      try {
+        const fn = new Function('data', `"use strict"; return (function(data) { ${inputs.code} })(data);`);
+        return fn(inputs.data);
+      } catch (err) {
+        throw new Error(`Code execution error: ${err.message}`);
+      }
     },
   },
   {
@@ -222,15 +238,20 @@ const BUILTIN_NODES = [
     outputs: [{ name: 'items', type: 'array' }],
     handler: async (inputs) => {
       const { items, field, operator, value } = inputs;
-      return (items || []).filter(item => {
+      if (!Array.isArray(items)) return [];
+      return items.filter(item => {
         const v = item[field];
         switch (operator) {
-          case '==': return v == value;
-          case '!=': return v != value;
-          case '>': return v > value;
-          case '<': return v < value;
-          case 'contains': return String(v).includes(value);
-          default: return v == value;
+          case '==': case '===': return v === value;
+          case '!=': case '!==': return v !== value;
+          case '>': return Number(v) > Number(value);
+          case '>=': return Number(v) >= Number(value);
+          case '<': return Number(v) < Number(value);
+          case '<=': return Number(v) <= Number(value);
+          case 'contains': return String(v).includes(String(value));
+          case 'startsWith': return String(v).startsWith(String(value));
+          case 'endsWith': return String(v).endsWith(String(value));
+          default: return v === value;
         }
       });
     },
@@ -243,8 +264,8 @@ const BUILTIN_NODES = [
     inputs: [{ name: 'items', type: 'array' }],
     outputs: [{ name: 'merged', type: 'any' }],
     handler: async (inputs) => {
-      if (Array.isArray(inputs.items)) return inputs.items.flat();
-      return inputs;
+      if (!Array.isArray(inputs.items)) return [];
+      return inputs.items.flat(1); // single level only
     },
   },
   {
