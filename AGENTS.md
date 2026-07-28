@@ -1,12 +1,12 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 263 tests | 0 deps | 16K lines | 19 core modules
+By automators.work | 612 tests | 0 deps | 21 core modules
 
 ## Architecture
 
 ```
-Core (19 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
+Core (21 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
 
 db.js              Document DB: MongoDB queries, indices, JWT auth, AES-256-GCM encryption
 vector.js          Vector DB: Float32/Int8/Polar3bit/Binary, IVF, Matryoshka, BM25
@@ -27,6 +27,8 @@ queue.js           Job queue: async, retries, backoff, dead letter, concurrency
 cron.js            Cron scheduler: 5-field expressions, tick, enable/disable
 connector.js       HTTP client: auth presets, retries, timeout (Slack/Discord/REST)
 memory.js          Agent memory: semantic + episodic + working, recall with decay
+parallel.js        Task orchestration: race/merge/all strategies, timeout, weighted scoring
+net-guard.js       SSRF guard: blocks loopback/RFC1918/link-local/cloud-metadata destinations
 ```
 
 ## Quick Start
@@ -172,12 +174,16 @@ engine.create({
 await engine.run(workflowId, { title: 'My Post' });
 ```
 
-### 20 Built-in Nodes
+### 18 Built-in Nodes
 
-Core: http.request, code.run, set.value, filter, merge, wait, if
+Core: http.request, set.value, filter, merge, wait, if
 Communication: slack.send, discord.send, email.send
 Data: json.parse, json.stringify, text.template, base64.encode, base64.decode, math.calc, datetime.now
 AI: openai.chat, anthropic.chat
+
+`code.run` was removed in the 2026-07 security audit: it ran arbitrary JS via `new Function`
+behind a keyword denylist that was trivially bypassable (real RCE, not a sandbox). Register
+your own `handler` on a custom node if you need to run trusted code — see below.
 
 Custom nodes: `engine.nodes.add({ type: 'my.node', handler: async (inputs, creds) => ... })`
 
@@ -298,14 +304,25 @@ Empty = unrestricted.
 
 ## Security
 
-- JWT auth with PBKDF2-SHA256 password hashing (Web Crypto)
-- AES-256-GCM encryption (database-level and field-level)
+3 full security audits to date, all findings remediated. Latest (2026-07): full-repo audit of
+all 21 core modules (4 parallel auditors) found 65 issues (7 critical, 13 high, 28 medium,
+17 low) — RCE in `code.run` (removed), SSRF across HTTP nodes/triggers/a2e/connector (fixed via
+new `net-guard.js`), prototype pollution (db.js, validate.js, shell.js, workflow.js), stored XSS
+in `portable-text.js`, unbounded recursion in the a2e DAG executor, plugin capability bypasses,
+predictable default secrets (CMS JWT, workflow vault key, credential-vault PBKDF2 salt), plus
+assorted correctness/DoS bugs (HNSW memory leak, broken cache middleware, cron reentrancy,
+`parallelRace([])` hang, non-atomic writes). All fixed and verified with regression tests — see
+[`specs/`](specs/) for the full reports. 2 earlier audits, 26 fixes applied.
+
+Current posture:
+- JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
+- AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
 - Timing-safe password comparison (byte-level XOR)
-- Credential vault with encrypted storage
-- RBAC: 4 roles (CMS) + 4 agent profiles (Shell)
-- Plugin capability manifest
-- code.run keyword blocklist (process, require, eval, fetch)
+- Credential vault with encrypted storage, random per-installation PBKDF2 salt
+- SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions
+- RBAC: 4 roles (CMS, with `:own`-scope enforcement) + 4 agent profiles (Shell, fail-closed default)
+- Plugin capability manifest, gated `database`/collection access, path-traversal guard on local plugin loading
+- ReDoS guards on user-supplied `$regex`/pattern input (db.js, vector.js, a2e.js)
 - Session auto-cleanup
-- Webhook HMAC-SHA256 signing
+- Webhook HMAC-SHA256 signing + optional per-webhook secret
 - Rate limiting in triggers
-- 2 full security audits, 26 fixes applied
