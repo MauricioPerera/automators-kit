@@ -2,13 +2,13 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-404 tests | 0 deps | 18K lines | 19 modules | Bun + Deno + Node.js
+612 tests | 0 deps | 21 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
 ## What it is
 
-A full-stack automation toolkit in vanilla JavaScript with zero npm dependencies. 19 core modules covering: document database, vector search (HNSW), HTTP router, CMS, n8n-style workflow engine, A2E executor, agent shell (command gateway), job queue, cron scheduler, agent memory, and more.
+A full-stack automation toolkit in vanilla JavaScript with zero npm dependencies. 21 core modules covering: document database, vector search (HNSW), HTTP router, CMS, n8n-style workflow engine, A2E executor, agent shell (command gateway), job queue, cron scheduler, agent memory, and more.
 
 Born from merging and distilling ideas from 10+ repos (lokiCMS, js-doc-store, js-vector-store, a2e, minimemory, Agent-Shell, php-agent-memory, EasyDB, RepoMemory, EmDash, ATDF) into a single portable project.
 
@@ -23,7 +23,7 @@ bun server-bun.js  # start at http://localhost:3000
 
 No `npm install`. Zero dependencies.
 
-## 19 Core Modules
+## 21 Core Modules
 
 | Module | What it does |
 |--------|-------------|
@@ -42,10 +42,12 @@ No `npm install`. Zero dependencies.
 | **triggers.js** | Trigger system: manual, webhook, cron, polling with change detection |
 | **credentials.js** | Credential vault: AES-256-GCM encrypted API keys and tokens |
 | **shell.js** | Agent shell: command gateway, 2 MCP tools (~600 constant tokens), pipeline, JQ filter, RBAC |
-| **queue.js** | Job queue: async processing, retries with exponential backoff, dead letter |
-| **cron.js** | Cron scheduler: 5-field expressions, enable/disable, manual run |
-| **connector.js** | HTTP client: auth presets (bearer/basic/apikey), retries, timeout |
+| **queue.js** | Job queue: async processing, retries with exponential backoff, dead letter, stuck-job lease reclaim |
+| **cron.js** | Cron scheduler: 5-field expressions, enable/disable, manual run, anti-reentrancy guard |
+| **connector.js** | HTTP client: auth presets (bearer/basic/apikey), retries, timeout, optional SSRF guard |
 | **memory.js** | Agent memory: semantic + episodic + working, scoping, dedup, dream cycle, correction boost |
+| **parallel.js** | Task orchestration: race/merge/all strategies, timeout, weighted scoring |
+| **net-guard.js** | SSRF guard: blocks fetches to loopback/RFC1918/link-local/cloud-metadata destinations |
 
 ## Usage
 
@@ -91,23 +93,10 @@ import { DocStore, Router, VectorStore, WorkflowEngine, Shell, AgentMemory } fro
 ## Testing
 
 ```bash
-bun test tests/    # 404 tests, 0 failures, ~8 seconds
+bun test tests/    # 612 tests across 21 files, ~7 seconds
 ```
 
-19 test files covering all core modules:
-
-| Category | Files | Tests |
-|----------|-------|-------|
-| Database + Auth | db.test.js | 38 |
-| Vector Search | vector.test.js, hnsw.test.js | 31 |
-| HTTP + Validation | http.test.js, validate.test.js | 29 |
-| CMS + Plugins | cms.test.js, plugins.test.js | 33 |
-| A2E + Workflow | a2e.test.js, workflow.test.js | 63 |
-| Shell + Nodes | shell.test.js, nodes.test.js | 63 |
-| Memory | memory.test.js | 29 |
-| Infrastructure | cron.test.js, queue.test.js, connector.test.js, credentials.test.js, triggers.test.js, portable-text.test.js | 84 |
-| Integration | integration.test.js | 29 |
-| **Total** | **19 files** | **404** |
+21 test files covering all core modules (includes the regression tests added by the 2026-07 security audit — see [Security](#security) below).
 
 ## Multi-runtime
 
@@ -119,15 +108,20 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 
 ## Security
 
-- 2 full security audits, 26 fixes applied
+3 full security audits to date, all findings remediated:
+
+- **2026-07**: full-repo audit of all 21 core modules (4 parallel auditors) — 65 findings (7 critical, 13 high, 28 medium, 17 low), all fixed and verified against the real code with regression tests. Highlights: removed the `code.run` node (its "sandbox" was a bypassable keyword denylist over `new Function` — real RCE), added SSRF guards (`net-guard.js`) across HTTP nodes/triggers/a2e/connector, closed prototype-pollution paths (db.js, validate.js, shell.js, workflow.js), fixed stored XSS in `portable-text.js`, bounded the a2e DAG executor's recursion, gated plugin capability bypasses, replaced predictable default secrets (CMS JWT, workflow vault key, credential-vault PBKDF2 salt) with per-instance random values, and fixed assorted correctness/DoS bugs (HNSW memory leak, broken cache middleware, cron reentrancy, `parallelRace([])` hang, non-atomic writes). Full reports and per-fix specs in [`specs/`](specs/).
+- 2 earlier audits, 26 fixes applied
+
+Current security posture:
 - Timing-safe password comparison (byte-level XOR)
-- AES-256-GCM encryption (database, field-level, credential vault)
-- JWT auth via Web Crypto API (PBKDF2 + HMAC-SHA256)
-- RBAC: 4 CMS roles + 4 agent profiles
-- Plugin capability manifest
-- Content size limits, bounded queries
-- HMAC-SHA256 webhook signing
-- code.run keyword blocklist
+- AES-256-GCM encryption (database, field-level, credential vault) with random per-installation PBKDF2 salts
+- JWT auth via Web Crypto API (PBKDF2 + HMAC-SHA256), random per-instance secret unless configured explicitly
+- SSRF guard (`net-guard.js`) on all outbound fetches driven by workflow/trigger definitions
+- RBAC: 4 CMS roles + 4 agent profiles, enforced on shell built-ins and `:own`-scoped entry operations
+- Plugin capability manifest, gated `database`/collection access, path-traversal guard on local plugin loading
+- Content size limits, bounded queries, ReDoS guards on user-supplied `$regex`/pattern input
+- HMAC-SHA256 webhook signing + optional per-webhook secret
 
 ## Documentation
 
