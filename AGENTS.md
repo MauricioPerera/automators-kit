@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 633 tests | 0 deps | 21 core modules
+By automators.work | 638 tests | 0 deps | 21 core modules
 
 ## Architecture
 
@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution
 nodes.js           Node registry: 20 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
 credentials.js     Credential vault: AES-256-GCM encrypted storage

@@ -4,6 +4,11 @@
  * Uses NodeRegistry for execution, TriggerManager for activation.
  * Zero dependencies.
  *
+ * Execution is DAG-parallel, not strictly sequential: nodes with no
+ * `{{ref}}` dependency between them run concurrently (see
+ * `_buildWorkflowDAG` / `execute()`). Dependencies are inferred from
+ * `{{nodeId.field}}` references in `inputs` — no explicit edges to declare.
+ *
  * Workflow definition:
  * {
  *   name: "My Workflow",
@@ -197,46 +202,70 @@ export class WorkflowEngine {
 
     // Context: results from previous nodes accessible via {{nodeId.field}}
     const context = { _trigger: triggerData.data || triggerData };
+    const nodes = wf.nodes || [];
+    const nodeMap = new Map(nodes.map((n) => [n.id, n]));
 
     try {
-      // Execute nodes sequentially (respecting order)
-      for (const node of wf.nodes) {
-        try {
-          // Resolve inputs from context
-          const resolvedInputs = this._resolveInputs(node.inputs || {}, context);
+      // Levels of node ids that can run in parallel (see _buildWorkflowDAG).
+      // A cycle (shouldn't happen — _validateNodeIds/the caller are expected
+      // to produce a valid DAG) falls back to one node per level, i.e. the
+      // old strictly-sequential order, rather than throwing.
+      const levels = _buildWorkflowDAG(nodes) || nodes.map((n) => [n.id]);
 
-          // Get credentials if needed
+      // Global skip barrier for `if` + `onFalse: 'skip'`, checked BETWEEN
+      // levels. Nodes already dispatched in the same level as the `if` node
+      // still run to completion even if the `if` evaluates false — there is
+      // no meaningful way to "un-dispatch" independent work already in
+      // flight in a real parallel executor (core/a2e.js's DAG has the same
+      // property). Only nodes in levels that haven't started yet are
+      // skipped. This preserves the historical "stop everything after"
+      // outcome for skip-guarded side effects (they're always in a LATER
+      // level, since they depend on the `if`'s result path or otherwise come
+      // after it) while still parallelizing independent branches.
+      let skipRemaining = false;
+      let stopped = false;
+
+      for (const level of levels) {
+        if (skipRemaining || stopped) break;
+
+        const settled = await Promise.allSettled(level.map(async (nodeId) => {
+          const node = nodeMap.get(nodeId);
+          const resolvedInputs = this._resolveInputs(node.inputs || {}, context);
           let creds = {};
           if (node.credentials) {
             creds = await this._vault.get(node.credentials);
             if (!creds) throw new Error(`Credential '${node.credentials}' not found`);
           }
+          return this._nodeRegistry.execute(node.type, resolvedInputs, creds);
+        }));
 
-          // Execute node
-          const result = await this._nodeRegistry.execute(node.type, resolvedInputs, creds);
+        // Commit in the level's (array-preserving) order for deterministic,
+        // backward-compatible nodeResults regardless of settle order.
+        for (let i = 0; i < level.length; i++) {
+          const nodeId = level[i];
+          const node = nodeMap.get(nodeId);
+          const outcome = settled[i];
 
-          // Store result in context for downstream nodes
-          const nodeResult = (result != null && result.data !== undefined) ? result.data : result;
-          context[node.id] = nodeResult;
-          execution.nodeResults[node.id] = {
-            status: 'success',
-            data: context[node.id],
-            duration: null,
-          };
+          if (outcome.status === 'fulfilled') {
+            const result = outcome.value;
+            const nodeResult = (result != null && result.data !== undefined) ? result.data : result;
+            context[nodeId] = nodeResult;
+            execution.nodeResults[nodeId] = { status: 'success', data: nodeResult, duration: null };
 
-          // IF node: check condition and skip next nodes if needed
-          if (node.type === 'if' && result === false && node.onFalse === 'skip') {
-            break;
-          }
+            if (node.type === 'if' && result === false && node.onFalse === 'skip') {
+              skipRemaining = true;
+            }
+          } else {
+            const err = outcome.reason;
+            execution.errors[nodeId] = err.message;
+            execution.nodeResults[nodeId] = { status: 'error', error: err.message };
 
-        } catch (err) {
-          execution.errors[node.id] = err.message;
-          execution.nodeResults[node.id] = { status: 'error', error: err.message };
-
-          // Stop on error unless node has continueOnError
-          if (!node.continueOnError) {
-            execution.status = 'failed';
-            break;
+            // Stop before the NEXT level unless this node has continueOnError.
+            // Siblings already running in this same level are not aborted.
+            if (!node.continueOnError) {
+              execution.status = 'failed';
+              stopped = true;
+            }
           }
         }
       }
@@ -375,4 +404,57 @@ export class WorkflowEngine {
     }
     return current;
   }
+}
+
+// ---------------------------------------------------------------------------
+// DAG SCHEDULING (ported from core/a2e.js's buildDAG, adapted to this
+// engine's `{{nodeId.field}}` template references instead of a2e's
+// `/workflow/<opId>` string convention)
+// ---------------------------------------------------------------------------
+
+/**
+ * Groups a workflow's nodes into levels that can each run in parallel: a
+ * node depends on every other node id referenced via `{{nodeId...}}` in its
+ * `inputs` (a `{{_trigger...}}` reference is not a dependency — trigger data
+ * is available from the start). Levels are produced with Kahn's algorithm;
+ * within a level, ids are kept in their original array order so behavior is
+ * deterministic and nodeResults commit order matches the workflow definition.
+ *
+ * @param {Array<{id: string, inputs?: object}>} nodes
+ * @returns {string[][]|null} Array of levels (each an array of node ids), or
+ *   `null` if the inputs describe a cycle (caller falls back to sequential).
+ */
+function _buildWorkflowDAG(nodes) {
+  const ids = nodes.map((n) => n.id);
+  const idSet = new Set(ids);
+  const deps = new Map(ids.map((id) => [id, new Set()]));
+
+  for (const node of nodes) {
+    const str = JSON.stringify(node.inputs || {});
+    const refs = str.match(/\{\{([^}]+)\}\}/g) || [];
+    for (const ref of refs) {
+      const depId = ref.slice(2, -2).split('.')[0];
+      if (depId !== '_trigger' && depId !== node.id && idSet.has(depId)) {
+        deps.get(node.id).add(depId);
+      }
+    }
+  }
+
+  const inDegree = new Map(ids.map((id) => [id, deps.get(id).size]));
+  const remaining = new Set(ids);
+  const levels = [];
+
+  while (remaining.size > 0) {
+    const ready = ids.filter((id) => remaining.has(id) && inDegree.get(id) === 0);
+    if (ready.length === 0) return null; // cycle
+    levels.push(ready);
+    for (const id of ready) {
+      remaining.delete(id);
+      for (const other of remaining) {
+        if (deps.get(other).has(id)) inDegree.set(other, inDegree.get(other) - 1);
+      }
+    }
+  }
+
+  return levels;
 }

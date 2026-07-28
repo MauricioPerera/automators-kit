@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-633 tests | 0 deps | 21 modules | Bun + Deno + Node.js
+638 tests | 0 deps | 21 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -37,7 +37,7 @@ No `npm install`. Zero dependencies.
 | **portable-text.js** | Rich content: JSON blocks to HTML/Markdown/PlainText, fromMarkdown parser |
 | **mcp.js** | MCP server: JSON-RPC 2.0 over stdio, 20 tools for AI agents |
 | **a2e.js** | A2E executor: 19 declarative operations, DAG parallel execution, middleware |
-| **workflow.js** | Workflow engine: n8n-style nodes, triggers, credentials, execution history |
+| **workflow.js** | Workflow engine: n8n-style nodes, triggers, credentials, execution history, DAG-parallel execution |
 | **nodes.js** | Node registry: 20 built-in nodes (core, communication, data, AI) + ARDF export |
 | **triggers.js** | Trigger system: manual, webhook, cron, polling with change detection |
 | **credentials.js** | Credential vault: AES-256-GCM encrypted API keys and tokens |
@@ -111,7 +111,7 @@ custom scope (create+publish, no delete) that isn't one of the 4 built-in
 ## Testing
 
 ```bash
-bun test tests/    # 633 tests across 23 files, ~7 seconds
+bun test tests/    # 638 tests across 23 files, ~7 seconds
 ```
 
 23 test files covering all core modules plus the `examples/content-pipeline`

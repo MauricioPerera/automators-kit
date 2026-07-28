@@ -475,3 +475,135 @@ describe('Security: node id collision (FIX-39)', () => {
     expect(updated.nodes.length).toBe(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Parallel DAG execution (scaled up from core/a2e.js's buildDAG, adapted to
+// this engine's {{nodeId.field}} template references)
+// ---------------------------------------------------------------------------
+
+describe('Parallel DAG execution', () => {
+  it('independent nodes with no {{ref}} between them run concurrently, not sequentially', async () => {
+    const order = [];
+    engine.nodes.add({
+      type: 'test.delay',
+      name: 'Delay',
+      category: 'test',
+      handler: async (inputs) => {
+        await new Promise((r) => setTimeout(r, 60));
+        order.push(inputs.tag);
+        return inputs.tag;
+      },
+    });
+    const wf = engine.create({
+      name: 'Parallel',
+      nodes: [
+        { id: 'a', type: 'test.delay', inputs: { tag: 'a' } },
+        { id: 'b', type: 'test.delay', inputs: { tag: 'b' } },
+      ],
+    });
+    const start = performance.now();
+    const exec = await engine.run(wf._id);
+    const elapsed = performance.now() - start;
+
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.a.data).toBe('a');
+    expect(exec.nodeResults.b.data).toBe('b');
+    // Both nodes sleep 60ms with no dependency between them. Sequential
+    // execution would take >=120ms; if they actually ran in parallel this
+    // stays well under that. Generous margin to avoid CI flakiness.
+    expect(elapsed).toBeLessThan(110);
+  });
+
+  it('a chain of {{ref}} dependencies still resolves in the correct order', async () => {
+    const wf = engine.create({
+      name: 'Chain3',
+      nodes: [
+        { id: 'a', type: 'set.value', inputs: { value: 1 } },
+        { id: 'b', type: 'math.calc', inputs: { a: '{{a}}', operation: 'add', b: 10 } },
+        { id: 'c', type: 'math.calc', inputs: { a: '{{b}}', operation: 'multiply', b: 2 } },
+      ],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.a.data).toBe(1);
+    expect(exec.nodeResults.b.data).toBe(11);
+    expect(exec.nodeResults.c.data).toBe(22);
+  });
+
+  it('onFalse:skip stops later levels, even though same-level siblings of the `if` already ran', async () => {
+    const draftCalls = [];
+    engine.nodes.add({
+      type: 'test.sibling',
+      name: 'Sibling',
+      category: 'test',
+      handler: async () => 'sibling-ran',
+    });
+    engine.nodes.add({
+      type: 'test.draft',
+      name: 'Draft',
+      category: 'test',
+      handler: async (inputs) => { draftCalls.push(inputs); return 'drafted'; },
+    });
+    const wf = engine.create({
+      name: 'SkipBarrier',
+      nodes: [
+        // 'gate' and 'sibling' are both independent (no {{ref}} to anything
+        // node-level) -> same DAG level -> both dispatched together.
+        { id: 'gate', type: 'if', inputs: { value: false, operator: '==', compare: true }, onFalse: 'skip' },
+        { id: 'sibling', type: 'test.sibling', inputs: {} },
+        // 'after' depends on 'sibling' (a later level) -> must be skipped.
+        { id: 'after', type: 'test.draft', inputs: { from: '{{sibling}}' } },
+      ],
+    });
+    const exec = await engine.run(wf._id);
+
+    expect(exec.nodeResults.gate.data).toBe(false);
+    // Same-level sibling of the `if` still ran (already in flight when the
+    // gate's result was checked) — this is the documented trade-off of real
+    // parallel execution, not a bug.
+    expect(exec.nodeResults.sibling.data).toBe('sibling-ran');
+    // The node in the LATER level (the one the skip barrier can actually
+    // stop) never ran.
+    expect(exec.nodeResults.after).toBeUndefined();
+    expect(draftCalls.length).toBe(0);
+  });
+
+  it('a node failing without continueOnError stops later levels but not already-dispatched same-level siblings', async () => {
+    engine.nodes.add({
+      type: 'test.boom',
+      name: 'Boom',
+      category: 'test',
+      handler: async () => { throw new Error('kaboom'); },
+    });
+    const wf = engine.create({
+      name: 'FailBarrier',
+      nodes: [
+        { id: 'fails', type: 'test.boom', inputs: {} },
+        { id: 'sibling', type: 'set.value', inputs: { value: 'sibling-ran' } },
+        { id: 'after', type: 'set.value', inputs: { value: '{{sibling}}-after' } },
+      ],
+    });
+    const exec = await engine.run(wf._id);
+
+    expect(exec.status).toBe('failed');
+    expect(exec.errors.fails).toBe('kaboom');
+    expect(exec.nodeResults.sibling.data).toBe('sibling-ran'); // same level, already in flight
+    expect(exec.nodeResults.after).toBeUndefined(); // later level, correctly stopped
+  });
+
+  it('a genuine cycle in {{ref}}s falls back to one-node-per-level instead of hanging or throwing', async () => {
+    const wf = engine.create({
+      name: 'Cycle',
+      nodes: [
+        { id: 'a', type: 'set.value', inputs: { value: '{{b}}' } },
+        { id: 'b', type: 'set.value', inputs: { value: '{{a}}' } },
+      ],
+    });
+    const exec = await engine.run(wf._id);
+    // Must complete (not hang) and not throw an unhandled error — the exact
+    // values are undefined-ish garbage-in-garbage-out for a real cycle, but
+    // the engine must degrade gracefully, not crash.
+    expect(exec.status).toBe('success');
+    expect(exec.finishedAt).not.toBeNull();
+  });
+});
