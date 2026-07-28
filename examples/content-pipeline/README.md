@@ -27,6 +27,18 @@ All the wiring lives in [`pipeline.js`](pipeline.js), shared between the
 runnable demo ([`setup.js`](setup.js)) and the automated regression test
 (`tests/examples-content-pipeline.test.js`) — the two can't drift apart.
 
+## Visual UI (optional)
+
+`automators-kit` is headless (JSON API only, no built-in dashboard). If you'd
+rather click through this instead of running curl commands, open
+[`ui.html`](ui.html) directly in a browser (`file://` — no server needed for
+the page itself) while `setup.js` is running. It's a static page using
+[htmx](https://htmx.org) for the fetch/poll/swap mechanics (CORS is on by
+default, so a `file://` page can talk to `http://localhost:3099` fine) — a
+form to submit an article, a table that auto-refreshes every 3s, and a
+"Login + publish drafts" button. If you ran `setup.js` with a different
+`PORT`, edit the `BASE` constant near the bottom of `ui.html`.
+
 ## Run it
 
 ```bash

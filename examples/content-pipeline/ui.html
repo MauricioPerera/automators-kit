@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Content Pipeline Demo — automators-kit</title>
+<script src="https://unpkg.com/htmx.org@1.9.12"></script>
+<script src="https://unpkg.com/htmx.org@1.9.12/dist/ext/json-enc.js"></script>
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  h2 { font-size: 1.05rem; margin-top: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 0.9rem; }
+  .status-draft { color: #b45309; font-weight: 600; }
+  .status-published { color: #15803d; font-weight: 600; }
+  form { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+  input, textarea { padding: 6px 8px; font: inherit; border: 1px solid #ccc; border-radius: 4px; }
+  button { padding: 8px 14px; border: none; border-radius: 4px; background: #2563eb; color: white; cursor: pointer; font: inherit; align-self: flex-start; }
+  button.secondary { background: #6b7280; }
+  small { color: #666; }
+  #intakeStatus, #publishStatus { margin-top: 6px; font-size: 0.85rem; color: #555; min-height: 1.2em; }
+  code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; }
+</style>
+</head>
+<body>
+  <h1>Content Pipeline Demo</h1>
+  <p><small>Habla directo con la API de <code>automators-kit</code> corriendo en
+  <code id="baseUrlLabel"></code> (<code>bun examples/content-pipeline/setup.js</code>).
+  automators-kit es headless — esta página es un archivo estático aparte que usa
+  <a href="https://htmx.org" target="_blank">htmx</a> para el fetch/refresh y CORS
+  para hablarle a la API en otro puerto. Si corriste el servidor en un puerto
+  distinto de 3099, cambiá <code>BASE</code> en el script al final del archivo.</small></p>
+
+  <h2>Nuevo artículo (webhook intake)</h2>
+  <form id="intakeForm" hx-ext="json-enc" hx-headers='{"X-Webhook-Secret":"demo-secret-change-me"}'
+        hx-post="" hx-target="#intakeStatus" hx-swap="innerHTML">
+    <input type="text" name="title" placeholder="Título" required>
+    <textarea name="body" rows="3" placeholder="Cuerpo en markdown (**bold**, # heading...)" required></textarea>
+    <button type="submit">Enviar (crea draft)</button>
+  </form>
+  <div id="intakeStatus"></div>
+
+  <h2>Artículos <small>(auto-refresh cada 3s — el webhook dispara la ejecución de forma
+  asíncrona, así que el draft puede tardar un instante en aparecer)</small></h2>
+  <div id="entriesPoll" hx-get="" hx-trigger="load, every 3s" hx-swap="none"></div>
+  <table id="entriesTable">
+    <thead><tr><th>Título</th><th>Estado</th><th>Creado</th></tr></thead>
+    <tbody><tr><td colspan="3"><em>cargando…</em></td></tr></tbody>
+  </table>
+
+  <h2>Admin</h2>
+  <button id="publishBtn" class="secondary">Login + publicar drafts</button>
+  <div id="publishStatus"></div>
+
+<script>
+  // Ajustá esto si corriste setup.js con otro PORT.
+  const BASE = 'http://localhost:3099';
+  document.getElementById('baseUrlLabel').textContent = BASE;
+  document.getElementById('intakeForm').setAttribute('hx-post', BASE + '/api/workflows/webhook/intake');
+  document.getElementById('entriesPoll').setAttribute('hx-get', BASE + '/api/entries?contentTypeSlug=article');
+  htmx.process(document.body);
+
+  function renderEntries(json) {
+    const tbody = document.querySelector('#entriesTable tbody');
+    const entries = (json && json.entries) || [];
+    tbody.innerHTML = entries.length
+      ? entries.map(e => `<tr>
+          <td>${e.title}</td>
+          <td class="status-${e.status}">${e.status}</td>
+          <td>${new Date(e.createdAt).toLocaleTimeString()}</td>
+        </tr>`).join('')
+      : '<tr><td colspan="3"><em>sin artículos aún — mandá uno arriba</em></td></tr>';
+  }
+
+  // htmx does the actual fetch (hx-get + poll trigger above); this listener
+  // just renders the JSON response into the table (the API is JSON-only, no
+  // server-side HTML templates to swap in directly).
+  document.body.addEventListener('htmx:afterRequest', (evt) => {
+    const path = evt.detail.pathInfo && evt.detail.pathInfo.requestPath;
+    if (path && path.includes('/api/entries')) {
+      try { renderEntries(JSON.parse(evt.detail.xhr.responseText)); } catch {}
+    }
+    if (path && path.includes('/api/workflows/webhook/intake')) {
+      const ok = evt.detail.successful;
+      document.getElementById('intakeStatus').textContent = ok
+        ? 'Enviado — esperando a que el workflow lo procese...'
+        : 'Error: ' + evt.detail.xhr.responseText;
+      if (ok) evt.target.reset();
+    }
+  });
+
+  document.getElementById('publishBtn').addEventListener('click', async () => {
+    const statusEl = document.getElementById('publishStatus');
+    statusEl.textContent = 'Logueando...';
+    try {
+      const loginRes = await fetch(BASE + '/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: 'admin@content-pipeline.demo', password: 'demo-admin-12345' }),
+      });
+      if (!loginRes.ok) throw new Error('login falló — ¿corriste setup.js? (crea este admin de demo)');
+      const { token } = await loginRes.json();
+
+      const wfRes = await fetch(BASE + '/api/workflows', { headers: { Authorization: 'Bearer ' + token } });
+      const { workflows } = await wfRes.json();
+      const publishWf = workflows.find((w) => w.name === 'Publish Drafts');
+      if (!publishWf) throw new Error('no encontré el workflow "Publish Drafts"');
+
+      statusEl.textContent = 'Publicando...';
+      const runRes = await fetch(BASE + '/api/workflows/' + publishWf._id + '/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
+        body: JSON.stringify({ olderThanMs: 0 }),
+      });
+      const result = await runRes.json();
+      const count = result.execution && result.execution.nodeResults && result.execution.nodeResults.publish
+        ? result.execution.nodeResults.publish.data.publishedCount
+        : '?';
+      statusEl.textContent = `Listo — ${count} artículo(s) publicado(s).`;
+    } catch (err) {
+      statusEl.textContent = 'Error: ' + err.message;
+    }
+  });
+</script>
+</body>
+</html>
