@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 638 tests | 0 deps | 21 core modules
+By automators.work | 645 tests | 0 deps | 21 core modules
 
 ## Architecture
 
@@ -60,6 +60,21 @@ a custom scope not among the 4 built-in `AGENT_PROFILES`. Demonstrates
 per-persona command history isolation too (`GET /api/gateway/:persona/history`).
 Run with `bun examples/command-gateway/setup.js`; regression test in
 `tests/examples-command-gateway.test.js`.
+
+`examples/agent-memory-backend/` — an agent with persistent state
+(`core/memory.js`'s `AgentMemory`: semantic + episodic, keyword-matched
+`recall()`, no embeddings provider required) reachable two ways from one
+shared set of handlers (`tools.js`): `setup.js` exposes
+`memory:learn/remember-error/recall/stats/dream` as agent-shell commands
+plus an hourly `core/cron.js` job running the heuristic dedup cycle;
+`mcp-server.js` exposes the SAME operations as MCP tools
+(`learn_task`/`remember_error`/`recall_memory`/`memory_stats`/`dream`)
+alongside the base CMS tools `createMCPServer` always includes — point a
+real MCP client at it to give an agent memory that survives across
+sessions. Memory is isolated per `agentId` on the same underlying db.
+Regression test in `tests/examples-agent-memory-backend.test.js` covers
+both surfaces, using `handleMCPRequest()` directly for MCP (no stdio
+needed for testing).
 
 ## MCP Server
 

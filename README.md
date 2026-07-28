@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-638 tests | 0 deps | 21 modules | Bun + Deno + Node.js
+645 tests | 0 deps | 21 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -108,15 +108,26 @@ exist everywhere but what each persona can reach differs — including a
 custom scope (create+publish, no delete) that isn't one of the 4 built-in
 `AGENT_PROFILES`. Run it with `bun examples/command-gateway/setup.js`.
 
+**[`examples/agent-memory-backend/`](examples/agent-memory-backend/)** —
+"give an agent its own state." Persistent semantic + episodic memory
+(`core/memory.js`, keyword-matched recall, no embeddings provider needed)
+reachable two ways from one set of shared handlers: the agent shell/HTTP for
+testing, and a real MCP server (`mcp-server.js`) so an actual AI client
+(Claude, Cursor) can read/write the same memory directly. Memory is isolated
+per `agentId` on the same underlying db, and self-maintains via an hourly
+`core/cron.js` job running the heuristic dedup cycle. Run with
+`bun examples/agent-memory-backend/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 638 tests across 23 files, ~7 seconds
+bun test tests/    # 645 tests across 24 files, ~7 seconds
 ```
 
-23 test files covering all core modules plus the `examples/content-pipeline`
-and `examples/command-gateway` end-to-end scenarios (includes the regression
-tests added by the 2026-07 security audit — see [Security](#security) below).
+24 test files covering all core modules plus the `examples/content-pipeline`,
+`examples/command-gateway`, and `examples/agent-memory-backend` end-to-end
+scenarios (includes the regression tests added by the 2026-07 security audit
+— see [Security](#security) below).
 
 ## Multi-runtime
 
