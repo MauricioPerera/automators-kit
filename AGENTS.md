@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 612 tests | 0 deps | 21 core modules
+By automators.work | 625 tests | 0 deps | 21 core modules
 
 ## Architecture
 
@@ -39,6 +39,17 @@ bun server-bun.js        # start API at http://localhost:3000
 bun mcp.js               # start MCP server (stdio)
 bun cli.js help          # CLI reference
 ```
+
+## Examples
+
+`examples/content-pipeline/` — end-to-end worked example combining CMS +
+workflow engine + custom nodes + agent shell: authenticated webhook intake →
+markdown→HTML → CMS draft → publish → shell inspection with RBAC. Shared
+setup in `pipeline.js`, runnable demo in `setup.js`
+(`bun examples/content-pipeline/setup.js`), regression test in
+`tests/examples-content-pipeline.test.js`. Good reference for wiring custom
+nodes (`workflowEngine.nodes.add(...)`) and shell commands
+(`shell.registry.register(...)`) on top of `createApp()`.
 
 ## MCP Server
 
@@ -314,13 +325,22 @@ assorted correctness/DoS bugs (HNSW memory leak, broken cache middleware, cron r
 `parallelRace([])` hang, non-atomic writes). All fixed and verified with regression tests — see
 [`specs/`](specs/) for the full reports. 2 earlier audits, 26 fixes applied.
 
+**Follow-up (2026-07):** building `examples/content-pipeline/` as a real end-to-end exercise —
+running a live server and curling it, not just unit tests — surfaced 2 more gaps the audit
+missed, both fixed: the FIX-10 webhook secret was enforced in `core/triggers.js` but never wired
+through `routes/workflows.js`/`WorkflowEngine.webhookTrigger`, so no webhook could authenticate
+over real HTTP; and `core/shell.js` exported `AGENT_PROFILES` but never consulted it —
+`new Shell({ profile: 'restricted' })` alone enforced nothing unless `permissions` was *also*
+passed explicitly. `permissions` now derives from `profile` when omitted (unrecognized profiles
+fail closed to `restricted`).
+
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
 - AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
 - Timing-safe password comparison (byte-level XOR)
 - Credential vault with encrypted storage, random per-installation PBKDF2 salt
-- SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions
-- RBAC: 4 roles (CMS, with `:own`-scope enforcement) + 4 agent profiles (Shell, fail-closed default)
+- SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions, plus a real, enforced HTTP header for webhook secrets
+- RBAC: 4 roles (CMS, with `:own`-scope enforcement) + 4 agent profiles (Shell, fail-closed default, `profile` alone now actually restricts)
 - Plugin capability manifest, gated `database`/collection access, path-traversal guard on local plugin loading
 - ReDoS guards on user-supplied `$regex`/pattern input (db.js, vector.js, a2e.js)
 - Session auto-cleanup

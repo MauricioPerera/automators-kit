@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-612 tests | 0 deps | 21 modules | Bun + Deno + Node.js
+625 tests | 0 deps | 21 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -90,13 +90,24 @@ import { DocStore, Router, VectorStore, WorkflowEngine, Shell, AgentMemory } fro
 // Build whatever you want — each module works independently
 ```
 
+## Examples
+
+**[`examples/content-pipeline/`](examples/content-pipeline/)** — a worked end-to-end scenario:
+webhook intake (authenticated) → markdown→HTML → CMS draft → publish → agent-shell
+inspection with RBAC, wired up with the framework's public API. Run it with
+`bun examples/content-pipeline/setup.js`; see its README for the full curl
+walkthrough, including live checks of the SSRF guard and body-size limit
+against a running server (not just unit tests).
+
 ## Testing
 
 ```bash
-bun test tests/    # 612 tests across 21 files, ~7 seconds
+bun test tests/    # 625 tests across 22 files, ~7 seconds
 ```
 
-21 test files covering all core modules (includes the regression tests added by the 2026-07 security audit — see [Security](#security) below).
+22 test files covering all core modules plus the `examples/content-pipeline`
+end-to-end scenario (includes the regression tests added by the 2026-07
+security audit — see [Security](#security) below).
 
 ## Multi-runtime
 
@@ -111,6 +122,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 3 full security audits to date, all findings remediated:
 
 - **2026-07**: full-repo audit of all 21 core modules (4 parallel auditors) — 65 findings (7 critical, 13 high, 28 medium, 17 low), all fixed and verified against the real code with regression tests. Highlights: removed the `code.run` node (its "sandbox" was a bypassable keyword denylist over `new Function` — real RCE), added SSRF guards (`net-guard.js`) across HTTP nodes/triggers/a2e/connector, closed prototype-pollution paths (db.js, validate.js, shell.js, workflow.js), fixed stored XSS in `portable-text.js`, bounded the a2e DAG executor's recursion, gated plugin capability bypasses, replaced predictable default secrets (CMS JWT, workflow vault key, credential-vault PBKDF2 salt) with per-instance random values, and fixed assorted correctness/DoS bugs (HNSW memory leak, broken cache middleware, cron reentrancy, `parallelRace([])` hang, non-atomic writes). Full reports and per-fix specs in [`specs/`](specs/).
+- **2026-07 (follow-up)**: building [`examples/content-pipeline/`](examples/content-pipeline/) as a real end-to-end exercise surfaced 2 more gaps the audit's unit tests didn't catch, both fixed: the webhook secret from FIX-10 was enforced in `core/triggers.js` but never wired through `routes/workflows.js`/`WorkflowEngine.webhookTrigger`, so no webhook could actually authenticate over real HTTP; and `core/shell.js` exported `AGENT_PROFILES` but never consulted it — `new Shell({ profile: 'restricted' })` alone enforced nothing unless the caller *also* passed `permissions` explicitly. `permissions` now derives from `profile` when omitted, failing closed to `restricted` for unrecognized profiles.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
