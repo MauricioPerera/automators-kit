@@ -76,3 +76,83 @@ describe('ConnectorError', () => {
     expect(err.details.url).toBe('/test');
   });
 });
+
+// fetch stub helpers — avoid real network calls while exercising request flow.
+function stubFetch(handler) {
+  const original = globalThis.fetch;
+  let calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return handler(url, init);
+  };
+  return {
+    calls: () => calls,
+    restore() { globalThis.fetch = original; },
+  };
+}
+
+function okResponse() {
+  return {
+    ok: true,
+    status: 200,
+    headers: new Map([['content-type', 'application/json']]),
+    json: async () => ({ ok: true }),
+    text: async () => '{"ok":true}',
+  };
+}
+
+describe('SSRF guard (blockInternalHosts)', () => {
+  it('rejects internal destination when flag is on, without fetching', async () => {
+    const fetch = stubFetch(() => okResponse());
+    try {
+      const c = new Connector('https://api.example.com', { blockInternalHosts: true });
+      await expect(
+        c.get('http://169.254.169.254/latest/meta-data/')
+      ).rejects.toBeInstanceOf(ConnectorError);
+      // No fetch performed.
+      expect(fetch.calls().length).toBe(0);
+    } finally {
+      fetch.restore();
+    }
+  });
+
+  it('default behavior still allows internal/localhost destinations', async () => {
+    const fetch = stubFetch(() => okResponse());
+    try {
+      const c = new Connector('https://api.example.com'); // default: flag off
+      const res = await c.get('http://localhost:9999/local-dev');
+      expect(res.ok).toBe(true);
+      expect(res.status).toBe(200);
+      expect(fetch.calls().length).toBe(1);
+      expect(fetch.calls()[0].url).toBe('http://localhost:9999/local-dev');
+    } finally {
+      fetch.restore();
+    }
+  });
+
+  it('public destinations work in both modes', async () => {
+    // Flag on
+    const f1 = stubFetch(() => okResponse());
+    try {
+      const on = new Connector('https://api.example.com', { blockInternalHosts: true });
+      const r1 = await on.get('/v1/users');
+      expect(r1.ok).toBe(true);
+      expect(f1.calls().length).toBe(1);
+      expect(f1.calls()[0].url).toBe('https://api.example.com/v1/users');
+    } finally {
+      f1.restore();
+    }
+
+    // Flag off (default)
+    const f2 = stubFetch(() => okResponse());
+    try {
+      const off = new Connector('https://api.example.com');
+      const r2 = await off.get('/v1/users');
+      expect(r2.ok).toBe(true);
+      expect(f2.calls().length).toBe(1);
+      expect(f2.calls()[0].url).toBe('https://api.example.com/v1/users');
+    } finally {
+      f2.restore();
+    }
+  });
+});

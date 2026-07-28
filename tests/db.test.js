@@ -3,12 +3,15 @@
  * DocStore, Collection, indices, query operators, Auth, Table, EncryptedAdapter
  */
 
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import {
   DocStore, Collection, Auth, Table, EncryptedAdapter, FieldCrypto,
-  MemoryStorageAdapter, HashIndex, SortedIndex,
-  matchFilter, generateId, createFromTemplate,
+  MemoryStorageAdapter, FileStorageAdapter, HashIndex, SortedIndex,
+  matchFilter, applyUpdate, generateId, createFromTemplate,
 } from '../core/db.js';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 
 // ---------------------------------------------------------------------------
 // HELPERS
@@ -208,6 +211,29 @@ describe('Query operators', () => {
   it('$regex', () => {
     expect(matchFilter({ name: 'Alice' }, { name: { $regex: '^Ali' } })).toBe(true);
     expect(matchFilter({ name: 'Bob' }, { name: { $regex: '^Ali' } })).toBe(false);
+    expect(matchFilter({ name: 'abc123' }, { name: { $regex: '[0-9]+' } })).toBe(true);
+    expect(matchFilter({ name: 'no digits' }, { name: { $regex: '[0-9]+' } })).toBe(false);
+  });
+
+  it('$regex rejects catastrophic (ReDoS) patterns before .test()', () => {
+    // String diseñado para disparar backtracking catastrofico si el patrón
+    // llegara a ejecutarse. Timeout bajo: si el fix no funciona, el test
+    // falla por timeout en vez de colgar la suite entera.
+    const evil = 'a'.repeat(30) + '!';
+    expect(() => matchFilter({ name: evil }, { name: { $regex: '(a+)+$' } })).toThrow();
+    expect(() => matchFilter({ name: evil }, { name: { $regex: '(a*)*$' } })).toThrow();
+    expect(() => matchFilter({ name: evil }, { name: { $regex: '(a+)*$' } })).toThrow();
+    expect(() => matchFilter({ name: evil }, { name: { $regex: '((a+)+)+' } })).toThrow();
+    // Mismo chequeo cuando el regex llega como instancia RegExp en el filtro.
+    expect(() => matchFilter({ name: evil }, { name: new RegExp('(a+)+$') })).toThrow();
+  }, 2000);
+
+  it('$regex rejects patterns exceeding the length limit', () => {
+    const tooLong = 'a'.repeat(201);
+    expect(() => matchFilter({ name: 'abc' }, { name: { $regex: tooLong } })).toThrow();
+    // Un patrón exactamente en el limite (200) NO se rechaza por longitud.
+    const atLimit = 'a'.repeat(200);
+    expect(() => matchFilter({ name: 'abc' }, { name: { $regex: atLimit } })).not.toThrow();
   });
 
   it('$contains on array', () => {
@@ -499,5 +525,278 @@ describe('generateId', () => {
     const ids = new Set();
     for (let i = 0; i < 1000; i++) ids.add(generateId());
     expect(ids.size).toBe(1000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Prototype pollution protection (FIX-03)
+// ---------------------------------------------------------------------------
+
+describe('Prototype pollution protection', () => {
+  // Limpia Object.prototype antes y después de cada test para aislar el
+  // estado global: si una protección falla y contamina, no debe filtrarse
+  // a otros tests ni dar un falso verde por herencia.
+  beforeEach(() => { delete ({}).__proto__.polluted; });
+  afterEach(()  => { delete ({}).__proto__.polluted; });
+
+  it('$set con __proto__ no contamina Object.prototype y lanza', () => {
+    const doc = { name: 'Alice' };
+    expect(() => applyUpdate(doc, { $set: { '__proto__.polluted': true } })).toThrow();
+    expect(({}).polluted).toBeUndefined();
+  });
+
+  it('$set con constructor.prototype no contamina Object.prototype y lanza', () => {
+    const doc = { name: 'Alice' };
+    expect(() => applyUpdate(doc, { $set: { 'constructor.prototype.polluted': true } })).toThrow();
+    expect(({}).polluted).toBeUndefined();
+  });
+
+  it('$unset con __proto__ lanza y no contamina', () => {
+    const doc = { name: 'Alice' };
+    expect(() => applyUpdate(doc, { $unset: { '__proto__.polluted': true } })).toThrow();
+    expect(({}).polluted).toBeUndefined();
+  });
+
+  it('$inc con __proto__ lanza y no contamina', () => {
+    const doc = { name: 'Alice' };
+    expect(() => applyUpdate(doc, { $inc: { '__proto__.polluted': 1 } })).toThrow();
+    expect(({}).polluted).toBeUndefined();
+  });
+
+  it('$push con constructor.prototype lanza y no contamina', () => {
+    const doc = { tags: ['a'] };
+    expect(() => applyUpdate(doc, { $push: { 'constructor.prototype.polluted': 'x' } })).toThrow();
+    expect(({}).polluted).toBeUndefined();
+  });
+
+  it('segmento peligroso en posición intermedia lanza', () => {
+    const doc = { a: {} };
+    expect(() => applyUpdate(doc, { $set: { 'a.__proto__.polluted': true } })).toThrow();
+    expect(({}).polluted).toBeUndefined();
+  });
+
+  it('los updates legítimos (paths normales) siguen funcionando igual', () => {
+    // $set anidado
+    const d1 = applyUpdate({ a: { b: { c: 1 } } }, { $set: { 'a.b.c': 2, 'a.b.d': 3 } });
+    expect(d1.a.b.c).toBe(2);
+    expect(d1.a.b.d).toBe(3);
+
+    // $inc anidado
+    const d2 = applyUpdate({ score: { n: 10 } }, { $inc: { 'score.n': 5 } });
+    expect(d2.score.n).toBe(15);
+
+    // $push anidado
+    const d3 = applyUpdate({ tags: { items: ['a'] } }, { $push: { 'tags.items': 'b' } });
+    expect(d3.tags.items).toEqual(['a', 'b']);
+
+    // $unset anidado
+    const d4 = applyUpdate({ a: { b: 1, c: 2 } }, { $unset: { 'a.b': 1 } });
+    expect(d4.a.b).toBeUndefined();
+    expect(d4.a.c).toBe(2);
+
+    // Sin contaminación colateral
+    expect(({}).polluted).toBeUndefined();
+  });
+
+  it('a nivel de Collection.update, el path peligroso no contamina', () => {
+    const db = createDb();
+    const col = db.collection('items');
+    const doc = col.insert({ name: 'Alice' });
+    expect(() => col.update({ _id: doc._id }, { $set: { '__proto__.polluted': true } })).toThrow();
+    expect(({}).polluted).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX-20: durability & security hardening (5 hallazgos MEDIUM)
+// ---------------------------------------------------------------------------
+
+describe('FIX-20: atomic writes (Hallazgo 1)', () => {
+  it('FileStorageAdapter.writeJson escribe a .tmp y renombra (atomico)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix20-atomic-'));
+    try {
+      const adapter = new FileStorageAdapter(dir);
+      const realFs = adapter.fs;
+      const calls = { writeFileSync: [], renameSync: [] };
+      // Spy sobre fs: registra llamadas sin alterar el comportamiento real.
+      adapter.fs = new Proxy(realFs, {
+        get(t, prop) {
+          if (prop === 'writeFileSync') {
+            return (...args) => { calls.writeFileSync.push(args[0]); return t.writeFileSync(...args); };
+          }
+          if (prop === 'renameSync') {
+            return (...args) => { calls.renameSync.push({ from: args[0], to: args[1] }); return t.renameSync(...args); };
+          }
+          return Reflect.get(t, prop);
+        },
+      });
+
+      adapter.writeJson('col.json', { a: 1, nested: { b: 2 } });
+
+      // 1) escribió a un archivo .tmp (nunca al final directo)
+      expect(calls.writeFileSync.length).toBe(1);
+      expect(String(calls.writeFileSync[0]).endsWith('col.json.tmp')).toBe(true);
+      // 2) renombró tmp -> final atómicamente
+      expect(calls.renameSync.length).toBe(1);
+      expect(String(calls.renameSync[0].from).endsWith('col.json.tmp')).toBe(true);
+      expect(String(calls.renameSync[0].to).endsWith('col.json')).toBe(true);
+      // 3) el archivo final es válido y no queda .tmp residual
+      expect(realFs.existsSync(join(dir, 'col.json'))).toBe(true);
+      expect(realFs.existsSync(join(dir, 'col.json.tmp'))).toBe(false);
+      expect(adapter.readJson('col.json')).toEqual({ a: 1, nested: { b: 2 } });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('FIX-20: stale persistent index forces rebuild (Hallazgo 2)', () => {
+  it('un indice persistido inconsistente con los docs fuerza rebuild (no resultados incompletos)', () => {
+    const adapter = new MemoryStorageAdapter();
+    const db1 = new DocStore(adapter);
+    const col1 = db1.collection('items');
+    col1.createIndex('value', { type: 'sorted' });
+    for (let i = 0; i < 50; i++) col1.insert({ _id: 'i' + i, value: i });
+    col1.flush();
+
+    const idxFile = 'items.value.sidx.json';
+    const state = adapter.readJson(idxFile);
+    expect(state.entries.length).toBe(50);
+
+    // Simular flush parcial: docs persistidos, indice stale (1 sola entrada).
+    adapter.writeJson(idxFile, { field: 'value', entries: [state.entries[0]] });
+
+    // Nuevo store carga desde el adapter; el indice stale NO debe usarse.
+    const db2 = new DocStore(adapter);
+    const col2 = db2.collection('items');
+    const results = col2.find({ value: { $gte: 45 } }).toArray();
+    // Si se hubiera usado el indice stale (1 entrada), devolveria 0 docs.
+    // Con rebuild devuelve los 5 correctos (45..49).
+    expect(results.length).toBe(5);
+    expect(results.map(r => r.value)).toEqual([45, 46, 47, 48, 49]);
+  });
+
+  it('un indice persistido consistente con los docs se reutiliza (round-trip)', () => {
+    const adapter = new MemoryStorageAdapter();
+    const db1 = new DocStore(adapter);
+    const col1 = db1.collection('items');
+    col1.createIndex('value', { type: 'sorted' });
+    for (let i = 0; i < 50; i++) col1.insert({ _id: 'i' + i, value: i });
+    col1.flush();
+
+    const db2 = new DocStore(adapter);
+    const col2 = db2.collection('items');
+    // El indice persistido es consistente -> se carga y responde correctamente.
+    expect(col2.find({ value: { $gte: 45 } }).toArray().length).toBe(5);
+    expect(col2.find({ value: { $lt: 5 } }).toArray().length).toBe(5);
+  });
+});
+
+describe('FIX-20: EncryptedAdapter.readJson fail-loud (Hallazgo 3)', () => {
+  it('lanza si hay datos encriptados sin preload (antes devolvia null silencioso)', async () => {
+    const inner = new MemoryStorageAdapter();
+    const enc = await EncryptedAdapter.create(inner, 'pw', 'explicit-salt');
+    enc.writeJson('secret.json', { secret: 'shh' });
+    await enc.persist();
+
+    // Nueva instancia, mismo inner+password+salt, SIN preload.
+    const enc2 = await EncryptedAdapter.create(inner, 'pw', 'explicit-salt');
+    expect(() => enc2.readJson('secret.json')).toThrow(/preload/);
+  });
+
+  it('devuelve datos desencriptados tras preload (no rompi el path correcto)', async () => {
+    const inner = new MemoryStorageAdapter();
+    const enc = await EncryptedAdapter.create(inner, 'pw', 'explicit-salt');
+    enc.writeJson('secret.json', { secret: 'shh' });
+    await enc.persist();
+
+    const enc2 = await EncryptedAdapter.create(inner, 'pw', 'explicit-salt');
+    await enc2.preload(['secret.json']);
+    expect(enc2.readJson('secret.json')).toEqual({ secret: 'shh' });
+  });
+});
+
+describe('FIX-20: PBKDF2 salt (Hallazgo 4)', () => {
+  it('sin salt explicito: genera uno aleatorio y lo persiste (sobrevive restart, misma key)', async () => {
+    const inner = new MemoryStorageAdapter();
+    const a = await EncryptedAdapter.create(inner, 'master-pw'); // sin salt -> random persistido
+    // el salt se persistio en el adapter interno
+    const persisted = inner.readJson('__enc.salt.json');
+    expect(persisted).toBeDefined();
+    expect(typeof persisted.salt).toBe('string');
+    expect(persisted.salt.length).toBeGreaterThan(0);
+
+    a.writeJson('data.json', { msg: 'hello' });
+    await a.persist();
+
+    // Nueva instancia, mismo inner+password, sin salt -> lee el salt persistido -> misma key
+    const b = await EncryptedAdapter.create(inner, 'master-pw');
+    await b.preload(['data.json']);
+    expect(b.readJson('data.json')).toEqual({ msg: 'hello' });
+  });
+
+  it('salt aleatorio distinto por almacenamiento -> keys distintas (no rainbow global)', async () => {
+    const innerA = new MemoryStorageAdapter();
+    const innerB = new MemoryStorageAdapter();
+    const a = await EncryptedAdapter.create(innerA, 'master-pw');
+    a.writeJson('data.json', { msg: 'hello' });
+    await a.persist();
+
+    // Copiar el blob encriptado de A al almacenamiento de B.
+    innerB.writeJson('data.json', innerA.readJson('data.json'));
+
+    // B deriva su propio salt aleatorio -> key distinta -> no puede desencriptar.
+    const b = await EncryptedAdapter.create(innerB, 'master-pw');
+    await b.preload(['data.json']);
+    expect(b.readJson('data.json')).toBeNull(); // desencripto con key equivocada
+  });
+});
+
+describe('FIX-20: Collection.import error visibility (Hallazgo 5)', () => {
+  it('salta duplicados legitimos (Duplicate _id / Unique constraint)', () => {
+    const db = createDb();
+    const col = db.collection('users');
+    col.createIndex('email', { unique: true });
+    col.insert({ _id: 'u1', email: 'a@test.com' });
+    const count = col.import([
+      { _id: 'u1', email: 'x@test.com' }, // dup _id -> skip
+      { _id: 'u2', email: 'a@test.com' }, // dup unique email -> skip
+      { _id: 'u3', email: 'b@test.com' }, // ok
+    ]);
+    expect(count).toBe(1);
+    expect(col.findById('u3')).toBeDefined();
+  });
+
+  it('re-lanza errores NO relacionados a duplicados (no los traga)', () => {
+    const db = createDb();
+    const col = db.collection('users');
+    col.createIndex('email', { unique: true });
+    col.insert({ _id: 'u1', email: 'a@test.com' });
+
+    // El doc con una funcion no es clonable (structuredClone lanza) -> error
+    // no relacionado a duplicados -> debe re-lanzarse, no saltarse.
+    expect(() => col.import([
+      { _id: 'u1', email: 'x@test.com' },                    // dup _id -> skip
+      { _id: 'u2', email: 'a@test.com' },                    // dup email -> skip
+      { _id: 'u3', email: 'b@test.com', fn: () => {} },      // error de clone -> re-lanzar
+    ])).toThrow();
+    // el doc que fallo no quedo insertado
+    expect(col.findById('u3')).toBeNull();
+  });
+});
+
+describe('FieldCrypto salt (FIX-41)', () => {
+  it('create(password) sin salt explícito lanza (no usa default hardcodeado)', async () => {
+    await expect(FieldCrypto.create('some-password')).rejects.toThrow(/explicit salt/);
+    await expect(FieldCrypto.create('some-password', '')).rejects.toThrow(/explicit salt/);
+    await expect(FieldCrypto.create('some-password', null)).rejects.toThrow(/explicit salt/);
+  });
+
+  it('create(password, salt) con salt explícito sigue funcionando (encrypt/decrypt)', async () => {
+    const crypto = await FieldCrypto.create('master-password', 'a-unique-random-salt');
+    const enc = await crypto.encrypt('secret-value');
+    expect(enc.startsWith('$enc$')).toBe(true);
+    const dec = await crypto.decrypt(enc);
+    expect(dec).toBe('secret-value');
   });
 });

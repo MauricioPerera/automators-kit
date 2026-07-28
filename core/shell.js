@@ -169,6 +169,11 @@ export function applyFilter(data, expression) {
     const result = {};
     for (const f of fields) {
       const key = f.replace(/^\./, '');
+      // Skip dangerous keys that would trigger prototype setters / pollute the
+      // result object's prototype chain (e.g. `__proto__` reassigns the result's
+      // prototype; `constructor`/`prototype` expose internals). The field is
+      // ignored rather than assigned.
+      if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
       result[key] = resolvePath(data, key);
     }
     return result;
@@ -323,11 +328,21 @@ export class CommandRegistry {
    * @param {Function} handlerFactory - (descriptor) => async handler function
    */
   fromARDF(descriptors, handlerFactory) {
+    // Only safe characters are allowed in resource_id. Anything outside
+    // [a-zA-Z0-9_:-] could register arbitrary namespaces/names (path/prop
+    // injection, confusing command ids). Invalid descriptors are skipped
+    // with a warning rather than registered.
+    const RESOURCE_ID_RE = /^[a-zA-Z0-9_:-]+$/;
     for (const desc of descriptors) {
       if (desc.resource_type !== 'tool') continue;
-      const [ns, name] = (desc.resource_id || '').includes(':')
-        ? desc.resource_id.split(':')
-        : ['imported', desc.resource_id];
+      const rid = desc.resource_id || '';
+      if (!RESOURCE_ID_RE.test(rid)) {
+        console.warn(`[ARDF] skipping descriptor with invalid resource_id: ${JSON.stringify(rid)}`);
+        continue;
+      }
+      const [ns, name] = rid.includes(':')
+        ? rid.split(':')
+        : ['imported', rid];
 
       const inputs = desc.content?.data?.inputs || [];
       this.register(ns, name, {
@@ -357,7 +372,11 @@ export class Shell {
   constructor(opts = {}) {
     this.registry = opts.registry || new CommandRegistry();
     this.permissions = opts.permissions || ['*'];
-    this.profile = opts.profile || 'admin';
+    // Fail-closed default: an unspecified profile is 'restricted', not 'admin'.
+    this.profile = opts.profile || 'restricted';
+    // When debug is true, internal error messages are surfaced to the caller.
+    // Default false keeps internal details out of agent-facing responses.
+    this.debug = !!opts.debug;
     this._history = [];
     this._context = {};
     this._maxHistory = 100;
@@ -446,7 +465,11 @@ Profiles: admin, operator, reader, restricted (current: ${this.profile})`;
       return { ...result, meta: { ...result.meta, duration_ms: Math.round(performance.now() - start) } };
 
     } catch (err) {
-      return this._response(1, null, err.message, input, start);
+      // Log the real error server-side; never reflect internal details to the
+      // agent caller unless debug mode is explicitly enabled.
+      console.error(`[shell] internal error for "${input}":`, err && err.message);
+      const error = this.debug ? (err && err.message) || 'Internal command error' : 'Internal command error';
+      return this._response(1, null, error, input, start);
     }
   }
 
@@ -464,13 +487,21 @@ Profiles: admin, operator, reader, restricted (current: ${this.profile})`;
   async _execSingle(cmd) {
     if (!cmd.command) return this._error(1, 'Empty command');
 
-    // Built-in commands
+    // Public built-in commands (no permission check — discovery only)
     switch (cmd.command) {
       case 'search': return this._cmdSearch(cmd);
       case 'describe': return this._cmdDescribe(cmd);
       case 'help': return this._ok(this.help());
-      case 'history': return this._ok(this.getHistory());
-      case 'context': return this._ok(this.getContext());
+    }
+
+    // Gated built-in commands — shell state, subject to RBAC like any other command
+    if (cmd.command === 'history' || cmd.command === 'context') {
+      if (!this._checkPermission(cmd.command)) {
+        return this._error(3, `Permission denied: ${cmd.command}`);
+      }
+      return cmd.command === 'history'
+        ? this._ok(this.getHistory())
+        : this._ok(this.getContext());
     }
 
     // Resolve registered command
@@ -573,9 +604,10 @@ Profiles: admin, operator, reader, restricted (current: ${this.profile})`;
 
   _checkPermission(commandId) {
     if (this.permissions.includes('*')) return true;
-    // Built-in commands (no colon) are always allowed for search/describe/help
+    // Non-colon builtins (history, context): shell-state commands.
+    // Allowed only via explicit grant or shell namespace access (shell:*).
     if (!commandId.includes(':')) {
-      return this.permissions.some(p => p === commandId || p === 'search' || p === 'describe' || p === 'help');
+      return this.permissions.some(p => p === commandId || p === 'shell:*');
     }
     const [ns, cmd] = commandId.split(':');
     return this.permissions.some(p => {

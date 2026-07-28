@@ -78,9 +78,10 @@ function validateField(name, rule, value) {
       case 'object':
         if (typeof value !== 'object' || value === null || Array.isArray(value)) {
           errors.push(`${name} must be an object`);
+          return errors;
         }
         // Nested schema validation
-        if (rule.properties && typeof value === 'object' && value !== null) {
+        if (rule.properties) {
           for (const [key, subRule] of Object.entries(rule.properties)) {
             const subErrors = validateField(`${name}.${key}`, subRule, value[key]);
             errors.push(...subErrors);
@@ -103,7 +104,14 @@ function validateField(name, rule, value) {
  * @param {object} data
  * @param {object} opts
  * @param {boolean} opts.partial - If true, skip required checks (for updates)
- * @param {boolean} opts.stripUnknown - If true, remove fields not in schema
+ * @param {boolean} opts.stripUnknown - If true, remove fields not in the
+ *   schema and return ONLY declared fields. IMPORTANT: the DEFAULT is
+ *   `false`, which means fields NOT declared in the schema are PASSED THROUGH
+ *   to `result` as-is (unvalidated). This is a permissive default kept for
+ *   backward compatibility. If you need strict mode (reject/drop unknown
+ *   fields), explicitly pass `opts.stripUnknown = true`. Note: regardless of
+ *   this flag, the dangerous keys `__proto__`, `constructor`, and `prototype`
+ *   are always filtered out of the copy to prevent prototype pollution.
  * @returns {{ valid: boolean, errors: string[], data: object }}
  */
 export function validate(schema, data, opts = {}) {
@@ -112,7 +120,17 @@ export function validate(schema, data, opts = {}) {
   }
 
   const errors = [];
-  const result = opts.stripUnknown ? {} : { ...data };
+  // Build result without spreading dangerous keys (`__proto__`, `constructor`,
+  // `prototype`) that would trigger prototype pollution via the
+  // `Object.prototype.__proto__` setter. Iterate own keys and skip them.
+  const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+  const result = {};
+  if (!opts.stripUnknown) {
+    for (const key of Object.keys(data)) {
+      if (DANGEROUS_KEYS.has(key)) continue;
+      result[key] = data[key];
+    }
+  }
 
   for (const [field, rule] of Object.entries(schema)) {
     // Skip meta keys

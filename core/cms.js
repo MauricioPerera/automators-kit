@@ -53,6 +53,37 @@ export function hasPermission(user, permission) {
   return perms.includes(base);
 }
 
+/**
+ * Resolve the effective scope a user holds for a given action permission.
+ *
+ * SECURITY (FIX-30): `hasPermission` collapses `entries:write:own` to its base
+ * `entries:write`, so a holder of the generic `entries:write` also satisfies a
+ * `:own` check with NO ownership comparison ever performed. On its own that is
+ * fine (a generic holder may edit any entry), but the `:own` variant was never
+ * enforced for the `author` role: nothing compared `doc.authorId === callerId`.
+ *
+ * This helper distinguishes the two cases so EntryService can enforce ownership
+ * only when the caller's effective permission is the `:own` variant:
+ *   - 'full' : user holds the generic permission (e.g. `entries:write`) → any entry
+ *   - 'own'  : user holds ONLY the `:own` variant (e.g. `entries:write:own`) → own entries
+ *   - 'none' : user holds neither → denied
+ *
+ * @param {{ role?: string }} user
+ * @param {string} permission - base action permission, e.g. 'entries:write'
+ * @returns {'full'|'own'|'none'}
+ */
+function effectiveScope(user, permission) {
+  const perms = ROLE_PERMISSIONS[user?.role] || [];
+  if (perms.includes(permission)) return 'full';
+  const ownPerm = `${permission}:own`;
+  if (perms.includes(ownPerm)) return 'own';
+  // Fallback mirrors hasPermission's collapse: a generic holder also satisfies
+  // the :own variant. Keep 'full' so ownership is NOT enforced for them.
+  const base = ownPerm.split(':').slice(0, 2).join(':');
+  if (perms.includes(base)) return 'full';
+  return 'none';
+}
+
 // ---------------------------------------------------------------------------
 // SLUG GENERATION
 // ---------------------------------------------------------------------------
@@ -137,19 +168,48 @@ function validateContent(content, contentType) {
 // CMS CLASS
 // ---------------------------------------------------------------------------
 
+/**
+ * Generate a cryptographically secure, per-instance random JWT secret using
+ * the Web Crypto API (same access pattern as Auth/EncryptedAdapter in db.js).
+ *
+ * Used ONLY when the caller does not supply `opts.secret`. This replaces the
+ * old hardcoded `'akit-dev-secret'` fallback, which was public in source and
+ * let any attacker forge `{ role: 'admin' }` JWTs. A random per-instance
+ * secret is unpredictable, so tokens can no longer be forged without knowing
+ * the generated value.
+ *
+ * Trade-off: a random secret is not persisted, so tokens do not survive a
+ * process restart unless an explicit, persistent `opts.secret` is provided.
+ * Acceptable for dev/test; production should always set `opts.secret`.
+ *
+ * @returns {string}
+ */
+function _generateRandomSecret() {
+  const crypto = Auth._getCrypto();
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) hex += bytes[i].toString(16).padStart(2, '0');
+  return `akit-rand-${hex}`;
+}
+
 export class CMS {
   /**
    * @param {object} adapter - Storage adapter (MemoryStorageAdapter, FileStorageAdapter, etc.)
    * @param {object} opts
-   * @param {string} opts.secret - JWT secret key
+   * @param {string} [opts.secret] - JWT secret key. If omitted, a cryptographically
+   *   secure random secret is generated per instance (tokens will NOT survive a
+   *   process restart). Production should always set an explicit, persistent secret.
    * @param {number} opts.tokenExpiry - Token expiry in seconds (default: 7 days)
    * @param {boolean} opts.autosave - Enable autosave (default: true)
    * @param {number} opts.autosaveInterval - Autosave interval in ms (default: 30000)
    */
   constructor(adapter, opts = {}) {
     this.db = new DocStore(adapter);
+    // SECURITY (FIX-13): never fall back to a hardcoded/predictable secret.
+    // If the caller did not configure one, generate a random per-instance
+    // secret so JWTs cannot be forged with a publicly known string.
     this.auth = new Auth(this.db, {
-      secret: opts.secret || 'akit-dev-secret',
+      secret: opts.secret || _generateRandomSecret(),
       tokenExpiry: opts.tokenExpiry || 7 * 24 * 60 * 60,
     });
 
@@ -322,6 +382,60 @@ class EntryService {
 
   get col() { return this.cms._entries; }
 
+  /**
+   * Resolve a caller (passed to update/delete/publish) into a normalized
+   * { id, role } object. Accepts either a user object (with `_id`/`id` and
+   * `role`) or a bare user-id string (looked up via UserService).
+   * @param {object|string|undefined} caller
+   * @returns {{ id: string, role: string } | null}
+   */
+  _resolveCaller(caller) {
+    if (!caller) return null;
+    if (typeof caller === 'string') {
+      const u = this.cms.users.findById(caller);
+      return u ? { id: u._id, role: u.role } : null;
+    }
+    const id = caller._id || caller.id;
+    const role = caller.role;
+    if (!id || !role) return null;
+    return { id, role };
+  }
+
+  /**
+   * Enforce `:own` scope ownership for a mutating entry operation.
+   *
+   * SECURITY (FIX-30): when a caller is supplied, authorize before mutating:
+   *   - 'full' scope (generic permission) → allowed on any entry
+   *   - 'own'  scope (`:own` variant only) → allowed only if doc.authorId === caller.id
+   *   - 'none' scope → denied
+   *
+   * Backward compatibility: when `caller` is omitted (undefined/null) NO check
+   * is performed, preserving the legacy behaviour relied upon by existing
+   * call sites in core/mcp.js, routes/entries.js, cli.js and plugins/* (which
+   * this fix must not touch). Authorization is only enforced when a caller is
+   * explicitly passed.
+   *
+   * @param {{ authorId?: string, _id: string }} doc
+   * @param {object|string|undefined} caller
+   * @param {string} permission - base action permission, e.g. 'entries:write'
+   * @returns {void}
+   * @throws {Error} when the caller is not authorized
+   */
+  _enforceOwnScope(doc, caller, permission) {
+    if (caller === undefined || caller === null) return; // legacy: no check
+    const c = this._resolveCaller(caller);
+    if (!c) throw new Error(`Authorization denied: cannot resolve caller for '${permission}'`);
+    const scope = effectiveScope({ role: c.role }, permission);
+    if (scope === 'full') return;
+    if (scope === 'none') {
+      throw new Error(`Authorization denied: missing permission '${permission}'`);
+    }
+    // scope === 'own' → require authorship
+    if (doc.authorId !== c.id) {
+      throw new Error(`Authorization denied: not the author of entry '${doc._id}'`);
+    }
+  }
+
   async create(input, authorId) {
     const payload = await this.cms.hook('entry:beforeCreate', { input, authorId });
     const data = payload.input || input;
@@ -426,9 +540,12 @@ class EntryService {
     return this.col.findOne({ slug, contentTypeSlug }) || null;
   }
 
-  async update(id, input) {
+  async update(id, input, caller) {
     const doc = this.col.findById(id);
     if (!doc) throw new Error(`Entry '${id}' not found`);
+
+    // SECURITY (FIX-30): enforce :own scope when a caller is supplied.
+    this._enforceOwnScope(doc, caller, 'entries:write');
 
     const payload = await this.cms.hook('entry:beforeUpdate', { id, input });
     const data = payload.input || input;
@@ -464,9 +581,12 @@ class EntryService {
     return updated;
   }
 
-  async delete(id) {
+  async delete(id, caller) {
     const doc = this.col.findById(id);
     if (!doc) throw new Error(`Entry '${id}' not found`);
+
+    // SECURITY (FIX-30): enforce :own scope when a caller is supplied.
+    this._enforceOwnScope(doc, caller, 'entries:delete');
 
     await this.cms.hook('entry:beforeDelete', { id, entry: doc });
     this.col.removeById(id);
@@ -475,9 +595,14 @@ class EntryService {
     return doc;
   }
 
-  async publish(id) {
+  async publish(id, caller) {
     const doc = this.col.findById(id);
     if (!doc) throw new Error(`Entry '${id}' not found`);
+
+    // SECURITY (FIX-30): enforce authorization when a caller is supplied.
+    // No `:own` variant exists for publish, so this reduces to: the caller must
+    // hold the generic `entries:publish` permission (author role is denied).
+    this._enforceOwnScope(doc, caller, 'entries:publish');
 
     await this.cms.hook('entry:beforePublish', { id, entry: doc });
     this.col.update({ _id: id }, { $set: { status: 'published', publishedAt: Date.now(), updatedAt: Date.now() } });

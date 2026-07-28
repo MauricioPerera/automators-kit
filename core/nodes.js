@@ -11,6 +11,8 @@
  *   const result = await registry.execute('slack.send', inputs, credentials);
  */
 
+import { assertPublicUrl } from './net-guard.js';
+
 // ---------------------------------------------------------------------------
 // NODE REGISTRY
 // ---------------------------------------------------------------------------
@@ -115,6 +117,10 @@ export class NodeRegistry {
     // Interpolate template values
     const url = interpolate(node.url || inputs.url, inputs, credentials);
     const method = (node.method || inputs.method || 'GET').toUpperCase();
+
+    // SSRF guard: reject loopback / private / link-local destinations before
+    // the fetch. Workflow definitions are not necessarily trusted.
+    assertPublicUrl(url);
 
     // Build headers
     const headers = { ...resolveObj(node.headers || {}, inputs, credentials) };
@@ -225,29 +231,14 @@ const BUILTIN_NODES = [
     ],
     outputs: [{ name: 'response', type: 'object' }],
   },
-  {
-    type: 'code.run',
-    name: 'Run Code',
-    category: 'core',
-    description: 'Execute a JavaScript function',
-    inputs: [{ name: 'data', type: 'any' }],
-    outputs: [{ name: 'result', type: 'any' }],
-    handler: async (inputs) => {
-      if (!inputs.code) return inputs.data;
-      // Restricted scope: only 'data' and safe globals available
-      // Block access to process, require, import, fetch, eval
-      const BLOCKED = ['process', 'require', 'import', 'eval', 'Function', 'fetch', 'globalThis', 'Bun', 'Deno'];
-      for (const b of BLOCKED) {
-        if (inputs.code.includes(b)) throw new Error(`Blocked keyword in code: ${b}`);
-      }
-      try {
-        const fn = new Function('data', `"use strict"; return (function(data) { ${inputs.code} })(data);`);
-        return fn(inputs.data);
-      } catch (err) {
-        throw new Error(`Code execution error: ${err.message}`);
-      }
-    },
-  },
+  // NOTE: the `code.run` node was removed from the built-in registry. Its
+  // handler ran user-supplied JavaScript through `new Function(...)` with a
+  // substring denylist as a "sandbox", which is trivially bypassable and is
+  // not a real sandbox. A denylist can never be made safe (there are too many
+  // ways to reach the Function constructor without naming it), and a real
+  // sandbox (V8 isolates / restricted worker) is an architecture change outside
+  // the scope of this fix. Executing untrusted code is now the responsibility
+  // of a workflow author who registers their own node — it is not a built-in.
   {
     type: 'set.value',
     name: 'Set Value',

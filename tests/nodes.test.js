@@ -110,20 +110,12 @@ describe('NodeRegistry', () => {
     expect(await reg.execute('merge', { items: [[1, 2], [3, 4]] })).toEqual([1, 2, 3, 4]);
   });
 
-  it('execute code.run (safe)', async () => {
+  // Regression: the `code.run` built-in node was removed (it ran untrusted JS
+  // via `new Function` with a bypassable substring denylist — RCE by design).
+  // It must no longer be present in the built-in registry.
+  it('code.run node is no longer a built-in (RCE removed)', () => {
     const reg = new NodeRegistry();
-    const result = await reg.execute('code.run', { data: 5, code: 'return data * 2;' });
-    expect(result).toBe(10);
-  });
-
-  it('code.run blocks dangerous keywords', async () => {
-    const reg = new NodeRegistry();
-    try {
-      await reg.execute('code.run', { code: 'process.exit()' });
-      expect(true).toBe(false);
-    } catch (err) {
-      expect(err.message).toContain('Blocked keyword');
-    }
+    expect(reg.has('code.run')).toBe(false);
   });
 
   it('throws on unknown node', async () => {
@@ -143,5 +135,37 @@ describe('NodeRegistry', () => {
     expect(ardf[0].schema_version).toBe('1.0.0');
     expect(ardf[0].resource_type).toBe('tool');
     expect(ardf[0].content.type).toBe('tool/io');
+  });
+
+  // SSRF guard: http.request / _executeApi must reject internal destinations
+  // with a controlled error before performing a real fetch.
+  it('http.request rejects cloud metadata URL (169.254.169.254)', async () => {
+    const reg = new NodeRegistry();
+    try {
+      await reg.execute('http.request', { url: 'http://169.254.169.254/latest/meta-data/' });
+      expect(true).toBe(false);
+    } catch (err) {
+      expect(err.message).toMatch(/net-guard|blocked internal/i);
+    }
+  });
+
+  it('http.request rejects loopback URL (127.0.0.1)', async () => {
+    const reg = new NodeRegistry();
+    try {
+      await reg.execute('http.request', { url: 'http://127.0.0.1:8080/admin' });
+      expect(true).toBe(false);
+    } catch (err) {
+      expect(err.message).toMatch(/net-guard|blocked internal/i);
+    }
+  });
+
+  it('http.request rejects non-http(s) scheme', async () => {
+    const reg = new NodeRegistry();
+    try {
+      await reg.execute('http.request', { url: 'file:///etc/passwd' });
+      expect(true).toBe(false);
+    } catch (err) {
+      expect(err.message).toMatch(/net-guard|blocked scheme/i);
+    }
   });
 });

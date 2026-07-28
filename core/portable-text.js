@@ -91,16 +91,45 @@ export function validateBlocks(blocks) {
 /**
  * Parse inline marks from text with simple markdown-like syntax.
  * Supports: **bold**, *italic*, `code`, [link](url)
+ *
+ * SECURITY: the input is HTML-escaped with `escHtml` BEFORE any markdown
+ * transformation, so user-supplied HTML/`<script>` is neutralized up front.
+ * The tags we emit (`<strong>`, `<em>`, `<code>`, `<a>`) are inserted as
+ * literals in the replacement strings and are therefore NOT re-escaped.
+ * Link URLs additionally pass `isSafeUrl` so `javascript:` (and any non
+ * http/https/mailto/relative scheme) cannot land in an `href`.
+ *
  * @param {string} text
  * @returns {string} HTML
  */
 function renderInlineMarks(text) {
   if (!text || typeof text !== 'string') return text || '';
-  return text
+  return escHtml(text)
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.+?)\*/g, '<em>$1</em>')
     .replace(/`(.+?)`/g, '<code>$1</code>')
-    .replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2">$1</a>');
+    .replace(/\[(.+?)\]\((.+?)\)/g, (m, label, url) => {
+      const href = isSafeUrl(url) ? url : '#';
+      return `<a href="${href}">${label}</a>`;
+    });
+}
+
+/**
+ * Decide whether a (already HTML-escaped) URL is safe to put in an `href`.
+ * Allowed: relative URLs (no scheme), http, https, mailto.
+ * Rejected: javascript:, data:, vbscript:, and anything else. Browsers strip
+ * ASCII tab/newline/control chars from URLs before resolving the scheme, so
+ * we strip them here too — this catches `java\tscript:` style obfuscation.
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isSafeUrl(url) {
+  if (!url) return false;
+  const stripped = String(url).replace(/[\s\x00-\x1f]+/g, '');
+  if (!stripped) return false;
+  // No scheme → relative URL (e.g. /path, #anchor, page.html) → safe.
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(stripped)) return true;
+  return /^(https?|mailto):/i.test(stripped);
 }
 
 // ---------------------------------------------------------------------------

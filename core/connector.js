@@ -12,7 +12,17 @@
  *
  *   const slack = new Connector('https://hooks.slack.com/services/T.../B.../xxx');
  *   await slack.post('', { text: 'Hello from Automators Kit!' });
+ *
+ * SSRF note: Connector is a general-purpose client a developer instantiates
+ * directly with their own `baseUrl` — which may legitimately point at an
+ * internal host (e.g. `http://localhost:PORT` for local development). Blocking
+ * internal destinations by default would break that use case. Callers that
+ * build a Connector with `baseUrl`/`path` sourced from UNTRUSTED input (user
+ * workflows, external data) MUST enable `opts.blockInternalHosts` so each
+ * request is validated with `assertPublicUrl` before the fetch is performed.
  */
+
+import { assertPublicUrl } from './net-guard.js';
 
 // ---------------------------------------------------------------------------
 // CONNECTOR
@@ -27,6 +37,12 @@ export class Connector {
    * @param {number} opts.timeout - Request timeout ms (default: 30000)
    * @param {number} opts.retries - Max retries on failure (default: 0)
    * @param {number} opts.retryDelay - Base retry delay ms (default: 1000)
+   * @param {boolean} opts.blockInternalHosts - When true, validate every request
+   *   URL with `assertPublicUrl` and reject loopback / RFC1918 / link-local /
+   *   cloud-metadata destinations before fetching. Default `false` to preserve
+   *   the legitimate local-development use case. MUST be enabled when
+   *   `baseUrl`/`path` come from untrusted sources (user workflows, external
+   *   input) to prevent SSRF.
    */
   constructor(baseUrl, opts = {}) {
     this.baseUrl = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
@@ -35,6 +51,7 @@ export class Connector {
     this.timeout = opts.timeout || 30000;
     this.retries = opts.retries || 0;
     this.retryDelay = opts.retryDelay || 1000;
+    this.blockInternalHosts = opts.blockInternalHosts || false;
   }
 
   /** GET request */
@@ -72,6 +89,15 @@ export class Connector {
       new URL(url); // validate
     } catch {
       throw new ConnectorError(`Invalid URL: ${url || path}`, { url: url || path, method });
+    }
+
+    // SSRF guard: when enabled, reject internal destinations before fetching.
+    if (this.blockInternalHosts) {
+      try {
+        assertPublicUrl(url);
+      } catch (err) {
+        throw new ConnectorError(err.message, { url, method });
+      }
     }
 
     // Build headers

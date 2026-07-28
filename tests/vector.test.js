@@ -7,6 +7,7 @@ import {
   VectorStore, QuantizedStore, BinaryQuantizedStore, PolarQuantizedStore,
   IVFIndex, BM25Index, SimpleTokenizer, MemoryStorageAdapter,
   normalize, cosineSim, euclideanDist, dotProduct, manhattanDist, computeScore,
+  matchFilter, Reranker,
 } from '../core/vector.js';
 
 function randomVec(dim) {
@@ -164,6 +165,77 @@ describe('IVFIndex', () => {
     const results = ivf.search('c', randomVec(16), 5);
     expect(results.length).toBeGreaterThan(0);
   });
+
+  // FIX-07 Hallazgo 1: build con sampleDims debe clusterizar sobre los primeros
+  // `sampleDims` componentes (no sobre dim completa), de forma consistente con
+  // _getCandidates. Una query truncada (Matryoshka) debe caer en el cluster
+  // correcto y devolver el vecino verdadero.
+  it('build con sampleDims clusteriza sobre dims truncadas y recall es consistente', () => {
+    const dim = 32;
+    const sampleDims = 8;
+    const store = new VectorStore(new MemoryStorageAdapter(), dim);
+
+    // 5 grupos bien separados en los primeros `sampleDims` componentes;
+    // las dims 8..31 (fuera de sampleDims) llevan ruido grande y distinto
+    // por vector para que clusterizar sobre dim completa agruparía distinto.
+    const groups = 5, perGroup = 6;
+    for (let g = 0; g < groups; g++) {
+      for (let j = 0; j < perGroup; j++) {
+        const v = new Array(dim).fill(0);
+        // primer componente = separación de grupo (domina en espacio truncado)
+        v[0] = g * 1000;
+        // dim 1: perturbación única por vector (para que el target sea top-1)
+        v[1] = j * 0.001;
+        // dims 8..31: ruido grande y distinto (scramble fuera de sampleDims)
+        for (let d = sampleDims; d < dim; d++) v[d] = ((g * 31 + j * 17 + d) % 97) * 1000;
+        store.set('c', `g${g}j${j}`, v);
+      }
+    }
+    store.flush();
+
+    const ivf = new IVFIndex(store, /*numClusters*/ 5, /*numProbes*/ 1);
+    const built = ivf.build('c', sampleDims);
+
+    // Estructural: los centroides quedaron en dimensión sampleDims (no dim).
+    const idx = ivf._loadIndex('c');
+    expect(idx.sampleDims).toBe(sampleDims);
+    expect(idx.centroids[0].length).toBe(sampleDims);
+
+    // Funcional: query truncado = primeros sampleDims del target.
+    const targetId = 'g2j3';
+    const tFull = store.get('c', targetId).vector;
+    const q = tFull.slice(0, sampleDims);
+
+    const results = ivf.search('c', q, 5);
+    expect(results.length).toBeGreaterThan(0);
+    // "Consistente" = el top-1 es el propio target (cosine sobre los primeros
+    // sampleDims = 1.0) y su cluster fue sondeado gracias al clustering truncado.
+    expect(results[0].id).toBe(targetId);
+    expect(built.numClusters).toBe(5);
+  });
+});
+
+describe('matchFilter $regex (FIX-07 Hallazgo 2: ReDoS)', () => {
+  it('rechaza patrón catastrófico ANTES de ejecutar .test() (no cuelga)', () => {
+    // (a+)+$ contra un string largo es ReDoS catastrófico. Debe lanzar
+    // rápido, no colgar el event loop. Timeout bajo: si el fix falla, el test
+    // muere por timeout en vez de colgar la suite.
+    const evil = '(a+)+$';
+    const longString = 'a'.repeat(50_000);
+    expect(() => matchFilter({ x: longString }, { x: { $regex: evil } }))
+      .toThrow(/\$regex/);
+  }, 2000);
+
+  it('patrones $regex normales siguen funcionando igual que antes', () => {
+    expect(matchFilter({ name: 'AI-123' }, { name: { $regex: '^AI' } })).toBe(true);
+    expect(matchFilter({ name: 'ML-123' }, { name: { $regex: '^AI' } })).toBe(false);
+    expect(matchFilter({ tags: 'vector-db' }, { tags: { $regex: 'vector' } })).toBe(true);
+    // patrón cerca del límite de longitud pero válido
+    const ok = 'a'.repeat(100);
+    expect(matchFilter({ x: 'a'.repeat(150) }, { x: { $regex: ok } })).toBe(true);
+    // RegExp object ya construido sigue aceptándose
+    expect(matchFilter({ x: 'hello' }, { x: { $regex: /^he/ } })).toBe(true);
+  });
 });
 
 describe('BM25Index', () => {
@@ -175,5 +247,135 @@ describe('BM25Index', () => {
     const results = bm25.search('col', 'quick fox', 5);
     expect(results.length).toBeGreaterThan(0);
     expect(results[0].id).toBe('doc1'); // best match
+  });
+});
+
+// FIX-21: Reranker.crossModelSearch indexa respuesta de API externa sin
+// bounds check sobre r.index. Construye sources con un VectorStore real y
+// stubbeando Reranker.rank para devolver índices controlados.
+describe('Reranker.crossModelSearch (FIX-21: bounds check sobre r.index)', () => {
+  function makeSources() {
+    const store = new VectorStore(new MemoryStorageAdapter(), 4);
+    store.set('col', 'd0', [1, 0, 0, 0], { text: 'alpha' });
+    store.set('col', 'd1', [0, 1, 0, 0], { text: 'beta'  });
+    store.set('col', 'd2', [0, 0, 1, 0], { text: 'gamma' });
+    store.flush();
+    return [{ store, collection: 'col', queryVector: [1, 0, 0, 0] }];
+  }
+
+  it('salta índices fuera de rango / undefined sin lanzar y devuelve los válidos', async () => {
+    const reranker = new Reranker({ apiUrl: 'http://x', apiToken: 't' });
+    // Respuesta maliciosa/de un provider buggy: 99 fuera de rango, undefined,
+    // un string, y negativo. Sólo 0 y 1 son válidos (allCandidates.length=3).
+    reranker.rank = async () => ([
+      { index: 0,       score: 0.9 },
+      { index: 99,      score: 0.8 }, // fuera de rango
+      { index: undefined, score: 0.7 }, // ausente
+      { index: 'x',     score: 0.6 }, // no entero
+      { index: -1,      score: 0.5 }, // negativo
+      { index: 1,       score: 0.4 },
+    ]);
+
+    const results = await reranker.crossModelSearch('q', makeSources(), { limit: 5 });
+
+    // No lanza; los inválidos se saltan; sólo quedan los dos válidos.
+    expect(results.length).toBe(2);
+    expect(results.map(r => r.id)).toEqual(['d0', 'd1']);
+    expect(results[0].score).toBe(0.9);
+    expect(results[1].score).toBe(0.4);
+  });
+
+  it('caso normal (todos los índices válidos) sigue funcionando igual que antes', async () => {
+    const reranker = new Reranker({ apiUrl: 'http://x', apiToken: 't' });
+    reranker.rank = async () => ([
+      { index: 2, score: 0.95 },
+      { index: 0, score: 0.80 },
+      { index: 1, score: 0.70 },
+    ]);
+
+    const results = await reranker.crossModelSearch('q', makeSources(), { limit: 5 });
+
+    expect(results.length).toBe(3);
+    expect(results.map(r => r.id)).toEqual(['d2', 'd0', 'd1']);
+    expect(results.map(r => r.score)).toEqual([0.95, 0.80, 0.70]);
+    // metadata y collection se propagan correctamente
+    expect(results[0].metadata.text).toBe('gamma');
+    expect(results[0].collection).toBe('col');
+  });
+});
+
+// FIX-36 Hallazgo 1: _cosinePolar reportaba scores de "coseno" fuera de [-1,1]
+// porque dividía solo por |query| y no por |stored|. La norma del vector
+// reconstruido con _pairs pares (cos,sin) normalizados es sqrt(pairs), así que
+// el score escalaba con sqrt(pairs) y podía exceder 1. El coseno real divide por
+// |query| * |stored|.
+describe('PolarQuantizedStore cosine scale (FIX-36 Hallazgo 1)', () => {
+  it('todo score de búsqueda cae dentro de [-1, 1] (tolerancia FP)', () => {
+    const dim = 8; // _pairs = 4 → norma stored = sqrt(4) = 2; bug daba score ~2x
+    const store = new PolarQuantizedStore(new MemoryStorageAdapter(), dim);
+    for (let i = 0; i < 30; i++) store.set('c', `d${i}`, randomVec(dim));
+    store.flush();
+
+    const results = store.search('c', randomVec(dim), 30);
+    expect(results.length).toBe(30);
+    for (const r of results) {
+      expect(r.score).toBeGreaterThanOrEqual(-1.0001);
+      expect(r.score).toBeLessThanOrEqual(1.0001);
+    }
+  });
+
+  it('self-query no excede 1 (antes del fix daba ~sqrt(pairs))', () => {
+    const dim = 4; // _pairs = 2 → bug producía score ~sqrt(2) ≈ 1.414
+    const store = new PolarQuantizedStore(new MemoryStorageAdapter(), dim);
+    const v = [0.7, 0.3, -0.2, 0.6];
+    store.set('c', 'self', v);
+    store.flush();
+
+    const results = store.search('c', v, 5);
+    expect(results.length).toBe(1);
+    expect(results[0].id).toBe('self');
+    // coseno verdadero de un vector consigo mismo ≤ 1
+    expect(results[0].score).toBeLessThanOrEqual(1 + 1e-9);
+    expect(results[0].score).toBeGreaterThanOrEqual(-1 - 1e-9);
+  });
+});
+
+// FIX-36 Hallazgo 2: TopKHeap con k=0 lanzaba TypeError al acceder this.data[0]
+// en push. Alcanzable vía limit=0 en search / matryoshkaSearch / searchAcross.
+describe('TopKHeap k=0 / limit=0 no lanza (FIX-36 Hallazgo 2)', () => {
+  it('search con limit=0 retorna [] sin lanzar', () => {
+    const store = new VectorStore(new MemoryStorageAdapter(), 4);
+    store.set('col', 'a', [1, 0, 0, 0]);
+    store.set('col', 'b', [0, 1, 0, 0]);
+    store.flush();
+    expect(() => store.search('col', [1, 0, 0, 0], 0)).not.toThrow();
+    const results = store.search('col', [1, 0, 0, 0], 0);
+    expect(results).toEqual([]);
+  });
+
+  it('PolarQuantizedStore.search con limit=0 retorna [] sin lanzar', () => {
+    const store = new PolarQuantizedStore(new MemoryStorageAdapter(), 4);
+    store.set('c', 'a', [1, 0, 0, 0]);
+    store.flush();
+    expect(() => store.search('c', [1, 0, 0, 0], 0)).not.toThrow();
+    expect(store.search('c', [1, 0, 0, 0], 0)).toEqual([]);
+  });
+
+  it('matryoshkaSearch con limit=0 retorna [] sin lanzar', () => {
+    const store = new VectorStore(new MemoryStorageAdapter(), 8);
+    store.set('c', 'a', [1, 0, 0, 0, 0, 0, 0, 0]);
+    store.flush();
+    expect(() => store.matryoshkaSearch('c', [1, 0, 0, 0, 0, 0, 0, 0], 0))
+      .not.toThrow();
+    expect(store.matryoshkaSearch('c', [1, 0, 0, 0, 0, 0, 0, 0], 0)).toEqual([]);
+  });
+
+  it('searchAcross con limit=0 retorna [] sin lanzar', () => {
+    const store = new VectorStore(new MemoryStorageAdapter(), 4);
+    store.set('a', 'x', [1, 0, 0, 0]);
+    store.set('b', 'y', [0, 1, 0, 0]);
+    store.flush();
+    expect(() => store.searchAcross(['a', 'b'], [1, 0, 0, 0], 0)).not.toThrow();
+    expect(store.searchAcross(['a', 'b'], [1, 0, 0, 0], 0)).toEqual([]);
   });
 });

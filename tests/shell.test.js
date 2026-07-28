@@ -111,6 +111,28 @@ describe('JQ Filter', () => {
   it('null on missing path', () => {
     expect(applyFilter(data, '.missing.deep')).toBeUndefined();
   });
+
+  it('[__proto__] multi-select does not pollute result or Object.prototype', () => {
+    const malicious = { count: 2 };
+    Object.defineProperty(malicious, '__proto__', {
+      value: { polluted: true },
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    const r = applyFilter(malicious, '[__proto__, .count]');
+    // result must not inherit `polluted` exploitably
+    expect(r.polluted).toBeUndefined();
+    // global Object.prototype must remain clean
+    expect(({}).polluted).toBeUndefined();
+  });
+
+  it('[.a, .b, .c] multi-select with legitimate fields still works', () => {
+    const r = applyFilter(data, '[.count, .users]');
+    expect(r.count).toBe(2);
+    expect(r.users.length).toBe(2);
+    expect(r.users[0].name).toBe('Alice');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -299,6 +321,54 @@ describe('Permissions', () => {
     expect((await shell.exec('users:list')).code).toBe(0);
     expect((await shell.exec('users:create')).code).toBe(3);
   });
+
+  // RBAC on gated builtins (history, context) — FIX-06
+  it('restricted cannot run history (RBAC bypass fix)', async () => {
+    const shell = new Shell({ profile: 'restricted', permissions: AGENT_PROFILES.restricted });
+    await shell.exec('search users'); // populate some history
+    const r = await shell.exec('history');
+    expect(r.code).toBe(3); // permission denied, not the history data
+    expect(r.error).toContain('Permission denied');
+    expect(r.data).toBe(null);
+  });
+
+  it('restricted cannot run context (RBAC bypass fix)', async () => {
+    const shell = new Shell({ profile: 'restricted', permissions: AGENT_PROFILES.restricted });
+    const r = await shell.exec('context');
+    expect(r.code).toBe(3); // permission denied, not the context data
+    expect(r.error).toContain('Permission denied');
+    expect(r.data).toBe(null);
+  });
+
+  it('restricted can still run search/describe/help (unchanged behavior)', async () => {
+    const shell = new Shell({ profile: 'restricted', permissions: AGENT_PROFILES.restricted });
+    shell.registry.register('users', 'list', { description: 'List users' }, async () => []);
+    expect((await shell.exec('search users')).code).toBe(0);
+    expect((await shell.exec('describe users:list')).code).toBe(0);
+    expect((await shell.exec('help')).code).toBe(0);
+  });
+
+  it('admin can run history and context normally', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
+    await shell.exec('search users');
+    const h = await shell.exec('history');
+    expect(h.code).toBe(0);
+    expect(Array.isArray(h.data)).toBe(true);
+    const c = await shell.exec('context');
+    expect(c.code).toBe(0);
+    expect(typeof c.data).toBe('object');
+  });
+
+  it('operator can run history and context normally', async () => {
+    const shell = new Shell({ profile: 'operator', permissions: AGENT_PROFILES.operator });
+    await shell.exec('search users');
+    const h = await shell.exec('history');
+    expect(h.code).toBe(0);
+    expect(Array.isArray(h.data)).toBe(true);
+    const c = await shell.exec('context');
+    expect(c.code).toBe(0);
+    expect(typeof c.data).toBe('object');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -344,5 +414,95 @@ describe('Token efficiency', () => {
 
     // Help text should be roughly the same size (within 100 chars diff for the count line)
     expect(Math.abs(help1.length - help2.length)).toBeLessThan(100);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX-32 — misc hardening (resource_id validation, fail-closed default,
+// generic error messages)
+// ---------------------------------------------------------------------------
+
+describe('FIX-32: fromARDF resource_id validation', () => {
+  it('skips descriptors with invalid resource_id (not registered)', () => {
+    const reg = new CommandRegistry();
+    const warn = console.warn;
+    const warned = [];
+    console.warn = (...args) => warned.push(args.join(' '));
+    try {
+      reg.fromARDF([
+        { resource_type: 'tool', resource_id: 'evil/../etc', description: 'bad', content: { data: { inputs: [] } }, metadata: {} },
+        { resource_type: 'tool', resource_id: 'good:cmd', description: 'good', content: { data: { inputs: [] } }, metadata: {} },
+        { resource_type: 'tool', resource_id: 'also bad with spaces', description: 'bad2', content: { data: { inputs: [] } }, metadata: {} },
+      ]);
+    } finally {
+      console.warn = warn;
+    }
+    expect(reg.has('good:cmd')).toBe(true);
+    expect(reg.has('evil/../etc')).toBe(false);
+    expect(reg.size).toBe(1);
+    expect(warned.length).toBe(2);
+  });
+
+  it('still imports valid resource_ids without a colon as imported:<id>', () => {
+    const reg = new CommandRegistry();
+    const w = console.warn; console.warn = () => {}; try {
+      reg.fromARDF([
+        { resource_type: 'tool', resource_id: 'standalone', description: 'ok', content: { data: { inputs: [] } }, metadata: {} },
+      ]);
+    } finally { console.warn = w; }
+    expect(reg.has('imported:standalone')).toBe(true);
+  });
+});
+
+describe('FIX-32: fail-closed default profile', () => {
+  it('new Shell() without explicit profile has profile === "restricted"', () => {
+    const shell = new Shell();
+    expect(shell.profile).toBe('restricted');
+  });
+
+  it('explicit profile is honored', () => {
+    expect(new Shell({ profile: 'admin' }).profile).toBe('admin');
+    expect(new Shell({ profile: 'operator' }).profile).toBe('operator');
+  });
+
+  it('help reflects the restricted default profile', () => {
+    const shell = new Shell();
+    expect(shell.help()).toContain('current: restricted');
+  });
+});
+
+describe('FIX-32: generic error messages on handler throw', () => {
+  it('handler throwing internal message returns generic error to caller', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
+    const errSpy = console.error;
+    console.error = () => {};
+    try {
+      shell.registry.register('fs', 'read', { description: 'read' }, async () => {
+        throw new Error('ENOENT /secret/path');
+      });
+      const r = await shell.exec('fs:read');
+      expect(r.code).toBe(1);
+      expect(r.error).toBe('Internal command error');
+      expect(r.error).not.toContain('ENOENT');
+      expect(r.error).not.toContain('/secret/path');
+    } finally {
+      console.error = errSpy;
+    }
+  });
+
+  it('debug mode preserves the internal message', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin, debug: true });
+    const errSpy = console.error;
+    console.error = () => {};
+    try {
+      shell.registry.register('fs', 'read', { description: 'read' }, async () => {
+        throw new Error('ENOENT /secret/path');
+      });
+      const r = await shell.exec('fs:read');
+      expect(r.code).toBe(1);
+      expect(r.error).toBe('ENOENT /secret/path');
+    } finally {
+      console.error = errSpy;
+    }
   });
 });

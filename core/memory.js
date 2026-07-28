@@ -50,6 +50,9 @@ export class AgentMemory {
    * @param {number} opts.dedupThreshold - Similarity threshold for dedup (default: 0.85)
    * @param {Function} opts.similarityFn - (textA, textB) => score 0-1 (for dedup without vectors)
    * @param {Function} opts.llmFn - async (prompt) => string (for dream consolidation)
+   * @param {number} opts.maxDedupScanSize - Max docs scanned per dedup pass before safe
+   *   degradation (default: 5000). Above this, saveOrUpdate/dream bound the scan to the
+   *   N most recent docs instead of doing an O(n²) full scan.
    */
   constructor(db, opts = {}) {
     this.db = db;
@@ -60,6 +63,11 @@ export class AgentMemory {
     this.dedupThreshold = opts.dedupThreshold || 0.85;
     this._similarityFn = opts.similarityFn || null;
     this._llmFn = opts.llmFn || null;
+    this.maxDedupScanSize = opts.maxDedupScanSize || 5000;
+
+    // Instrumentation: number of doc comparisons performed in the last dedup pass
+    // (saveOrUpdate or dream). Exposed for tests/observability; bounded by maxDedupScanSize.
+    this._dedupComparisons = 0;
 
     // Scoped collection names (PHP-style isolation)
     const scope = this.agentId + (this.userId ? `-${this.userId}` : '');
@@ -524,12 +532,14 @@ export class AgentMemory {
     const searchable = this._extractSearchable(entry);
     const terms = searchable.split(/\s+/).filter(Boolean);
 
-    // Find most similar existing entry
+    // Find most similar existing entry (bounded scan — see _dedupScan)
     let bestMatch = null;
     let bestScore = 0;
 
-    const existing = col.find({}).toArray();
+    this._dedupComparisons = 0;
+    const existing = this._dedupScan(col);
     for (const doc of existing) {
+      this._dedupComparisons++;
       let score;
       if (this._similarityFn) {
         score = this._similarityFn(searchable, this._extractSearchable(doc));
@@ -588,6 +598,7 @@ export class AgentMemory {
     const start = performance.now();
     const log = [];
     const phase = (name) => log.push({ phase: name, ts: Date.now() });
+    this._dedupComparisons = 0;
 
     // Phase 1: Orient
     phase('orient');
@@ -651,7 +662,7 @@ export class AgentMemory {
    * @returns {Array<Array<object>>} Array of clusters (each cluster = array of similar docs)
    */
   _findDuplicateClusters(col) {
-    const docs = col.find({}).toArray();
+    const docs = this._dedupScan(col);
     const clusters = [];
     const used = new Set();
     const colName = col === this._episodic ? 'episodic' : 'semantic';
@@ -664,6 +675,7 @@ export class AgentMemory {
 
       for (let j = i + 1; j < docs.length; j++) {
         if (used.has(docs[j]._id)) continue;
+        this._dedupComparisons++;
         const textB = this._extractSearchable(docs[j]);
 
         let score;
@@ -688,6 +700,28 @@ export class AgentMemory {
     }
 
     return clusters;
+  }
+
+  /**
+   * Return the candidate docs for a dedup pass, bounding the scan when the
+   * collection exceeds maxDedupScanSize. Below the limit, behavior is identical
+   * to the previous full scan (all docs, insertion order). Above the limit, the
+   * scan degrades safely to the N most recent docs (by timestamp desc) and emits
+   * a console.warn, avoiding the O(n²) full comparison while keeping dedup
+   * functional over the freshest entries.
+   * @param {object} col - Collection instance
+   * @returns {Array<object>} candidate docs to compare
+   */
+  _dedupScan(col) {
+    const total = col.count();
+    if (total <= this.maxDedupScanSize) {
+      return col.find({}).toArray();
+    }
+    console.warn(
+      `[AgentMemory] dedup scan capped: collection has ${total} docs (limit ${this.maxDedupScanSize}); ` +
+      `scanning only the ${this.maxDedupScanSize} most recent — full O(n²) scan skipped.`
+    );
+    return col.find({}).sort({ timestamp: -1 }).limit(this.maxDedupScanSize).toArray();
   }
 
   /**

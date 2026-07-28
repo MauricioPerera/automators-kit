@@ -249,3 +249,172 @@ describe('CMS lifecycle', () => {
     expect(cms2._autosaveTimer).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// JWT secret hardening (FIX-13)
+// ---------------------------------------------------------------------------
+
+describe('JWT secret hardening (FIX-13)', () => {
+  it('does not fall back to the public hardcoded secret when opts.secret is omitted', async () => {
+    const a = new CMS(new MemoryStorageAdapter());
+    await a.auth.init();
+    expect(a.auth.secret).not.toBe('akit-dev-secret');
+    expect(typeof a.auth.secret).toBe('string');
+    expect(a.auth.secret.length).toBeGreaterThan(0);
+    await a.shutdown();
+  });
+
+  it('two instances without opts.secret use distinct, non-hardcoded secrets', async () => {
+    const a = new CMS(new MemoryStorageAdapter());
+    const b = new CMS(new MemoryStorageAdapter());
+    await a.auth.init();
+    await b.auth.init();
+    expect(a.auth.secret).not.toBe(b.auth.secret);
+    expect(a.auth.secret).not.toBe('akit-dev-secret');
+    expect(b.auth.secret).not.toBe('akit-dev-secret');
+    await a.shutdown();
+    await b.shutdown();
+  });
+
+  it('a token signed by a no-secret instance is NOT valid under the old hardcoded secret', async () => {
+    // Instance with no explicit secret (random per-instance secret).
+    const a = new CMS(new MemoryStorageAdapter());
+    await a.auth.init();
+    await a.users.register('x@t.com', 'pass12345678', { name: 'X', role: 'admin' });
+    const { token } = await a.users.login('x@t.com', 'pass12345678');
+    expect(token).toBeDefined();
+
+    // Verifier armed with the OLD leaked hardcoded secret. If the token were
+    // signed with that secret, the signature would verify. It must not.
+    const leaked = new CMS(new MemoryStorageAdapter(), { secret: 'akit-dev-secret' });
+    await leaked.auth.init();
+    const forged = await leaked.auth._verifyJWT(token);
+    expect(forged).toBeNull();
+    await leaked.shutdown();
+    await a.shutdown();
+  });
+
+  it('explicit opts.secret still works as before (configured behaviour preserved)', async () => {
+    const cms2 = new CMS(new MemoryStorageAdapter(), { secret: 'my-explicit-secret' });
+    await cms2.auth.init();
+    expect(cms2.auth.secret).toBe('my-explicit-secret');
+    await cms2.users.register('y@t.com', 'pass12345678', { name: 'Y', role: 'admin' });
+    const { token, user } = await cms2.users.login('y@t.com', 'pass12345678');
+    expect(token).toBeDefined();
+    expect(user.role).toBe('admin');
+
+    const verified = await cms2.users.verify(token);
+    expect(verified).not.toBeNull();
+    expect(verified.email).toBe('y@t.com');
+    await cms2.shutdown();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// EntryService :own scope authorization (FIX-30)
+// ---------------------------------------------------------------------------
+
+describe('EntryService :own scope authorization (FIX-30)', () => {
+  let authorA, authorB, editor;
+
+  beforeEach(async () => {
+    await cms.contentTypes.create({
+      name: 'Post', slug: 'post',
+      fields: [{ name: 'title', type: 'text', required: true }],
+    });
+    authorA = await cms.users.register('a@t.com', 'pass12345678', { name: 'A', role: 'author' });
+    authorB = await cms.users.register('b@t.com', 'pass12345678', { name: 'B', role: 'author' });
+    editor = await cms.users.register('e@t.com', 'pass12345678', { name: 'E', role: 'editor' });
+  });
+
+  it('author can update/delete OWN entry when caller is passed', async () => {
+    const entry = await cms.entries.create(
+      { title: 'Mine', contentTypeSlug: 'post', content: { title: 'Mine' } },
+      authorA._id,
+    );
+    const updated = await cms.entries.update(entry._id, { title: 'Mine 2' }, authorA);
+    expect(updated.title).toBe('Mine 2');
+    await cms.entries.delete(entry._id, authorA);
+    expect(cms.entries.findById(entry._id)).toBeNull();
+  });
+
+  it('author CANNOT update another author\'s entry (rejected with authorization error)', async () => {
+    const entry = await cms.entries.create(
+      { title: 'B entry', contentTypeSlug: 'post', content: { title: 'B' } },
+      authorB._id,
+    );
+    let err;
+    try { await cms.entries.update(entry._id, { title: 'hacked' }, authorA); } catch (e) { err = e; }
+    expect(err).toBeDefined();
+    expect(err.message.toLowerCase()).toContain('author');
+    // Entry must remain unchanged.
+    expect(cms.entries.findById(entry._id).title).toBe('B entry');
+  });
+
+  it('author CANNOT delete another author\'s entry (rejected with authorization error)', async () => {
+    const entry = await cms.entries.create(
+      { title: 'B entry', contentTypeSlug: 'post', content: { title: 'B' } },
+      authorB._id,
+    );
+    let err;
+    try { await cms.entries.delete(entry._id, authorA); } catch (e) { err = e; }
+    expect(err).toBeDefined();
+    expect(err.message.toLowerCase()).toContain('author');
+    expect(cms.entries.findById(entry._id)).not.toBeNull();
+  });
+
+  it('author CANNOT publish (no entries:publish permission, even on own entry)', async () => {
+    const entry = await cms.entries.create(
+      { title: 'Mine', contentTypeSlug: 'post', content: { title: 'Mine' } },
+      authorA._id,
+    );
+    let err;
+    try { await cms.entries.publish(entry._id, authorA); } catch (e) { err = e; }
+    expect(err).toBeDefined();
+    expect(err.message.toLowerCase()).toContain('denied');
+    expect(cms.entries.findById(entry._id).status).toBe('draft');
+  });
+
+  it('editor (generic entries:write/delete) can mutate ANY author\'s entry', async () => {
+    const entry = await cms.entries.create(
+      { title: 'B entry', contentTypeSlug: 'post', content: { title: 'B' } },
+      authorB._id,
+    );
+    const updated = await cms.entries.update(entry._id, { title: 'edited by editor' }, editor);
+    expect(updated.title).toBe('edited by editor');
+    await cms.entries.delete(entry._id, editor);
+    expect(cms.entries.findById(entry._id)).toBeNull();
+  });
+
+  it('editor (generic entries:publish) can publish ANY author\'s entry', async () => {
+    const entry = await cms.entries.create(
+      { title: 'B entry', contentTypeSlug: 'post', content: { title: 'B' } },
+      authorB._id,
+    );
+    const published = await cms.entries.publish(entry._id, editor);
+    expect(published.status).toBe('published');
+  });
+
+  it('caller can be passed as a bare user-id string (looked up)', async () => {
+    const entry = await cms.entries.create(
+      { title: 'B entry', contentTypeSlug: 'post', content: { title: 'B' } },
+      authorB._id,
+    );
+    let err;
+    try { await cms.entries.update(entry._id, { title: 'x' }, authorA._id); } catch (e) { err = e; }
+    expect(err).toBeDefined();
+    expect(err.message.toLowerCase()).toContain('author');
+  });
+
+  it('omitting caller preserves legacy behaviour (no authorization check)', async () => {
+    const entry = await cms.entries.create(
+      { title: 'B entry', contentTypeSlug: 'post', content: { title: 'B' } },
+      authorB._id,
+    );
+    // No caller → no check, mutates regardless of authorship (back-compat).
+    const updated = await cms.entries.update(entry._id, { title: 'legacy' });
+    expect(updated.title).toBe('legacy');
+    await cms.entries.delete(entry._id);
+    expect(cms.entries.findById(entry._id)).toBeNull();
+  });
+});

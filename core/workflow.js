@@ -25,6 +25,29 @@ import { generateId } from './db.js';
 // WORKFLOW ENGINE
 // ---------------------------------------------------------------------------
 
+/**
+ * Generate a cryptographically secure random master key (256 bits, hex).
+ * Used when no `opts.masterKey` is provided so the credential vault is never
+ * initialized with the public hard-coded `'default-key'`.
+ *
+ * Trade-off: the generated key is per-instance and NOT persisted across
+ * restarts. Credentials encrypted with it cannot be decrypted after a restart
+ * unless an explicit `opts.masterKey` is supplied. Callers that need
+ * persistent credentials MUST pass their own `masterKey`.
+ */
+function _generateMasterKey() {
+  const crypto = (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle)
+    ? globalThis.crypto
+    : null;
+  if (!crypto || !crypto.getRandomValues) {
+    throw new Error('WorkflowEngine: Web Crypto unavailable — cannot generate a secure master key');
+  }
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  let hex = '';
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+  return hex;
+}
+
 export class WorkflowEngine {
   /**
    * @param {import('./db.js').DocStore} db
@@ -37,7 +60,7 @@ export class WorkflowEngine {
     this._workflows = db.collection('_workflows');
     this._executions = db.collection('_executions');
     this._nodeRegistry = opts.nodeRegistry || new NodeRegistry();
-    this._vault = new CredentialVault(db, opts.masterKey || 'default-key');
+    this._vault = new CredentialVault(db, opts.masterKey || _generateMasterKey());
 
     try { this._workflows.createIndex('name'); } catch {}
     try { this._workflows.createIndex('active'); } catch {}
@@ -74,6 +97,8 @@ export class WorkflowEngine {
   // ─── CRUD ────────────────────────────────────────────────
 
   create(definition) {
+    this._validateNodeIds(definition.nodes || []);
+
     const wf = this._workflows.insert({
       name: definition.name,
       description: definition.description || '',
@@ -107,6 +132,11 @@ export class WorkflowEngine {
   update(id, changes) {
     const wf = this._workflows.findById(id);
     if (!wf) throw new Error(`Workflow '${id}' not found`);
+
+    // Validate node ids if nodes are being updated.
+    if (changes.nodes !== undefined) {
+      this._validateNodeIds(changes.nodes);
+    }
 
     // Unregister old trigger
     this._triggers.unregister(id);
@@ -273,6 +303,31 @@ export class WorkflowEngine {
   // ─── INTERNAL ──────────────────────────────────────────
 
   /**
+   * Validate node ids in a workflow definition BEFORE it can be executed.
+   * Rejects:
+   *   - duplicate node ids (the second node would silently overwrite the
+   *     first's result in the execution context, keyed by `node.id`)
+   *   - the reserved id `_trigger` (collides with the trigger-data context key)
+   * Throws a clear Error so create()/update() fail before persistence.
+   */
+  _validateNodeIds(nodes) {
+    if (!Array.isArray(nodes)) return;
+    const seen = new Set();
+    for (const node of nodes) {
+      if (!node || typeof node !== 'object') continue;
+      const id = node.id;
+      if (id === undefined || id === null || id === '') continue;
+      if (id === '_trigger') {
+        throw new Error(`Workflow node id '_trigger' is reserved (collides with trigger data context key)`);
+      }
+      if (seen.has(id)) {
+        throw new Error(`Workflow node id '${id}' is duplicated — node ids must be unique`);
+      }
+      seen.add(id);
+    }
+  }
+
+  /**
    * Resolve {{nodeId.field}} and {{_trigger.field}} references in inputs.
    */
   _resolveInputs(inputs, context) {
@@ -309,6 +364,12 @@ export class WorkflowEngine {
     const parts = path.split('.');
     let current = context;
     for (const p of parts) {
+      // Block prototype-chain traversal: never resolve `__proto__`,
+      // `constructor` or `prototype` segments. A reference like
+      // `{{__proto__.constructor.name}}` must not walk the prototype chain.
+      if (p === '__proto__' || p === 'constructor' || p === 'prototype') {
+        return undefined;
+      }
       if (current == null) return undefined;
       current = current[p];
     }

@@ -68,6 +68,35 @@ describe('CredentialVault', () => {
     expect(vault.list().length).toBe(1); // still 1 entry
   });
 
+  it('update rejects meta.values injection (encrypted-at-rest preserved)', async () => {
+    await vault.store('slack', { token: 'xoxb-real' });
+    await vault.store('slack', { token: 'xoxb-real' }, { values: 'plaintext-injection' });
+    // The stored blob must remain encrypted, not the injected plaintext string.
+    const raw = vault._col.findOne({ name: 'slack' });
+    expect(raw.values).not.toBe('plaintext-injection');
+    expect(raw.values.token).toMatch(/^\$enc\$/);
+    // And it must still be recoverable via get().
+    const creds = await vault.get('slack');
+    expect(creds.token).toBe('xoxb-real');
+  });
+
+  it('update rejects meta.name rename', async () => {
+    await vault.store('slack', { token: 'xoxb-real' });
+    await vault.store('slack', { token: 'xoxb-real' }, { name: 'renamed' });
+    expect(vault.has('slack')).toBe(true);
+    expect(vault.has('renamed')).toBe(false);
+    expect(vault.list().length).toBe(1);
+    expect(vault.list()[0].name).toBe('slack');
+  });
+
+  it('update applies legitimate metadata (description, service)', async () => {
+    await vault.store('slack', { token: 'xoxb-real' }, { description: 'first', service: 'old' });
+    await vault.store('slack', { token: 'xoxb-real' }, { description: 'updated desc', service: 'stripe' });
+    const list = vault.list();
+    expect(list[0].description).toBe('updated desc');
+    expect(list[0].service).toBe('stripe');
+  });
+
   it('throws without init', async () => {
     const v2 = new CredentialVault(db, 'key');
     try {
@@ -76,5 +105,50 @@ describe('CredentialVault', () => {
     } catch (err) {
       expect(err.message).toContain('not initialized');
     }
+  });
+
+  // ---- FIX-41: salt persistido por instalación ----
+
+  it('init() persiste un salt en la colección de metadata', async () => {
+    const v = new CredentialVault(db, 'test-master-key-32chars!!!');
+    await v.init();
+    const meta = db.collection('_credentials_meta');
+    const saltDoc = meta.findOne({ _id: 'field_crypto_salt' });
+    expect(saltDoc).not.toBeNull();
+    expect(typeof saltDoc.salt).toBe('string');
+    expect(saltDoc.salt.length).toBeGreaterThan(0);
+    // No es la constante pública hardcodeada original.
+    expect(saltDoc.salt).not.toBe('js-doc-field-v1');
+  });
+
+  it('reutiliza el salt persistido entre instancias sobre el mismo db (restart)', async () => {
+    const mk = 'test-master-key-32chars!!!';
+    const v1 = new CredentialVault(db, mk);
+    await v1.init();
+    await v1.store('slack', { token: 'xoxb-secret-123' });
+
+    const saltBefore = db.collection('_credentials_meta').findOne({ _id: 'field_crypto_salt' }).salt;
+
+    // Segunda instancia "reabre" el mismo storage sin re-derivar salt nuevo.
+    const v2 = new CredentialVault(db, mk);
+    await v2.init();
+    const saltAfter = db.collection('_credentials_meta').findOne({ _id: 'field_crypto_salt' }).salt;
+    expect(saltAfter).toBe(saltBefore);
+
+    // La credencial encriptada por v1 sigue siendo desencriptable por v2.
+    const creds = await v2.get('slack');
+    expect(creds.token).toBe('xoxb-secret-123');
+  });
+
+  it('salt es único por instalación (dos db distintos → salts distintos)', async () => {
+    const db2 = new DocStore(new MemoryStorageAdapter());
+    const mk = 'test-master-key-32chars!!!';
+    const v1 = new CredentialVault(db, mk);
+    await v1.init();
+    const v2 = new CredentialVault(db2, mk);
+    await v2.init();
+    const s1 = db.collection('_credentials_meta').findOne({ _id: 'field_crypto_salt' }).salt;
+    const s2 = db2.collection('_credentials_meta').findOne({ _id: 'field_crypto_salt' }).salt;
+    expect(s1).not.toBe(s2);
   });
 });

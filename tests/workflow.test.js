@@ -341,3 +341,137 @@ describe('Triggers', () => {
     expect(tm.fireWebhook('h', {})).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Security fixes
+// ---------------------------------------------------------------------------
+
+describe('Security: masterKey default (FIX-23 #1)', () => {
+  it('does NOT use the hard-coded "default-key" when no masterKey is given', async () => {
+    // Engine A: no masterKey -> random per-instance key.
+    const dbA = new DocStore(new MemoryStorageAdapter());
+    const engineA = new WorkflowEngine(dbA);
+    await engineA.init();
+    await engineA.vault.store('cred', { token: 'super-secret' });
+
+    // Engine B: explicitly the old hard-coded key, sharing the same store.
+    const engineB = new WorkflowEngine(dbA, { masterKey: 'default-key' });
+    await engineB.init();
+
+    // If engineA had used 'default-key', engineB could decrypt it.
+    // Since engineA used a random key, decryption must fail.
+    await expect(engineB.vault.get('cred')).rejects.toThrow();
+  });
+
+  it('two instances without masterKey use different keys', async () => {
+    const db1 = new DocStore(new MemoryStorageAdapter());
+    const e1 = new WorkflowEngine(db1);
+    await e1.init();
+    await e1.vault.store('cred', { token: 'a' });
+
+    const e2 = new WorkflowEngine(db1);
+    await e2.init();
+    // Different random key -> cannot decrypt what e1 stored.
+    await expect(e2.vault.get('cred')).rejects.toThrow();
+  });
+});
+
+describe('Security: prototype traversal (FIX-23 #2)', () => {
+  it('_getFromContext blocks __proto__ traversal', () => {
+    const ctx = { name: 'Alice' };
+    expect(engine._getFromContext('__proto__.constructor.name', ctx)).toBeUndefined();
+    expect(engine._getFromContext('constructor.prototype', ctx)).toBeUndefined();
+  });
+
+  it('inline interpolation does not leak prototype values', () => {
+    const ctx = { name: 'Alice' };
+    // Inline form: "Found {{__proto__.constructor.name}} items"
+    expect(engine._resolveValue('Found {{__proto__.constructor.name}} items', ctx)).toBe('Found  items');
+    // Full-reference form returns undefined.
+    expect(engine._resolveValue('{{__proto__.constructor.name}}', ctx)).toBeUndefined();
+  });
+
+  it('normal nested references still resolve (regression)', () => {
+    const ctx = { user: { profile: { name: 'Alice', age: 30 } } };
+    expect(engine._getFromContext('user.profile.name', ctx)).toBe('Alice');
+    expect(engine._resolveValue('{{user.profile.name}}', ctx)).toBe('Alice');
+    expect(engine._resolveValue('Age: {{user.profile.age}}', ctx)).toBe('Age: 30');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Security: node id collision (FIX-39)
+// ---------------------------------------------------------------------------
+
+describe('Security: node id collision (FIX-39)', () => {
+  it('rejects create with duplicate node ids before execution', () => {
+    expect(() => engine.create({
+      name: 'Dup',
+      nodes: [
+        { id: 'n1', type: 'set.value', inputs: { value: 1 } },
+        { id: 'n1', type: 'set.value', inputs: { value: 2 } },
+      ],
+    })).toThrow(/duplicated/);
+  });
+
+  it('rejects create with reserved _trigger node id', () => {
+    expect(() => engine.create({
+      name: 'Reserved',
+      nodes: [{ id: '_trigger', type: 'set.value', inputs: { value: 1 } }],
+    })).toThrow(/_trigger.*reserved/);
+  });
+
+  it('rejects update with duplicate node ids before execution', () => {
+    const wf = engine.create({
+      name: 'OK',
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: 1 } }],
+    });
+    expect(() => engine.update(wf._id, {
+      nodes: [
+        { id: 'n1', type: 'set.value', inputs: { value: 1 } },
+        { id: 'n1', type: 'set.value', inputs: { value: 2 } },
+      ],
+    })).toThrow(/duplicated/);
+    // Original definition untouched after rejected update.
+    expect(engine.get(wf._id).nodes.length).toBe(1);
+  });
+
+  it('rejects update with reserved _trigger node id', () => {
+    const wf = engine.create({
+      name: 'OK2',
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: 1 } }],
+    });
+    expect(() => engine.update(wf._id, {
+      nodes: [{ id: '_trigger', type: 'set.value', inputs: { value: 1 } }],
+    })).toThrow(/_trigger.*reserved/);
+  });
+
+  it('creates and executes workflows with unique valid ids normally', async () => {
+    const wf = engine.create({
+      name: 'Valid',
+      nodes: [
+        { id: 'a', type: 'set.value', inputs: { value: 'first' } },
+        { id: 'b', type: 'set.value', inputs: { value: 'second' } },
+      ],
+    });
+    expect(wf._id).toBeDefined();
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.a.data).toBe('first');
+    expect(exec.nodeResults.b.data).toBe('second');
+  });
+
+  it('updating with unique valid ids succeeds', () => {
+    const wf = engine.create({
+      name: 'UpdValid',
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: 1 } }],
+    });
+    const updated = engine.update(wf._id, {
+      nodes: [
+        { id: 'n1', type: 'set.value', inputs: { value: 10 } },
+        { id: 'n2', type: 'set.value', inputs: { value: 20 } },
+      ],
+    });
+    expect(updated.nodes.length).toBe(2);
+  });
+});

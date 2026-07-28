@@ -368,3 +368,113 @@ describe('Dream Cycle', () => {
     expect(Array.isArray(report.log)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Dedup Performance Guard (FIX-22: bound O(n²) scan on large collections)
+// ---------------------------------------------------------------------------
+
+describe('Dedup Performance Guard', () => {
+  it('saveOrUpdate bounds the scan when collection exceeds maxDedupScanSize', () => {
+    const db2 = new DocStore(new MemoryStorageAdapter());
+    const mem2 = new AgentMemory(db2, {
+      agentId: 'cap-agent', userId: 'u1', dedupThreshold: 0.4, maxDedupScanSize: 5,
+    });
+
+    // Insert 10 distinct docs (above the cap of 5). Disjoint vocabularies so
+    // they do NOT dedup into one another — the collection must hold all 10.
+    for (let i = 0; i < 10; i++) {
+      mem2.saveOrUpdate('semantic', {
+        type: MemoryType.CODE_SNIPPET,
+        code: `c${i}k`,
+        description: `d${i}k q${i}k r${i}k`,
+        tags: [`t${i}`],
+      });
+    }
+    expect(mem2.stats().semantic).toBe(10);
+
+    // Capture console.warn to confirm safe degradation is reported
+    const originalWarn = console.warn;
+    const warns = [];
+    console.warn = (msg) => warns.push(String(msg));
+
+    // 11th save: scan must be capped, not a full O(n) over 10 docs
+    mem2._dedupComparisons = 0;
+    const result = mem2.saveOrUpdate('semantic', {
+      type: MemoryType.CODE_SNIPPET,
+      code: 'brand_new',
+      description: 'totally different and unique new entry',
+      tags: ['t'],
+    });
+    console.warn = originalWarn;
+
+    // Compared at most maxDedupScanSize docs (cap=5), not all 10
+    expect(mem2._dedupComparisons).toBeLessThanOrEqual(5);
+    expect(mem2._dedupComparisons).toBeGreaterThan(0);
+    // Degradation warning emitted
+    expect(warns.some(w => w.includes('dedup scan capped'))).toBe(true);
+    // Process did not hang; entry created (no duplicate match in the capped window)
+    expect(result.deduplicated).toBe(false);
+    expect(result.entry._id).toBeDefined();
+  });
+
+  it('dream bounds the O(n²) cluster scan when collection exceeds maxDedupScanSize', async () => {
+    const db2 = new DocStore(new MemoryStorageAdapter());
+    const mem2 = new AgentMemory(db2, {
+      agentId: 'cap-dream', userId: 'u1', dedupThreshold: 0.4, maxDedupScanSize: 5,
+    });
+
+    // 10 episodes (above cap=5). Full O(n²) would be C(10,2)=45 comparisons.
+    // Disjoint task vocabularies so none cluster — keeps all 10, scan still bounded.
+    for (let i = 0; i < 10; i++) {
+      mem2.learnTask({ task: `ep${i}task xyz${i}`, tags: [`g${i}`] });
+    }
+    expect(mem2.stats().episodic).toBe(10);
+
+    const originalWarn = console.warn;
+    const warns = [];
+    console.warn = (msg) => warns.push(String(msg));
+    const report = await mem2.dream();
+    console.warn = originalWarn;
+
+    // Capped scan: at most C(5,2)=10 comparisons for episodic (+ 0 semantic)
+    expect(mem2._dedupComparisons).toBeLessThanOrEqual(10);
+    // Strictly less than the unbounded C(10,2)=45
+    expect(mem2._dedupComparisons).toBeLessThan(45);
+    // Degradation warning emitted for the episodic collection
+    expect(warns.some(w => w.includes('dedup scan capped'))).toBe(true);
+    // Completed without hanging; report well-formed
+    expect(typeof report.kept).toBe('number');
+    expect(report.kept).toBeLessThanOrEqual(10);
+  });
+
+  it('normal dedup behavior is unchanged for collections below the limit', () => {
+    // Default cap (5000) — small collection behaves exactly as before.
+    // Insert original
+    mem.storeSnippet({
+      code: 'console.log("hello world")',
+      description: 'Print hello world to console',
+      tags: ['javascript', 'logging'],
+    });
+
+    const result = mem.saveOrUpdate('semantic', {
+      type: MemoryType.CODE_SNIPPET,
+      code: 'console.log("hello world")',
+      description: 'Print hello world to the console output',
+      tags: ['javascript', 'debug'],
+    });
+
+    // Same dedup outcome as the pre-fix behavior
+    expect(result.deduplicated).toBe(true);
+    expect(result.entry.tags).toContain('logging');
+    expect(result.entry.tags).toContain('debug');
+    expect(mem.stats().semantic).toBe(1);
+    // Below the cap: full scan, no degradation warning, scanned the 1 existing doc
+    expect(mem._dedupComparisons).toBe(1);
+  });
+
+  it('default maxDedupScanSize is 5000', () => {
+    const db2 = new DocStore(new MemoryStorageAdapter());
+    const mem2 = new AgentMemory(db2, { agentId: 'd', userId: 'u' });
+    expect(mem2.maxDedupScanSize).toBe(5000);
+  });
+});

@@ -101,6 +101,81 @@ describe('toHTML', () => {
   });
 });
 
+describe('toHTML — XSS protection in renderInlineMarks', () => {
+  // HECHO 1: HTML/<script> inside a paragraph text must be escaped, not rendered.
+  it('escapes <script> inside paragraph text', () => {
+    const html = toHTML([{ type: 'paragraph', text: '<script>alert(1)</script>' }]);
+    expect(html).toContain('&lt;script&gt;');
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).not.toContain('<script>');
+  });
+
+  it('escapes HTML inside heading text', () => {
+    const html = toHTML([{ type: 'heading', level: 2, text: '<img src=x onerror=alert(1)>' }]);
+    expect(html).toContain('&lt;img');
+    expect(html).not.toContain('<img src=x onerror=alert(1)>');
+  });
+
+  it('escapes HTML inside list items and quotes', () => {
+    const list = toHTML([{ type: 'list', style: 'bullet', items: ['<b>x</b>'] }]);
+    expect(list).toContain('&lt;b&gt;');
+    expect(list).not.toContain('<b>x</b>');
+    const quote = toHTML([{ type: 'quote', text: '</blockquote><script>bad()</script>' }]);
+    expect(quote).toContain('&lt;/blockquote&gt;');
+    expect(quote).not.toContain('</blockquote><script>');
+  });
+
+  // HECHO 2: javascript: URLs must not survive into an href.
+  it('blocks javascript: link href', () => {
+    const html = toHTML([{ type: 'paragraph', text: '[click](javascript:alert(1))' }]);
+    expect(html).not.toContain('href="javascript:alert(1)"');
+    expect(html).not.toContain('javascript:alert(1)');
+    // link still renders as an anchor with a safe href
+    expect(html).toContain('<a href="#">click</a>');
+  });
+
+  it('blocks obfuscated java\\tscript: link href', () => {
+    const html = toHTML([{ type: 'paragraph', text: '[x](java\tscript:alert(1))' }]);
+    expect(html).not.toContain('javascript:alert(1)');
+    expect(html).not.toContain('java\tscript:alert(1)');
+    expect(html).toContain('<a href="#">x</a>');
+  });
+
+  it('blocks data: and vbscript: link hrefs', () => {
+    const data = toHTML([{ type: 'paragraph', text: '[a](data:text/html,<script>)' }]);
+    expect(data).not.toContain('href="data:');
+    expect(data).toContain('<a href="#">a</a>');
+  });
+
+  // HECHO 3: legitimate links still work.
+  it('renders a legitimate https link', () => {
+    const html = toHTML([{ type: 'paragraph', text: '[texto](https://example.com)' }]);
+    expect(html).toContain('<a href="https://example.com">texto</a>');
+  });
+
+  it('renders a legitimate relative link', () => {
+    const html = toHTML([{ type: 'paragraph', text: '[go](/path/page)' }]);
+    expect(html).toContain('<a href="/path/page">go</a>');
+  });
+
+  it('renders a mailto link', () => {
+    const html = toHTML([{ type: 'paragraph', text: '[mail](mailto:a@b.com)' }]);
+    expect(html).toContain('<a href="mailto:a@b.com">mail</a>');
+  });
+
+  // HECHO 4: markdown still renders the right tags and does not self-escape.
+  it('still renders bold/italic/code tags', () => {
+    const html = toHTML([{ type: 'paragraph', text: '**bold** *italic* `code`' }]);
+    expect(html).toContain('<strong>bold</strong>');
+    expect(html).toContain('<em>italic</em>');
+    expect(html).toContain('<code>code</code>');
+    // our own tags must not be escaped
+    expect(html).not.toContain('&lt;strong&gt;');
+    expect(html).not.toContain('&lt;em&gt;');
+    expect(html).not.toContain('&lt;code&gt;');
+  });
+});
+
 describe('toMarkdown', () => {
   it('renders heading', () => {
     expect(toMarkdown([{ type: 'heading', level: 3, text: 'Title' }])).toContain('### Title');

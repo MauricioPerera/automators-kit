@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { parallelMerge, parallelRace } from '../core/parallel.js';
+import { parallelMerge, parallelRace, withTimeout } from '../core/parallel.js';
 
 const delay = (ms, val) => new Promise(r => setTimeout(() => r(val), ms));
 
@@ -125,6 +125,76 @@ describe('parallelMerge', () => {
     ]);
     expect(result.results.find(r => r.id === 'agent-b').output).toBe('y');
   });
+
+  it('scorer receives (result, task) — task object, not numeric index', async () => {
+    let captured = null;
+    await parallelMerge([
+      () => ({ output: 'a', confidence: 0.5 }),
+    ], {
+      scorer: (result, task) => {
+        // task must be the normalized task object ({ fn, id, weight }), not a number.
+        captured = { result, task };
+        return (result?.confidence ?? 0) * (task?.weight ?? 1);
+      },
+    });
+    expect(captured).not.toBeNull();
+    expect(typeof captured.task).toBe('object');
+    expect(captured.task.id).toBe('task-0');
+    expect(captured.task.weight).toBe(1);
+    expect(typeof captured.task.fn).toBe('function');
+    expect(captured.result.output).toBe('a');
+  });
+});
+
+describe('withTimeout', () => {
+  it('resolves in time and leaves controller untouched', async () => {
+    const controller = new AbortController();
+    const val = await withTimeout(delay(10, 'ok'), 100, controller);
+    expect(val).toBe('ok');
+    expect(controller.signal.aborted).toBe(false);
+  });
+
+  it('rejects on timeout and aborts the controller so the caller can cancel', async () => {
+    const controller = new AbortController();
+    let rejected = false;
+    try {
+      await withTimeout(delay(5000, 'slow'), 50, controller);
+    } catch (err) {
+      rejected = true;
+      expect(err.message).toBe('Timeout after 50ms');
+    }
+    expect(rejected).toBe(true);
+    // The cancellation handle fired: caller can wire this signal into a fetch, etc.
+    expect(controller.signal.aborted).toBe(true);
+  });
+
+  it('supports onTimeout callback (opts object form)', async () => {
+    let called = false;
+    let rejected = false;
+    try {
+      await withTimeout(delay(5000, 'slow'), 50, { onTimeout: () => { called = true; } });
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
+    expect(called).toBe(true);
+  });
+
+  it('does not cancel the underlying promise by itself (no controller)', async () => {
+    // Without a cancellation handle, the wrapped promise keeps running after timeout.
+    let settled = false;
+    const slow = delay(60, 'late').then(() => { settled = true; });
+    let rejected = false;
+    try {
+      await withTimeout(slow, 20);
+    } catch {
+      rejected = true;
+    }
+    expect(rejected).toBe(true);
+    // Give the still-running promise time to finish on its own.
+    await delay(80, null);
+    expect(settled).toBe(true);
+  });
 });
 
 describe('parallelRace', () => {
@@ -160,5 +230,28 @@ describe('parallelRace', () => {
       () => delay(10, 'fast'),
     ], { timeout: 100 });
     expect(result.resolved).toBe('fast');
+  });
+
+  it('empty task list resolves instead of hanging', async () => {
+    // Low timeout: if the empty-array fix regresses, this fails fast by
+    // timeout instead of stalling the whole suite.
+    const result = await Promise.race([
+      parallelRace([]),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('hung')), 2000)),
+    ]);
+    expect(result.resolved).toBeNull();
+    expect(result.winnerId).toBe(-1);
+    expect(result.duration).toBe(0);
+  });
+
+  it('non-empty race still works as before', async () => {
+    const result = await parallelRace([
+      () => delay(50, 'a'),
+      () => delay(10, 'b'),
+      () => delay(30, 'c'),
+    ]);
+    expect(result.resolved).toBe('b');
+    expect(result.winnerId).toBe(1);
+    expect(result.duration).toBeGreaterThanOrEqual(0);
   });
 });

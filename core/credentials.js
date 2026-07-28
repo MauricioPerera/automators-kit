@@ -13,6 +13,14 @@
 
 import { FieldCrypto } from './db.js';
 
+// Convierte un Uint8Array a base64 (sin deps; mismo patrón que core/db.js).
+function _bytesToBase64(uint8) {
+  if (typeof Buffer !== 'undefined') return Buffer.from(uint8).toString('base64');
+  let binary = '';
+  for (let i = 0; i < uint8.length; i++) binary += String.fromCharCode(uint8[i]);
+  return btoa(binary);
+}
+
 export class CredentialVault {
   /**
    * @param {import('./db.js').DocStore} db
@@ -23,12 +31,34 @@ export class CredentialVault {
     this._masterKey = masterKey;
     this._crypto = null;
     this._col = db.collection('_credentials');
+    this._meta = db.collection('_credentials_meta');
     try { this._col.createIndex('name', { unique: true }); } catch {}
   }
 
-  /** Initialize encryption */
+  /** Initialize encryption — loads or generates & persists a per-install salt. */
   async init() {
-    this._crypto = await FieldCrypto.create(this._masterKey);
+    const salt = this._loadOrCreateSalt();
+    this._crypto = await FieldCrypto.create(this._masterKey, salt);
+  }
+
+  /**
+   * Devuelve el salt persistido para FieldCrypto. Si no existe, genera uno
+   * aleatorio criptográficamente seguro, lo persiste en la colección de
+   * metadata y hace flush a disco. Así cada instalación tiene su propio salt
+   * único (no hay rainbow table global) y sobrevive restarts (mismo db →
+   * mismo salt → credenciales siguen siendo desencriptables).
+   */
+  _loadOrCreateSalt() {
+    const SALT_ID = 'field_crypto_salt';
+    const existing = this._meta.findOne({ _id: SALT_ID });
+    if (existing && typeof existing.salt === 'string') return existing.salt;
+
+    const crypto = globalThis.crypto?.webcrypto || globalThis.crypto;
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    const salt = _bytesToBase64(bytes);
+    this._meta.insert({ _id: SALT_ID, salt, createdAt: Date.now() });
+    this.db.flush();
+    return salt;
   }
 
   /**
@@ -46,11 +76,15 @@ export class CredentialVault {
 
     const existing = this._col.findOne({ name });
     if (existing) {
-      this._col.update({ _id: existing._id }, { $set: {
+      // Whitelist metadata fields — never let `meta` overwrite `values`/`name`/`_id`
+      // (same contract as the insert branch: only `description` and `service` are honored).
+      const set = {
         values: encrypted,
-        ...meta,
         updatedAt: Date.now(),
-      }});
+      };
+      if (meta.description !== undefined) set.description = meta.description;
+      if (meta.service !== undefined) set.service = meta.service;
+      this._col.update({ _id: existing._id }, { $set: set });
     } else {
       this._col.insert({
         name,

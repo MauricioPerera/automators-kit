@@ -43,8 +43,20 @@ function parseField(field, min, max) {
       const [range, step] = part.split('/');
       const stepN = parseInt(step);
       if (isNaN(stepN) || stepN <= 0) throw new Error(`Invalid cron step: ${step}`);
-      const start = range === '*' ? min : parseInt(range);
-      for (let i = start; i <= max; i += stepN) values.add(i);
+      let start, upper;
+      if (range === '*') {
+        // * — full field range
+        start = min; upper = max;
+      } else if (range.includes('-')) {
+        // Explicit lo-hi range — MUST stop at hi, not the field max.
+        const [lo, hi] = range.split('-').map(Number);
+        if (isNaN(lo) || isNaN(hi) || lo > hi) throw new Error(`Invalid cron range: ${range}`);
+        start = lo; upper = hi;
+      } else {
+        // Bare N — from N up to the field max (current/correct behavior).
+        start = parseInt(range); upper = max;
+      }
+      for (let i = start; i <= upper; i += stepN) values.add(i);
     } else if (part.includes('-')) {
       const [lo, hi] = part.split('-').map(Number);
       if (isNaN(lo) || isNaN(hi) || lo > hi) throw new Error(`Invalid cron range: ${part}`);
@@ -105,6 +117,8 @@ export class CronScheduler {
       lastRun: null,
       runs: 0,
       errors: 0,
+      running: false,        // anti-reentrancy guard
+      skippedOverlaps: 0,   // # of executions skipped because a prior one was still running
     });
     return this;
   }
@@ -148,6 +162,8 @@ export class CronScheduler {
       lastRun: t.lastRun,
       runs: t.runs,
       errors: t.errors,
+      running: t.running,
+      skippedOverlaps: t.skippedOverlaps,
     }));
   }
 
@@ -177,6 +193,13 @@ export class CronScheduler {
   }
 
   async _execute(task) {
+    // Anti-reentrancy: if this job is still running from a previous tick/manual
+    // run, skip the new invocation instead of launching a concurrent one.
+    if (task.running) {
+      task.skippedOverlaps++;
+      return;
+    }
+    task.running = true;
     try {
       await task.handler();
       task.lastRun = Date.now();
@@ -184,6 +207,8 @@ export class CronScheduler {
     } catch (err) {
       task.errors++;
       console.error(`[Cron] Error in '${task.name}':`, err.message);
+    } finally {
+      task.running = false;
     }
   }
 }

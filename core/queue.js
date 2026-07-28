@@ -24,6 +24,7 @@ export class JobQueue {
    * @param {number} opts.pollInterval - Poll interval ms (default: 1000)
    * @param {number} opts.maxRetries - Default max retries (default: 3)
    * @param {number} opts.backoffMs - Base backoff ms (default: 1000)
+   * @param {number} opts.leaseMs - Stuck-processing reclaim threshold ms (default: 300000 = 5min)
    */
   constructor(db, opts = {}) {
     this.db = db;
@@ -31,6 +32,7 @@ export class JobQueue {
     this.pollInterval = opts.pollInterval || 1000;
     this.maxRetries = opts.maxRetries || 3;
     this.backoffMs = opts.backoffMs || 1000;
+    this.leaseMs = opts.leaseMs ?? 300000;
 
     this._jobs = db.collection('_queue_jobs');
     this._dead = db.collection('_queue_dead');
@@ -115,6 +117,17 @@ export class JobQueue {
       clearInterval(this._timer);
       this._timer = null;
     }
+    // A pending throttled-flush timer would fire `this.db.flush()` after the
+    // queue has stopped, touching resources the caller may have already
+    // closed/released and keeping the process alive for nothing. Cancel it.
+    // A throttled flush means there may be unflushed writes batched since the
+    // last _markDirty; do one final synchronous flush so those changes are not
+    // lost (db.flush() is synchronous), then drop the timer.
+    if (this._flushTimer) {
+      clearTimeout(this._flushTimer);
+      this._flushTimer = null;
+      this.db.flush();
+    }
     return this;
   }
 
@@ -168,9 +181,15 @@ export class JobQueue {
     if (this._running >= this.concurrency) return;
 
     const now = Date.now();
+    const leaseCutoff = now - this.leaseMs;
+    // Pending jobs that are due, OR jobs stuck in 'processing' whose lease
+    // expired (process crashed/restarted mid-job) — reclaim the latter so
+    // they are not lost forever.
     const available = this._jobs.find({
-      status: 'pending',
-      runAt: { $lte: now },
+      $or: [
+        { status: 'pending', runAt: { $lte: now } },
+        { status: 'processing', updatedAt: { $lt: leaseCutoff } },
+      ],
     }).sort({ priority: -1, createdAt: 1 }).limit(this.concurrency - this._running).toArray();
 
     for (const job of available) {
@@ -190,7 +209,7 @@ export class JobQueue {
     this._running++;
 
     try {
-      const result = await handlerDef.handler(job.data, job);
+      const result = await this._invokeHandler(handlerDef, job);
       this._jobs.update({ _id: job._id }, { $set: {
         status: 'completed', result, error: null,
         attempts: job.attempts + 1, updatedAt: Date.now(),
@@ -216,5 +235,29 @@ export class JobQueue {
       this._running--;
       this.db.flush();
     }
+  }
+
+  /**
+   * Invoke a registered handler, enforcing its optional `timeout`.
+   * If the handler does not settle within `handlerDef.timeout` ms, reject with
+   * a timeout error (handled by _process like any other handler error). The
+   * underlying handler promise cannot be cancelled in JS, but its result is
+   * ignored once the timeout fires — freeing the concurrency slot.
+   */
+  _invokeHandler(handlerDef, job) {
+    const run = handlerDef.handler(job.data, job);
+    if (!handlerDef.timeout) return run;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error(`Handler timeout after ${handlerDef.timeout}ms`));
+      }, handlerDef.timeout);
+      Promise.resolve(run).then(
+        (v) => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } },
+        (e) => { if (!settled) { settled = true; clearTimeout(timer); reject(e); } }
+      );
+    });
   }
 }

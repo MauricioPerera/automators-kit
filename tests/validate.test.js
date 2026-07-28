@@ -104,4 +104,56 @@ describe('validate', () => {
     expect(v({ x: 5 }).valid).toBe(true);
     expect(v({}).valid).toBe(false);
   });
+
+  // Hallazgo 1: array passed against an object schema must yield ONLY the
+  // type error, no spurious nested-property errors.
+  it('object schema on array yields only the type error (no spurious subfield errors)', () => {
+    const schema = {
+      data: {
+        type: 'object',
+        properties: { a: { type: 'string' }, b: { type: 'number' } },
+      },
+    };
+    const result = validate(schema, { data: [1, 2, 3] });
+    expect(result.valid).toBe(false);
+    expect(result.errors).toEqual(['data must be an object']);
+    expect(result.errors.length).toBe(1);
+  });
+
+  // Hallazgo 2: documented default behavior — stripUnknown=false (default)
+  // passes through fields not declared in the schema, unvalidated.
+  it('default (stripUnknown=false) passes through unknown fields unvalidated', () => {
+    const schema = { name: { type: 'string', required: true } };
+    const result = validate(schema, { name: 'Alice', extra: 'unknown' });
+    expect(result.valid).toBe(true);
+    expect(result.data.extra).toBe('unknown');
+    // strict mode drops it
+    const strict = validate(schema, { name: 'Alice', extra: 'unknown' }, { stripUnknown: true });
+    expect(strict.valid).toBe(true);
+    expect(strict.data.extra).toBeUndefined();
+    expect('extra' in strict.data).toBe(false);
+  });
+
+  // Hallazgo 3: a `__proto__` own-property in the input must not pollute the
+  // prototype of the returned `result`.
+  it('__proto__ own-property does not pollute result prototype', () => {
+    const schema = { name: { type: 'string', required: true } };
+    // Craft an input whose own-property `__proto__` would, if spread, attach
+    // inherited properties to the result.
+    const input = { name: 'Alice' };
+    Object.defineProperty(input, '__proto__', {
+      value: { polluted: 'yes', constructor: Object.prototype.constructor },
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    const result = validate(schema, input, { stripUnknown: false });
+    expect(result.valid).toBe(true);
+    // polluted is NOT a legitimate schema field, so it must not leak via the
+    // prototype chain of result.
+    expect(result.data.polluted).toBeUndefined();
+    expect(Object.prototype.polluted).toBeUndefined();
+    // declared field still works
+    expect(result.data.name).toBe('Alice');
+  });
 });

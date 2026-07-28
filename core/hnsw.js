@@ -145,6 +145,7 @@ export class HNSWIndex {
     this.maxLevel = 0;
     this.nodeLevels = new Map(); // nodeIdx -> assigned level
     this.count = 0;
+    this.freeList = [];         // stack of reusable node indices (holes in vectors/idxToId)
   }
 
   /** Number of vectors in the index */
@@ -158,10 +159,19 @@ export class HNSWIndex {
   add(id, vector) {
     if (this.idToIdx.has(id)) return; // already exists
 
-    const nodeIdx = this.idxToId.length;
+    // Reuse a freed index (hole) before appending a new slot — prevents
+    // unbounded growth of vectors/idxToId under insert/remove churn.
+    let nodeIdx;
+    if (this.freeList.length > 0) {
+      nodeIdx = this.freeList.pop();
+      this.idxToId[nodeIdx] = id;
+      this.vectors[nodeIdx] = vector;
+    } else {
+      nodeIdx = this.idxToId.length;
+      this.idxToId.push(id);
+      this.vectors.push(vector);
+    }
     this.idToIdx.set(id, nodeIdx);
-    this.idxToId.push(id);
-    this.vectors.push(vector);
     this.count++;
 
     const nodeLevel = this._randomLevel();
@@ -249,19 +259,25 @@ export class HNSWIndex {
 
     this.idToIdx.delete(id);
     this.vectors[idx] = null;
+    this.idxToId[idx] = null;   // clear stale id mapping; slot is now a reusable hole
     this.nodeLevels.delete(idx);
     this.count--;
+    this.freeList.push(idx);    // recycle this index on the next add()
 
-    // Update entry point if removed
+    // Update entry point if removed. Pick the remaining node with the
+    // HIGHEST level (not the first one in Map iteration order) so that no
+    // node in an upper layer is left orphaned/unreachable from the new
+    // entry point — otherwise the top layers silently disconnect.
     if (this.entryPoint === idx) {
       this.entryPoint = -1;
-      for (const [nIdx] of this.nodeLevels) {
-        if (this.vectors[nIdx]) {
+      let bestLevel = -1;
+      for (const [nIdx, nLevel] of this.nodeLevels) {
+        if (this.vectors[nIdx] && nLevel > bestLevel) {
+          bestLevel = nLevel;
           this.entryPoint = nIdx;
-          this.maxLevel = this.nodeLevels.get(nIdx) || 0;
-          break;
         }
       }
+      this.maxLevel = bestLevel >= 0 ? bestLevel : 0;
     }
 
     return true;
@@ -321,7 +337,11 @@ export class HNSWIndex {
   // ─── INTERNAL ──────────────────────────────────────────────
 
   _randomLevel() {
-    return Math.floor(-Math.log(Math.random()) * this.ml);
+    // Clamp Math.random() to a positive minimum: returning 0.0 would yield
+    // -Math.log(0) === Infinity, producing an unbounded nodeLevel that hangs
+    // the levels-grow loop and exhausts memory. Cap the result for robustness.
+    const r = Math.max(Math.random(), Number.MIN_VALUE);
+    return Math.min(Math.floor(-Math.log(r) * this.ml), 32);
   }
 
   /**

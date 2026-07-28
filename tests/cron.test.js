@@ -36,6 +36,33 @@ describe('parseCron', () => {
     expect(s.minute.size).toBe(4);
   });
 
+  it('parses explicit range/step, capped at range upper bound', () => {
+    const s = parseCron('5-10/2 * * * *');
+    const mins = Array.from(s.minute).sort((a, b) => a - b);
+    expect(mins).toEqual([5, 7, 9]);
+    expect(s.minute.has(11)).toBe(false);
+    expect(s.minute.has(13)).toBe(false);
+    expect(s.minute.has(59)).toBe(false);
+    expect(s.minute.size).toBe(3);
+  });
+
+  it('parses */N (star step) using full field range — unchanged', () => {
+    const s = parseCron('*/15 * * * *');
+    const mins = Array.from(s.minute).sort((a, b) => a - b);
+    expect(mins).toEqual([0, 15, 30, 45]);
+    expect(s.minute.size).toBe(4);
+  });
+
+  it('parses N/step (bare, no explicit range) up to field max — unchanged', () => {
+    const s = parseCron('5/2 * * * *');
+    expect(s.minute.has(5)).toBe(true);
+    expect(s.minute.has(7)).toBe(true);
+    expect(s.minute.has(57)).toBe(true);
+    expect(s.minute.has(59)).toBe(true);
+    // 5 + 2k up to 59 → 28 values
+    expect(s.minute.size).toBe(28);
+  });
+
   it('parses comma-separated', () => {
     const s = parseCron('0 9,12,18 * * *');
     expect(s.hour.size).toBe(3);
@@ -139,5 +166,72 @@ describe('CronScheduler', () => {
     expect(cron._timer).not.toBeNull();
     cron.stop();
     expect(cron._timer).toBeNull();
+  });
+
+  it('does not run overlapping executions of the same job (reentrancy guard)', async () => {
+    let inFlight = false;
+    let overlap = false;
+    let resolveSlow;
+    const slow = new Promise(r => { resolveSlow = r; });
+    const cron = new CronScheduler();
+    cron.add('slow', '* * * * *', async () => {
+      if (inFlight) overlap = true;
+      inFlight = true;
+      await slow;
+      inFlight = false;
+    });
+    const task = cron._tasks.get('slow');
+
+    // Fire two concurrent executions — simulates a second tick landing while the
+    // first handler is still running (handler slower than the tick interval).
+    const p1 = cron._execute(task);
+    const p2 = cron._execute(task);
+
+    // The second invocation must be skipped synchronously, not started.
+    expect(task.running).toBe(true);
+    expect(task.skippedOverlaps).toBe(1);
+    expect(overlap).toBe(false);
+
+    resolveSlow();
+    await Promise.all([p1, p2]);
+
+    expect(overlap).toBe(false);
+    expect(task.runs).toBe(1);
+    expect(task.running).toBe(false);
+  });
+
+  it('clears running flag after completion and allows a later execution', async () => {
+    let calls = 0;
+    const cron = new CronScheduler();
+    cron.add('j', '* * * * *', async () => { calls++; });
+    const task = cron._tasks.get('j');
+
+    await cron._execute(task);
+    expect(task.running).toBe(false);
+    expect(task.runs).toBe(1);
+
+    // A later tick should fire normally — the guard was released.
+    await cron._execute(task);
+    expect(task.runs).toBe(2);
+    expect(calls).toBe(2);
+  });
+
+  it('clears running flag even when the handler throws', async () => {
+    let calls = 0;
+    const cron = new CronScheduler();
+    cron.add('j', '* * * * *', async () => {
+      calls++;
+      if (calls === 1) throw new Error('boom');
+    });
+    const task = cron._tasks.get('j');
+
+    await cron._execute(task);
+    expect(task.running).toBe(false);
+    expect(task.errors).toBe(1);
+
+    // After a throwing run, a later execution must still proceed normally.
+    await cron._execute(task);
+    expect(task.runs).toBe(1);
+    expect(calls).toBe(2);
   });
 });

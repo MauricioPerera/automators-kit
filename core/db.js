@@ -20,6 +20,46 @@ function generateId() {
 }
 
 // ---------------------------------------------------------------------------
+// REGEX GUARD — limita ReDoS desde patrones arbitrarios en filtros de query
+// ---------------------------------------------------------------------------
+
+// Longitud maxima de un patron $regex proveniente de input externo. Un patron
+// mayor se rechaza de plano: no se ejecuta .test() contra el valor del doc.
+const REGEX_MAX_LEN = 200;
+
+// Heuristica de backtracking catastrofico: detecta grupos cuantificados cuyo
+// contenido ya contiene un cuantificador ((x+)+, (x*)*, (x+)*, (x*)+), incluso
+// anidados ((a+)+)+. No es un analizador perfecto: puede over-rechazar
+// patrones validos con cuantificadores anidados no catastroficos. Es
+// intencional (fail-closed): el patron viene de input no confiable y ante la
+// duda se prefiere rechazar a colgar el event loop.
+//
+// Limites conocidos:
+//  - Solo cubre cuantificadores * y + (no ?). (a?)* no se detecta.
+//  - Patrones validos pero complejos con grupos cuantificados anidados pueden
+//    ser rechazados injustamente.
+//  - No detecta catastrofe por backtracking en construcciones sin grupo
+//    cuantificado (p.ej. super-linear por alternation ambigua).
+function _validateRegexPattern(src) {
+  if (typeof src !== 'string') src = String(src ?? '');
+  if (src.length > REGEX_MAX_LEN) {
+    throw new Error(`$regex pattern too long (max ${REGEX_MAX_LEN} chars)`);
+  }
+  // Quita escapes (\., \+, ...) y clases [..] para no falsear la heuristica.
+  let s = src.replace(/\\./g, '').replace(/\[(?:[^\]\\]|\\.)*\]/g, 'X');
+  // Colapsa grupos cuantificados de adentro hacia afuera; si el contenido de
+  // un grupo cuantificado ya tiene un * o +, hay anidamiento -> catastrofico.
+  for (let i = 0; i < 32; i++) {
+    const m = s.match(/\(([^()]*)\)([*+])/);
+    if (!m) break;
+    if (/[*+]/.test(m[1])) {
+      throw new Error('$regex pattern rejected: potential catastrophic backtracking');
+    }
+    s = s.replace(/\(([^()]*)\)([*+])/, 'Q');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MATCH FILTER (query engine)
 // ---------------------------------------------------------------------------
 
@@ -49,7 +89,11 @@ function matchFilter(doc, filter) {
     const cond = filter[key];
 
     if (cond === null || cond === undefined || typeof cond !== 'object' || cond instanceof RegExp) {
-      if (cond instanceof RegExp) { if (!cond.test(String(val ?? ''))) return false; }
+      if (cond instanceof RegExp) {
+        // cond proviene del filtro (input externo): validar antes de .test().
+        _validateRegexPattern(cond.source);
+        if (!cond.test(String(val ?? ''))) return false;
+      }
       else if (val !== cond) return false;
       continue;
     }
@@ -68,6 +112,9 @@ function matchFilter(doc, filter) {
         case '$exists':  if ((val !== undefined) !== target) return false; break;
         case '$regex': {
           const re = typeof target === 'string' ? new RegExp(target) : target;
+          // Validar antes de .test(): el patron viene del filtro (input
+          // externo) y un patron catastrofico bloquearia el event loop.
+          _validateRegexPattern(re.source);
           if (!re.test(String(val ?? ''))) return false;
           break;
         }
@@ -124,12 +171,25 @@ function matchFilter(doc, filter) {
   return true;
 }
 
+// Segmentos de path peligrosos: navegarlos permite alcanzar / mutar
+// Object.prototype y contaminar TODO objeto plano del proceso (prototype
+// pollution). Se rechazan de forma explícita con throw (no se ignoran
+// silenciosamente) para que un update malicioso sea obvio en logs y nunca
+// quede "parcialmente aplicado".
+const DANGEROUS_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function _checkPathSegment(seg) {
+  if (DANGEROUS_SEGMENTS.has(seg)) {
+    throw new Error(`Invalid path segment: ${seg}`);
+  }
+}
+
 /** Accede a valores anidados con dot notation: 'address.city' */
 function _getNestedValue(obj, path) {
-  if (!path.includes('.')) return obj[path];
   const parts = path.split('.');
   let current = obj;
   for (const p of parts) {
+    _checkPathSegment(p);
     if (current == null) return undefined;
     current = current[p];
   }
@@ -137,8 +197,8 @@ function _getNestedValue(obj, path) {
 }
 
 function _setNestedValue(obj, path, value) {
-  if (!path.includes('.')) { obj[path] = value; return; }
   const parts = path.split('.');
+  for (const p of parts) _checkPathSegment(p);
   let current = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     if (current[parts[i]] == null) current[parts[i]] = {};
@@ -148,8 +208,8 @@ function _setNestedValue(obj, path, value) {
 }
 
 function _deleteNestedValue(obj, path) {
-  if (!path.includes('.')) { delete obj[path]; return; }
   const parts = path.split('.');
+  for (const p of parts) _checkPathSegment(p);
   let current = obj;
   for (let i = 0; i < parts.length - 1; i++) {
     if (current[parts[i]] == null) return;
@@ -265,7 +325,13 @@ class FileStorageAdapter {
   }
   writeJson(filename, data) {
     const file = this.path.join(this.dir, filename);
-    this.fs.writeFileSync(file, JSON.stringify(data));
+    // FIX-20 (Hallazgo 1): escritura atómica via tmp + rename. Si el proceso
+    // muere a mitad del writeFileSync, el archivo final nunca queda truncado:
+    // o permanece el viejo válido, o el rename instala el nuevo completo.
+    // rename es atómico en el mismo filesystem (y reemplaza el destino en Win).
+    const tmp = file + '.tmp';
+    this.fs.writeFileSync(tmp, JSON.stringify(data));
+    this.fs.renameSync(tmp, file);
   }
   delete(filename) {
     const file = this.path.join(this.dir, filename);
@@ -857,13 +923,44 @@ class Collection {
 
     // Try load from persisted state
     const state = this._adapter.readJson(this._indexFile(field, type));
-    if (state && !rebuild) {
+    if (state && !rebuild && this._indexStateIsConsistent(field, type, state)) {
       index.importState(state);
     } else if (this._docs && this._docs.size > 0) {
       index.rebuild(Array.from(this._docs.values()));
     }
 
     this._indexes.set(field, index);
+  }
+
+  /**
+   * FIX-20 (Hallazgo 2): valida baratamente que el estado de índice persistido
+   * está consistente con los docs actuales. Si un flush anterior escribió docs
+   * pero no índices (crash), el índice persistido queda desincronizado y las
+   * queries devolverían resultados incorrectos sin error. Comparamos el set de
+   * _ids referenciados por el índice contra el set de docs que tienen el campo
+   * definido; si difieren, el caller fuerza rebuild en vez de usar estado stale.
+   */
+  _indexStateIsConsistent(field, type, state) {
+    if (!this._docs) return false;
+    let indexIds;
+    if (type === 'sorted') {
+      indexIds = new Set((state.entries || []).map(e => e && e._id));
+    } else {
+      indexIds = new Set();
+      const data = (state && state.data) || {};
+      for (const ids of Object.values(data)) {
+        for (const id of ids) indexIds.add(id);
+      }
+    }
+    const docIdsWithField = new Set();
+    for (const doc of this._docs.values()) {
+      if (_getNestedValue(doc, field) !== undefined) docIdsWithField.add(doc._id);
+    }
+    if (indexIds.size !== docIdsWithField.size) return false;
+    for (const id of indexIds) {
+      if (!docIdsWithField.has(id)) return false;
+    }
+    return true;
   }
 
   dropIndex(field) {
@@ -1175,8 +1272,14 @@ class Collection {
       try {
         this.insert(doc);
         count++;
-      } catch {
-        // Skip duplicates
+      } catch (err) {
+        // FIX-20 (Hallazgo 5): solo saltar violaciones de unicidad/duplicados
+        // (Duplicate _id / Unique constraint violated). Cualquier otro error
+        // (validación, prototype pollution, corrupción) se re-lanza para que
+        // el fallo sea visible en vez de tragado silenciosamente.
+        const msg = err && err.message ? err.message : '';
+        if (/Duplicate|Unique constraint/i.test(msg)) continue;
+        throw err;
       }
     }
     return count;
@@ -1259,7 +1362,11 @@ class DocStore {
     const watchers = this._watchers.get(collectionName);
     if (!watchers) return;
     for (const cb of watchers) {
-      try { cb(event); } catch {}
+      // FIX-20 (Hallazgo 5): aislar cada watcher para que el fallo de uno no
+      // interrumpa la notificación a los demás, pero loguear el error para que
+      // no quede silenciado del todo.
+      try { cb(event); }
+      catch (err) { console.error(`DocStore watch error (${collectionName}):`, err); }
     }
   }
 }
@@ -1482,7 +1589,8 @@ class Table {
     this.columns.push(colDef);
     this._colMap.set(colDef.name, colDef);
     if (colDef.unique) {
-      try { this._col.createIndex(colDef.name, { unique: true }); } catch {}
+      try { this._col.createIndex(colDef.name, { unique: true }); }
+      catch (err) { console.error(`Table.addColumn: index creation failed for "${colDef.name}":`, err); }
     }
     this._saveMeta();
   }
@@ -1652,12 +1760,34 @@ class EncryptedAdapter {
    * Crea un EncryptedAdapter derivando una key AES-256 del password.
    * @param {object} inner    Adapter interno
    * @param {string} password Password para derivar la key
-   * @param {string} [salt]   Salt (default: 'js-doc-store-v1')
+   * @param {string} [salt]   Salt. Si se omite, se genera uno aleatorio
+   *   criptográficamente seguro por almacenamiento y se PERSISTE en el adapter
+   *   interno (archivo `__enc.salt.json`) para que los datos sigan siendo
+   *   descifrables tras un restart. Pasar salt explícito desactiva la
+   *   persistencia (el caller lo gestiona).
    * @returns {Promise<EncryptedAdapter>}
    */
-  static async create(inner, password, salt = 'js-doc-store-v1') {
+  static async create(inner, password, salt) {
     const crypto = EncryptedAdapter._getCrypto();
     const enc = new TextEncoder();
+
+    // FIX-20 (Hallazgo 4): resolver el salt. Antes el default era la constante
+    // global 'js-doc-store-v1', lo que hacía que dos instalaciones con la misma
+    // password derivaran la misma key (vulnerable a rainbow tables precomputadas
+    // contra ese salt específico). Ahora: salt explícito > salt persistido >
+    // salt aleatorio nuevo (y se persiste para sobrevivir restarts).
+    let saltStr = salt;
+    if (!saltStr) {
+      const SALT_FILE = '__enc.salt.json';
+      const existing = inner.readJson(SALT_FILE);
+      if (existing && typeof existing.salt === 'string') {
+        saltStr = existing.salt;
+      } else {
+        const bytes = crypto.getRandomValues(new Uint8Array(16));
+        saltStr = _uint8ToBase64(bytes);
+        inner.writeJson(SALT_FILE, { salt: saltStr });
+      }
+    }
 
     // Derivar key con PBKDF2
     const keyMaterial = await crypto.subtle.importKey(
@@ -1665,7 +1795,7 @@ class EncryptedAdapter {
     );
 
     const key = await crypto.subtle.deriveKey(
-      { name: 'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash: 'SHA-256' },
+      { name: 'PBKDF2', salt: enc.encode(saltStr), iterations: 100000, hash: 'SHA-256' },
       keyMaterial,
       { name: 'AES-GCM', length: 256 },
       false,
@@ -1763,8 +1893,11 @@ class EncryptedAdapter {
     const encrypted = this.inner.readJson(filename);
     if (!encrypted) return null;
     if (!encrypted.__enc) return encrypted; // no encriptado, leer directo
-    // No podemos desencriptar sync — retornar null
-    return null;
+    // FIX-20 (Hallazgo 3): datos encriptados sin preload. Antes se devolvía
+    // `null` silenciosamente y la Collection lo interpretaba como colección
+    // vacía, haciendo que un insert posterior SOBREESCRIBA datos encriptados al
+    // flush. Lanzar hace el fallo visible en vez de silencioso.
+    throw new Error('EncryptedAdapter: encrypted data requires preload() before sync access');
   }
 
   writeJson(filename, data) {
@@ -1834,7 +1967,13 @@ function _base64ToUint8(base64) {
 class FieldCrypto {
   constructor(key) { this._key = key; }
 
-  static async create(password, salt = 'js-doc-field-v1') {
+  static async create(password, salt) {
+    // FIX-41: sin salt por defecto — el salt público hardcodeado permitía
+    // rainbow tables precomputadas contra esa constante. Ahora el caller es
+    // responsable de proveer y persistir un salt único por instalación.
+    if (!salt) {
+      throw new Error('FieldCrypto.create requires an explicit salt — no insecure default is provided. Callers must generate and persist a random salt.');
+    }
     const crypto = EncryptedAdapter._getCrypto();
     const enc = new TextEncoder();
     const keyMaterial = await crypto.subtle.importKey(
@@ -1927,9 +2066,12 @@ class Auth {
     this._sessions = this.db.collection(this.sessionsCol);
 
     // Indices
-    try { this._users.createIndex('email', { unique: true }); } catch {}
-    try { this._sessions.createIndex('token'); } catch {}
-    try { this._sessions.createIndex('userId'); } catch {}
+    try { this._users.createIndex('email', { unique: true }); }
+    catch (err) { console.error('Auth.init: email index failed:', err); }
+    try { this._sessions.createIndex('token'); }
+    catch (err) { console.error('Auth.init: token index failed:', err); }
+    try { this._sessions.createIndex('userId'); }
+    catch (err) { console.error('Auth.init: userId index failed:', err); }
 
     // Auto-cleanup expired sessions every hour
     this.cleanExpiredSessions();

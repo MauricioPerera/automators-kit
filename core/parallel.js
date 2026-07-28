@@ -24,7 +24,10 @@
  * @param {string} opts.strategy - 'first-wins' | 'highest-confidence' | 'consensus' | 'all' (default: 'highest-confidence')
  * @param {number} opts.timeout - Per-task timeout in ms (default: 30000)
  * @param {number} opts.minConfidence - Minimum confidence to accept (default: 0)
- * @param {Function} opts.scorer - Custom scorer: (result, index) => number (overrides confidence field)
+ * @param {Function} opts.scorer - Custom scorer: (result, task) => number (overrides confidence field).
+ *   Receives the raw `result` value and the normalized `task` object ({ fn, id, weight }).
+ *   NOTE: this is the `task` object, not a numeric index — despite the strategy name,
+ *   tasks resolve together via Promise.all, so there is no completion order to index by.
  *
  * @returns {Promise<{ resolved: any, results: Array, conflicts: Array, strategy: string, duration: number }>}
  */
@@ -76,8 +79,10 @@ export async function parallelMerge(tasks, opts = {}) {
 
   switch (strategy) {
     case 'first-wins': {
-      // First completed (they all resolved at same time via Promise.all,
-      // so "first" = first in array order that succeeded)
+      // NOTE: name kept for API compatibility, but this is NOT "first to finish"
+      // chronologically. All tasks resolve together via Promise.all, so
+      // `completed[0]` is the first task IN ARRAY ORDER that succeeded — not
+      // the fastest. For true first-to-finish semantics, use parallelRace.
       resolved = completed[0].output;
       break;
     }
@@ -176,6 +181,14 @@ export async function parallelRace(tasks, opts = {}) {
   const timeout = opts.timeout || 30000;
   const start = performance.now();
 
+  // Empty task list: no winner possible. Resolve immediately instead of
+  // hanging forever (forEach never calls its callback, so the Promise would
+  // otherwise stay pending). Mirrors the all-failed shape: null resolved,
+  // winnerId -1, zero duration.
+  if (!tasks || tasks.length === 0) {
+    return { resolved: null, winnerId: -1, duration: 0 };
+  }
+
   return new Promise((resolve) => {
     let settled = false;
     let failures = 0;
@@ -218,9 +231,44 @@ export async function parallelRace(tasks, opts = {}) {
 // HELPERS
 // ---------------------------------------------------------------------------
 
-function withTimeout(promise, ms) {
+/**
+ * Wrap a promise with a timeout. On expiry the outer promise rejects, but the
+ * underlying task is NOT cancelled by withTimeout itself — JavaScript cannot
+ * cancel an arbitrary Promise without the producer's cooperation. The promise
+ * keeps running in the background after the timeout fires.
+ *
+ * To get REAL cancellation, pass an `AbortController` (or an `onTimeout` callback)
+ * via the optional third argument: withTimeout calls `controller.abort()` (and/or
+ * `onTimeout()`) when the timeout expires, so a task that respects the signal
+ * (e.g. `fetch(url, { signal })`) will actually stop instead of leaking. The
+ * caller is responsible for wiring the controller's signal into the task producer.
+ *
+ * @param {Promise} promise - Promise to wait for.
+ * @param {number} ms - Timeout in milliseconds.
+ * @param {{ controller?: AbortController, onTimeout?: () => void }|AbortController} [cancel]
+ *   Optional cancellation handle. May be an `AbortController` directly, or an
+ *   opts object `{ controller, onTimeout }`. On timeout: `controller.abort()` is
+ *   called and/or `onTimeout()` runs (if provided). On normal settle/resolve, the
+ *   controller is left untouched (the task finished in time).
+ * @returns {Promise} Resolves with the promise's value, or rejects with a
+ *   timeout error after `ms`.
+ */
+export function withTimeout(promise, ms, cancel) {
+  // Accept either an AbortController directly or an opts object.
+  const opts = cancel && typeof cancel.abort === 'function'
+    ? { controller: cancel }
+    : (cancel || {});
+
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`Timeout after ${ms}ms`)), ms);
+    const timer = setTimeout(() => {
+      // Surface rejection first, then give the caller a chance to cancel the
+      // still-running underlying task.
+      reject(new Error(`Timeout after ${ms}ms`));
+      if (opts.controller) {
+        try { opts.controller.abort(); } catch { /* already aborted */ }
+      }
+      if (typeof opts.onTimeout === 'function') opts.onTimeout();
+    }, ms);
     promise.then(
       (val) => { clearTimeout(timer); resolve(val); },
       (err) => { clearTimeout(timer); reject(err); },

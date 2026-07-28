@@ -32,6 +32,13 @@ export function notFound(message = 'Not found') {
   return json({ error: message }, 404);
 }
 
+/**
+ * Sentinel returned by _match when a route matched but a path param could not
+ * be URI-decoded (malformed percent-encoding). Distinguishes "bad request"
+ * from "no match" so the caller can answer 400 instead of 404 or 500.
+ */
+const BAD_REQUEST = Symbol('bad-request');
+
 // ---------------------------------------------------------------------------
 // ROUTE COMPILER
 // ---------------------------------------------------------------------------
@@ -56,7 +63,7 @@ function compilePattern(pattern) {
 // ---------------------------------------------------------------------------
 
 export class Router {
-  constructor() {
+  constructor(options = {}) {
     /** @type {Array<{method: string, pattern: string, compiled: {regex: RegExp, paramNames: string[]}, handlers: Function[]}>} */
     this._routes = [];
     /** @type {Function[]} */
@@ -67,10 +74,15 @@ export class Router {
     this._notFound = null;
     /** @type {Function|null} */
     this._onError = null;
+    /** Max request body size in bytes (Content-Length guard). 0 = disabled. */
+    this._maxBodySize = options.maxBodySize ?? 10 * 1024 * 1024; // 10MB default
 
     // Bind handle so it can be passed directly to Bun.serve/Deno.serve
     this.handle = this.handle.bind(this);
   }
+
+  /** Configure the max request body size in bytes (0 disables the guard). */
+  setMaxBodySize(bytes) { this._maxBodySize = bytes; return this; }
 
   /** Register global middleware */
   use(...handlers) {
@@ -120,6 +132,19 @@ export class Router {
     const method = request.method;
     const path = url.pathname;
 
+    // Body size guard: reject oversized payloads BEFORE materializing the body.
+    // Only Content-Length is checked (when present); bodies without a reliable
+    // Content-Length are not capped by this guard (streaming cap is a future fix).
+    if (this._maxBodySize > 0 && !['GET', 'HEAD'].includes(method)) {
+      const cl = request.headers.get('Content-Length');
+      if (cl !== null) {
+        const len = Number(cl);
+        if (Number.isFinite(len) && len > this._maxBodySize) {
+          return error('Request body too large', 413);
+        }
+      }
+    }
+
     // Cache raw body text so it survives sub-router Request recreation
     let _rawBody;
     if (!['GET', 'HEAD'].includes(method)) {
@@ -145,58 +170,84 @@ export class Router {
       _body: undefined,
     };
 
+    let response;
     try {
       // Run global middleware
       const mwResult = await this._runMiddleware(this._middleware, ctx);
-      if (mwResult instanceof Response) return mwResult;
-
-      // Handle OPTIONS (CORS preflight) — return 204 if no explicit route
-      if (method === 'OPTIONS') {
+      if (mwResult instanceof Response) {
+        response = mwResult;
+      } else if (method === 'OPTIONS') {
+        // Handle OPTIONS (CORS preflight) — return 204 if no explicit route
         const optRoute = this._match('OPTIONS', path);
-        if (optRoute) return this._executeRoute(optRoute, ctx);
-        return new Response(null, { status: 204 });
-      }
+        if (optRoute === BAD_REQUEST) response = error('Bad Request', 400);
+        else response = optRoute ? await this._executeRoute(optRoute, ctx) : new Response(null, { status: 204 });
+      } else {
+        // Try sub-routers first
+        response = null;
+        for (const { prefix, router } of this._subs) {
+          if (path === prefix || path.startsWith(prefix + '/')) {
+            // Strip prefix for sub-router
+            const subPath = path.slice(prefix.length) || '/';
+            const subUrl = new URL(request.url);
+            subUrl.pathname = subPath;
+            const subReq = new Request(subUrl.toString(), {
+              method: request.method,
+              headers: request.headers,
+              body: ['GET', 'HEAD'].includes(method) ? null : request.body,
+            });
+            // Pass state + cached body down
+            const subCtx = {
+              ...ctx,
+              req: subReq,
+              path: subPath,
+              query: Object.fromEntries(subUrl.searchParams),
+            };
+            // Preserve the json() parser and cached body
+            subCtx.json = ctx.json;
+            subCtx._body = ctx._body;
+            const result = await router._handleInternal(subCtx, subPath);
+            if (result) { response = result; break; }
+          }
+        }
 
-      // Try sub-routers first
-      for (const { prefix, router } of this._subs) {
-        if (path === prefix || path.startsWith(prefix + '/')) {
-          // Strip prefix for sub-router
-          const subPath = path.slice(prefix.length) || '/';
-          const subUrl = new URL(request.url);
-          subUrl.pathname = subPath;
-          const subReq = new Request(subUrl.toString(), {
-            method: request.method,
-            headers: request.headers,
-            body: ['GET', 'HEAD'].includes(method) ? null : request.body,
-          });
-          // Pass state + cached body down
-          const subCtx = {
-            ...ctx,
-            req: subReq,
-            path: subPath,
-            query: Object.fromEntries(subUrl.searchParams),
-          };
-          // Preserve the json() parser and cached body
-          subCtx.json = ctx.json;
-          subCtx._body = ctx._body;
-          const result = await router._handleInternal(subCtx, subPath);
-          if (result) return result;
+        // Match own routes
+        if (!response) {
+          const match = this._match(method, path);
+          if (match === BAD_REQUEST) response = error('Bad Request', 400);
+          else if (match) response = await this._executeRoute(match, ctx);
+          else if (this._notFound) response = this._notFound(ctx);
+          else response = notFound();
         }
       }
-
-      // Match own routes
-      const match = this._match(method, path);
-      if (match) return await this._executeRoute(match, ctx);
-
-      // 404
-      if (this._notFound) return this._notFound(ctx);
-      return notFound();
-
     } catch (err) {
-      if (this._onError) return this._onError(err, ctx);
-      console.error('[Router] Error:', err);
-      return error(err.message || 'Internal server error', 500);
+      if (this._onError) {
+        response = this._onError(err, ctx);
+      } else {
+        // Log full detail server-side only; never leak err.message to the client.
+        console.error('[Router] Error:', err);
+        response = error('Internal server error', 500);
+      }
     }
+
+    // Post-process: merge CORS headers (set by middleware on ctx.state) into the
+    // final response so ALL responses (not just OPTIONS preflight) carry them.
+    return this._applyCors(response, ctx);
+  }
+
+  /**
+   * Merge ctx.state._corsHeaders into the final response headers.
+   * @private
+   */
+  _applyCors(response, ctx) {
+    const corsHeaders = ctx && ctx.state && ctx.state._corsHeaders;
+    if (!corsHeaders || !response) return response;
+    const headers = new Headers(response.headers);
+    for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
   }
 
   /**
@@ -222,6 +273,7 @@ export class Router {
 
     // Match own routes
     const match = this._match(ctx.method, path);
+    if (match === BAD_REQUEST) return error('Bad Request', 400);
     if (match) return this._executeRoute(match, ctx);
 
     return null;
@@ -234,9 +286,15 @@ export class Router {
       const m = route.compiled.regex.exec(path);
       if (m) {
         const params = {};
-        route.compiled.paramNames.forEach((name, i) => {
-          params[name] = decodeURIComponent(m[i + 1]);
-        });
+        for (let i = 0; i < route.compiled.paramNames.length; i++) {
+          const name = route.compiled.paramNames[i];
+          try {
+            params[name] = decodeURIComponent(m[i + 1]);
+          } catch {
+            // Malformed percent-encoding (e.g. %zz) → 400, not a 500.
+            return BAD_REQUEST;
+          }
+        }
         return { route, params };
       }
     }
@@ -320,21 +378,51 @@ export function logger() {
 }
 
 /**
+ * Tracks every active rate-limit cleanup timer so the process can confirm no
+ * orphans accumulate (each rateLimit() call registers its timer here and
+ * removes it on stop()). Exposed for tests/ops introspection only.
+ */
+const _activeRateLimitTimers = new Set();
+export function getActiveRateLimitTimerCount() { return _activeRateLimitTimers.size; }
+
+/**
+ * Default key function: extract a real client IP from common proxy headers
+ * (CF-Connecting-IP, X-Forwarded-For, X-Real-IP), falling back to 'global' when
+ * none is present. This prevents one client from exhausting a single shared
+ * bucket for everyone.
+ */
+function defaultKeyFn(ctx) {
+  const headers = ctx && ctx.req && ctx.req.headers;
+  if (headers) {
+    const cf = headers.get('CF-Connecting-IP');
+    if (cf) return cf.trim();
+    const xff = headers.get('X-Forwarded-For');
+    if (xff) return xff.split(',')[0].trim();
+    const xri = headers.get('X-Real-IP');
+    if (xri) return xri.trim();
+  }
+  return 'global';
+}
+
+/**
  * Rate limiter middleware (sliding window).
  * Inspired by Syntra's rate-limit middleware.
  * @param {object} opts
  * @param {number} opts.max - Max requests per window (default: 120)
  * @param {number} opts.windowMs - Window size in ms (default: 60000 = 1 min)
  * @param {Function} opts.keyFn - (ctx) => string, key to rate limit by (default: IP or 'global')
+ * @returns {Function} middleware with a `.stop()` method to clear its cleanup timer.
  */
 export function rateLimit(opts = {}) {
   const max = opts.max || 120;
   const windowMs = opts.windowMs || 60000;
-  const keyFn = opts.keyFn || (() => 'global');
+  const keyFn = opts.keyFn || defaultKeyFn;
   const windows = new Map(); // key -> number[]
 
-  // Cleanup old entries periodically
-  setInterval(() => {
+  // Cleanup old entries periodically. The timer ref is tracked so it can be
+  // stopped via middleware.stop(); without that, every rateLimit() call would
+  // leak a permanent interval (and keep the event loop alive).
+  const timer = setInterval(() => {
     const now = Date.now();
     for (const [key, timestamps] of windows) {
       const valid = timestamps.filter(t => now - t < windowMs);
@@ -342,8 +430,11 @@ export function rateLimit(opts = {}) {
       else windows.set(key, valid);
     }
   }, windowMs);
+  // Don't let the cleanup timer keep the process alive on its own.
+  if (typeof timer.unref === 'function') timer.unref();
+  _activeRateLimitTimers.add(timer);
 
-  return async (ctx, next) => {
+  const middleware = async (ctx, next) => {
     const key = keyFn(ctx);
     const now = Date.now();
 
@@ -381,4 +472,12 @@ export function rateLimit(opts = {}) {
 
     return next();
   };
+
+  /** Clear this limiter's cleanup timer so it stops leaking the interval. */
+  middleware.stop = function stop() {
+    clearInterval(timer);
+    _activeRateLimitTimers.delete(timer);
+  };
+
+  return middleware;
 }

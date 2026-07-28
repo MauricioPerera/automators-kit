@@ -90,6 +90,63 @@ describe('HNSWIndex', () => {
     expect(hnsw.size).toBe(1);
   });
 
+  it('remove entry point keeps every remaining node reachable (no orphaned upper layers)', () => {
+    // Deterministic level assignment by insertion order:
+    //   A=3 (becomes entry point), C=0, D=0, E=0, B=2 (inserted LAST).
+    // Map iteration order = insertion order, so after removing A the
+    // FIRST remaining node is C (level 0). The naive reassignment picked
+    // that first node and set maxLevel=0, orphaning B's level-2 layer.
+    // The fix must pick the remaining node with the HIGHEST level (B, 2).
+    const hnsw = new HNSWIndex({ m: 4, efConstruction: 50, efSearch: 50 });
+    const preset = [3, 0, 0, 0, 2];
+    let li = 0;
+    hnsw._randomLevel = () => preset[li++];
+
+    const dim = 8;
+    const va = randomVec(dim), vc = randomVec(dim), vd = randomVec(dim);
+    const ve = randomVec(dim), vb = randomVec(dim);
+    hnsw.add('A', va);
+    hnsw.add('C', vc);
+    hnsw.add('D', vd);
+    hnsw.add('E', ve);
+    hnsw.add('B', vb);
+
+    expect(hnsw.entryPoint).toBe(0); // A is index 0, highest level
+    expect(hnsw.maxLevel).toBe(3);
+
+    hnsw.remove('A'); // remove the entry point
+
+    // maxLevel must reflect the highest REMAINING level (B=2), not C=0.
+    expect(hnsw.maxLevel).toBe(2);
+
+    // Every remaining node must be findable via a self-query (distance 0
+    // to itself) — proves none were orphaned by the entry-point swap.
+    for (const [id, vec] of [['B', vb], ['C', vc], ['D', vd], ['E', ve]]) {
+      const res = hnsw.search(vec, hnsw.size);
+      expect(res.some(r => r.id === id)).toBe(true);
+    }
+  });
+
+  it('remove then re-add reuses freed indices (no unbounded vectors growth)', () => {
+    const hnsw = new HNSWIndex({ m: 4, efConstruction: 20 });
+    const dim = 8;
+    const N = 30, M = 10;
+
+    for (let i = 0; i < N; i++) hnsw.add(`n${i}`, randomVec(dim));
+    expect(hnsw.vectors.length).toBe(N);
+
+    for (let i = 0; i < M; i++) hnsw.remove(`n${i}`); // punch M holes
+    expect(hnsw.size).toBe(N - M);
+    expect(hnsw.vectors.length).toBe(N); // holes, not shrunk
+
+    for (let i = 0; i < M; i++) hnsw.add(`new${i}`, randomVec(dim));
+    expect(hnsw.size).toBe(N);
+    // Re-adds MUST recycle the freed holes instead of appending → length
+    // stays at N. Under the old code this grew to N + M.
+    expect(hnsw.vectors.length).toBe(N);
+    expect(hnsw.freeList.length).toBe(0);
+  });
+
   it('recall quality with 1000 vectors', () => {
     const dim = 32;
     const n = 1000;
@@ -124,5 +181,33 @@ describe('HNSWIndex', () => {
 
     // HNSW should have at least 70% recall with these params
     expect(recall).toBeGreaterThanOrEqual(0.7);
+  });
+
+  it('_randomLevel is finite and bounded when Math.random() returns 0', () => {
+    const hnsw = new HNSWIndex({ m: 4, efConstruction: 20 });
+    const originalRandom = Math.random;
+    // Force Math.random to always return 0 — would have hung the process.
+    Math.random = () => 0;
+    try {
+      const level = hnsw._randomLevel();
+      // Must be a finite integer, not Infinity/NaN, and capped at 32.
+      expect(Number.isFinite(level)).toBe(true);
+      expect(Number.isInteger(level)).toBe(true);
+      expect(level).toBeLessThanOrEqual(32);
+      expect(level).toBeGreaterThanOrEqual(0);
+
+      // Add must not hang and must produce a finite level assignment.
+      hnsw.add('zero-rand', [1, 0, 0, 0]);
+      expect(hnsw.size).toBe(1);
+      expect(Number.isFinite(hnsw.maxLevel)).toBe(true);
+      expect(hnsw.maxLevel).toBeLessThanOrEqual(32);
+
+      // search still works.
+      const res = hnsw.search([1, 0, 0, 0], 1);
+      expect(res.length).toBe(1);
+      expect(res[0].id).toBe('zero-rand');
+    } finally {
+      Math.random = originalRandom; // restore — never leak the global mock
+    }
   });
 });

@@ -23,6 +23,7 @@ class TopKHeap {
   }
 
   push(item) {
+    if (this.k <= 0) return; // k=0 → heap vacío, nada que insertar (FIX-36 Hallazgo 2)
     if (this.data.length < this.k) {
       this.data.push(item);
       this._bubbleUp(this.data.length - 1);
@@ -181,6 +182,32 @@ function computeScore(a, b, dims, metric) {
 //   { $or: [{ category: 'tech' }, { category: 'science' }] }
 //   { name: { $regex: '^AI' } }                   → regex match
 
+// --- $regex safety -----------------------------------------------------------
+// Límites para $regex: un patrón arbitrario de usuario puede ser catastrófico
+// (ReDoS). Antes de compilar validamos (1) longitud máxima del patrón y
+// (2) una heurística simple de cuantificadores anidados tipo (x+)+ / (x*)*.
+// Heurística deliberadamente conservadora: detecta un grupo NO anidado que
+// contiene un cuantificador y a su vez está cuantificado. Limitaciones
+// conocidas: NO detecta anidamiento profundo (p.ej. ((a+)+)+) ni otras formas
+// de backtracking exponencial; es una primera línea de defensa, no un motor
+// de análisis de regex. Ver specs/FIX-07-vector-REPORT.md.
+const REGEX_MAX_PATTERN_LEN = 200;
+const REGEX_CATASTROPHIC = /\([^()]*[+*?][^()]*\)[+*?]/;
+
+function _compileSafeRegex(target) {
+  const src = typeof target === 'string'
+    ? target
+    : (target && typeof target.source === 'string' ? target.source : null);
+  if (src === null) return target; // no es string ni RegExp: deja que .test() falle igual que antes
+  if (src.length > REGEX_MAX_PATTERN_LEN) {
+    throw new Error(`$regex: patrón demasiado largo (>${REGEX_MAX_PATTERN_LEN} chars)`);
+  }
+  if (REGEX_CATASTROPHIC.test(src)) {
+    throw new Error(`$regex: patrón potencialmente catastrófico rechazado (cuantificador anidado)`);
+  }
+  return typeof target === 'string' ? new RegExp(target) : target;
+}
+
 function matchFilter(metadata, filter) {
   if (!filter || typeof filter !== 'object') return true;
   if (!metadata) metadata = {};
@@ -231,7 +258,7 @@ function matchFilter(metadata, filter) {
         case '$nin':    if (Array.isArray(target) && target.includes(val)) return false; break;
         case '$exists': if ((val !== undefined) !== target) return false; break;
         case '$regex': {
-          const re = typeof target === 'string' ? new RegExp(target) : target;
+          const re = _compileSafeRegex(target);
           if (!re.test(String(val ?? ''))) return false;
           break;
         }
@@ -1282,9 +1309,12 @@ class PolarQuantizedStore {
       dot += qa * this._cosTable[indices[p]] + qb * this._sinTable[indices[p]];
       nq += qa * qa + qb * qb;
     }
-    // El vector reconstruido es unitario por construccion (cos^2+sin^2=1 por par)
+    // FIX-36 Hallazgo 1: el vector reconstruido tiene norma sqrt(pairs), no 1
+    // (cada par aporta cos^2+sin^2=1 a la norma al cuadrado, sumando `pairs`).
+    // El coseno real divide por |query| * |stored|; sin |stored| el score escala
+    // con sqrt(pairs) y excede [-1,1], rompiendo normalizaciones downstream.
     const denomQ = Math.sqrt(nq);
-    return denomQ === 0 ? 0 : dot / denomQ;
+    return denomQ === 0 ? 0 : dot / (denomQ * Math.sqrt(this._pairs));
   }
 
   // ── Collection management (same pattern as other stores) ─────
@@ -1564,6 +1594,13 @@ class IVFIndex {
     if (entry.pending && entry.pending.length > 0) this.store._flushCol(col, entry);
 
     const dim = this.store.dim;
+    // sampleDims define sobre cuántas dimensiones se clusteriza (soporta
+    // truncamiento Matryoshka: query de dimensión menor que el store). Se
+    // clampa a dim y se usa tanto para el k-means como para la comparación en
+    // _getCandidates, de forma consistente. Antes se clusterizaba sobre dim
+    // completa y sampleDims era solo metadata → asignación de cluster
+    // incorrecta con queries truncados (recall degradado silencioso).
+    const sdim = Math.min(sampleDims, dim);
     let flat;
 
     if (this.store instanceof PolarQuantizedStore || this.store instanceof BinaryQuantizedStore) {
@@ -1595,11 +1632,19 @@ class IVFIndex {
       for (let i = 0; i < n * dim; i++) flat[i] = f32[i];
     }
 
-    const { centroids, assignments } = this._kmeans(flat, n, dim, this.numClusters);
-    const index = { centroids, assignments, sampleDims };
+    // Truncar al primer sdim componente por vector para clusterizar sobre las
+    // mismas dimensiones con las que después se comparan los queries truncados.
+    const flatTrunc = new Float64Array(n * sdim);
+    for (let i = 0; i < n; i++) {
+      const srcOff = i * dim, dstOff = i * sdim;
+      for (let d = 0; d < sdim; d++) flatTrunc[dstOff + d] = flat[srcOff + d];
+    }
+
+    const { centroids, assignments } = this._kmeans(flatTrunc, n, sdim, this.numClusters);
+    const index = { centroids, assignments, sampleDims: sdim };
     this._indexes.set(col, index);
     this.store._adapter.writeJson(this._indexFile(col), {
-      centroids, assignments, sampleDims,
+      centroids, assignments, sampleDims: sdim,
       numClusters: centroids.length,
       numProbes:   this.numProbes,
     });
@@ -2243,9 +2288,16 @@ class Reranker {
     const ranked = await this.rank(queryText, documents);
 
     // 3. Mapear resultados
+    // `r.index` proviene de la respuesta JSON de un API de reranking externo
+    // (no confiable). Validar antes de indexar allCandidates: si está ausente,
+    // no es entero o está fuera de rango, SALTAR ese resultado en vez de
+    // dejar que `candidate.id` lance TypeError y tumbe toda la búsqueda.
     const results = [];
     for (const r of ranked) {
       if (results.length >= limit) break;
+      if (!Number.isInteger(r.index) || r.index < 0 || r.index >= allCandidates.length) {
+        continue;
+      }
       const candidate = allCandidates[r.index];
       results.push({
         id:         candidate.id,

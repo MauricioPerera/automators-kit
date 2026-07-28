@@ -4,13 +4,15 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { Router, json, error, notFound, cors } from '../core/http.js';
+import { Router, json, error, notFound, cors, rateLimit, getActiveRateLimitTimerCount } from '../core/http.js';
 
 function req(method, path, body = null, headers = {}) {
   const opts = { method, headers: new Headers(headers) };
   if (body && method !== 'GET') {
-    opts.body = JSON.stringify(body);
+    const str = JSON.stringify(body);
+    opts.body = str;
     opts.headers.set('Content-Type', 'application/json');
+    opts.headers.set('Content-Length', String(new TextEncoder().encode(str).length));
   }
   return new Request(`http://localhost${path}`, opts);
 }
@@ -194,6 +196,36 @@ describe('CORS', () => {
     expect(res.status).toBe(204);
     expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
   });
+
+  it('GET response includes CORS headers on the real response', async () => {
+    const r = new Router();
+    r.use(cors());
+    r.get('/api/test', () => json({ ok: true }));
+    const res = await r.handle(req('GET', '/api/test'));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(res.headers.get('Access-Control-Allow-Methods')).toBeTruthy();
+  });
+
+  it('POST response includes CORS headers on the real response', async () => {
+    const r = new Router();
+    r.use(cors({ origin: 'https://example.com' }));
+    r.post('/api/test', async (ctx) => json({ created: true }, 201));
+    const res = await r.handle(req('POST', '/api/test', { x: 1 }));
+    expect(res.status).toBe(201);
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('https://example.com');
+  });
+
+  it('CORS headers applied to sub-router responses', async () => {
+    const main = new Router();
+    const sub = new Router();
+    main.use(cors());
+    sub.get('/list', () => json({ items: [1, 2, 3] }));
+    main.route('/api/items', sub);
+    const res = await main.handle(req('GET', '/api/items/list'));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -208,5 +240,144 @@ describe('Error handling', () => {
     const res = await r.handle(req('GET', '/boom'));
     expect(res.status).toBe(500);
     expect((await jsonBody(res)).error).toBe('kaboom');
+  });
+
+  it('default error handler hides internal message from client but logs it', async () => {
+    const r = new Router();
+    r.get('/boom', () => { throw new Error('internal detail xyz'); });
+
+    const origError = console.error;
+    let logged = '';
+    console.error = (...args) => { logged += args.map(String).join(' '); };
+    try {
+      const res = await r.handle(req('GET', '/boom'));
+      expect(res.status).toBe(500);
+      const body = await res.text();
+      expect(body).not.toContain('internal detail xyz');
+      expect(body).toContain('Internal server error');
+      // Full detail still logged server-side
+      expect(logged).toContain('internal detail xyz');
+    } finally {
+      console.error = origError;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Body size limit
+// ---------------------------------------------------------------------------
+
+describe('Body size limit', () => {
+  it('rejects body exceeding maxBodySize with 413 before reading body', async () => {
+    const r = new Router({ maxBodySize: 10 });
+    let handlerCalled = false;
+    r.post('/data', async (ctx) => { handlerCalled = true; return json({ ok: true }); });
+    const res = await r.handle(req('POST', '/data', { payload: 'x'.repeat(200) }));
+    expect(res.status).toBe(413);
+    expect(handlerCalled).toBe(false);
+  });
+
+  it('rejects oversized body via setMaxBodySize', async () => {
+    const r = new Router();
+    r.setMaxBodySize(8);
+    r.post('/data', async (ctx) => json({ ok: true }));
+    const res = await r.handle(req('POST', '/data', { payload: 'x'.repeat(200) }));
+    expect(res.status).toBe(413);
+  });
+
+  it('allows normal-sized bodies within the limit', async () => {
+    const r = new Router({ maxBodySize: 1024 });
+    r.post('/data', async (ctx) => {
+      const body = await ctx.json();
+      return json({ name: body.name }, 201);
+    });
+    const res = await r.handle(req('POST', '/data', { name: 'test' }));
+    expect(res.status).toBe(201);
+    expect((await jsonBody(res)).name).toBe('test');
+  });
+
+  it('default 10MB limit allows typical payloads', async () => {
+    const r = new Router();
+    r.post('/data', async (ctx) => json({ ok: true }));
+    const res = await r.handle(req('POST', '/data', { name: 'test' }));
+    expect(res.status).toBe(200);
+  });
+
+  it('disabled limit (0) allows any Content-Length', async () => {
+    const r = new Router({ maxBodySize: 0 });
+    r.post('/data', async (ctx) => json({ ok: true }));
+    const res = await r.handle(req('POST', '/data', { payload: 'x'.repeat(5000) }));
+    expect(res.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rate limiter
+// ---------------------------------------------------------------------------
+
+describe('Rate limiter', () => {
+  it('rateLimit() intervals are stoppable and do not accumulate as orphans', () => {
+    const before = getActiveRateLimitTimerCount();
+    const mws = [];
+    // Create several limiters — each would otherwise leak a permanent interval.
+    for (let i = 0; i < 5; i++) mws.push(rateLimit({ windowMs: 1000 }));
+    expect(getActiveRateLimitTimerCount() - before).toBe(5);
+
+    // Stopping each one clears its timer; nothing is left behind.
+    for (const mw of mws) mw.stop();
+    expect(getActiveRateLimitTimerCount() - before).toBe(0);
+  });
+
+  it('default keyFn separates clients by CF-Connecting-IP into different buckets', async () => {
+    const r = new Router();
+    const mw = rateLimit({ max: 1, windowMs: 60000 });
+    r.use(mw);
+    r.get('/x', () => json({ ok: true }));
+
+    try {
+      // IP A: first request allowed, second rate-limited (max 1).
+      const a1 = await r.handle(req('GET', '/x', null, { 'CF-Connecting-IP': '1.1.1.1' }));
+      expect(a1.status).toBe(200);
+      const a2 = await r.handle(req('GET', '/x', null, { 'CF-Connecting-IP': '1.1.1.1' }));
+      expect(a2.status).toBe(429);
+
+      // IP B: different bucket, so it still has its full quota.
+      const b1 = await r.handle(req('GET', '/x', null, { 'CF-Connecting-IP': '2.2.2.2' }));
+      expect(b1.status).toBe(200);
+    } finally {
+      mw.stop();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Malformed path params
+// ---------------------------------------------------------------------------
+
+describe('Malformed path params', () => {
+  it('GET /users/%zz responds 400, not 500', async () => {
+    const r = new Router();
+    r.get('/users/:id', (ctx) => json({ id: ctx.params.id }));
+    const res = await r.handle(req('GET', '/users/%zz'));
+    expect(res.status).toBe(400);
+    const body = await jsonBody(res);
+    expect(body.error).toBe('Bad Request');
+  });
+
+  it('malformed param in sub-router responds 400, not 500', async () => {
+    const main = new Router();
+    const sub = new Router();
+    sub.get('/:id', (ctx) => json({ id: ctx.params.id }));
+    main.route('/users', sub);
+    const res = await main.handle(req('GET', '/users/%zz'));
+    expect(res.status).toBe(400);
+  });
+
+  it('valid encoded params still decode correctly', async () => {
+    const r = new Router();
+    r.get('/users/:id', (ctx) => json({ id: ctx.params.id }));
+    const res = await r.handle(req('GET', '/users/hello%20world'));
+    expect(res.status).toBe(200);
+    expect((await jsonBody(res)).id).toBe('hello world');
   });
 });

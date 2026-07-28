@@ -11,6 +11,8 @@
  *   const result = await executor.execute();
  */
 
+import { assertPublicUrl } from './net-guard.js';
+
 // ---------------------------------------------------------------------------
 // DATA MODEL — path get/set
 // ---------------------------------------------------------------------------
@@ -84,14 +86,33 @@ function buildDAG(operations) {
     for (const ref of refs) {
       const depId = ref.split('/')[2];
       if (depId !== op.id && opMap.has(depId)) {
-        // Skip onError references
-        if (op.onError === depId) continue;
+        // FIX-24: model onError as a real dependency edge. Previously the
+        // onError target was excluded as a dependency, so an op that referenced
+        // its own fallback's outputPath ran in parallel with the fallback and
+        // could read that path before the fallback resolved (silent undefined).
+        // The fallback always executes as a normal op in its own DAG level, so
+        // depending on it is safe and does not deadlock; any genuine cycle falls
+        // back to sequential execution (buildDAG returns null).
         graph.get(op.id).add(depId);
       }
     }
     // Explicit input reference
     if (op.input && opMap.has(op.input)) {
       graph.get(op.id).add(op.input);
+    }
+    // FIX-24: model Conditional branches as dependency edges. The branch op
+    // (ifTrue/ifFalse) is executed dynamically by the Conditional, but the DAG
+    // never saw it as a dependency, so the branch could be scheduled in an
+    // earlier level — in parallel with / before the Conditional that triggers
+    // it — racing on shared state. Make the branch depend on the Conditional
+    // so it always runs after the Conditional resolves. Self-branches are
+    // skipped to avoid self-edges (handled by the recursion-depth guard).
+    if (op.type === 'Conditional' && op.config) {
+      for (const branchId of [op.config.ifTrue, op.config.ifFalse]) {
+        if (typeof branchId === 'string' && branchId !== op.id && opMap.has(branchId)) {
+          graph.get(branchId).add(op.id);
+        }
+      }
     }
   }
 
@@ -177,6 +198,11 @@ async function handleApiCall(config, state) {
     opts.body = typeof body === 'string' ? body : JSON.stringify(body);
   }
 
+  // SSRF guard: reject loopback / private / link-local / metadata destinations
+  // before the fetch. config.url may come from an untrusted workflow definition
+  // or be resolved from external trigger state. Same guard as core/nodes.js.
+  assertPublicUrl(url);
+
   const res = await fetch(url, opts);
   const ct = res.headers.get('content-type') || '';
   const data = ct.includes('json') ? await res.json() : await res.text();
@@ -185,8 +211,16 @@ async function handleApiCall(config, state) {
 
 async function handleExecuteN8nWorkflow(config, state) {
   const n8nUrl = config.n8nUrl || process.env.N8N_URL || 'http://localhost:5678';
-  const apiKey = config.n8nApiKey || process.env.N8N_API_KEY || '';
+  // API key is taken ONLY from the environment / vault, never from the
+  // operation config. config.n8nUrl may be attacker-controlled; reading the
+  // key from config.* would let a leaked key be sent to an attacker host.
+  const apiKey = process.env.N8N_API_KEY || '';
   const payload = config.payload ? resolvePath(state, config.payload) : {};
+
+  // SSRF guard: reject internal destinations before the fetch. NOTE: this also
+  // blocks the historical default `http://localhost:5678`. Operators who run a
+  // co-located n8n must now expose it via a public N8N_URL; see FIX-11 report.
+  assertPublicUrl(n8nUrl);
 
   const res = await fetch(`${n8nUrl}/api/v1/workflows/${config.workflowId}/run`, {
     method: 'POST',
@@ -363,6 +397,9 @@ function handleFormatText(config, state) {
 
 function handleExtractText(config, state) {
   const text = String(getPath(state, config.inputPath) ?? '');
+  // FIX-24: ReDoS guard — validate the user-supplied pattern BEFORE compiling
+  // it. A catastrophic pattern would hang the event loop on .match/.matchAll.
+  _validateRegexPattern(config.pattern);
   const re = new RegExp(config.pattern, config.flags || 'g');
   if (config.extractAll) {
     return [...text.matchAll(re)].map(m => m[0]);
@@ -386,6 +423,8 @@ function handleValidateData(config, state) {
     case 'phone': valid = /^[\d\s\-+()]+$/.test(value) && value.replace(/\D/g, '').length >= 10; error = valid ? null : 'Invalid phone format'; break;
     case 'date': valid = !isNaN(Date.parse(value)); error = valid ? null : 'Invalid date format'; break;
     case 'custom': {
+      // FIX-24: ReDoS guard — validate the user-supplied pattern BEFORE compiling.
+      _validateRegexPattern(config.pattern || '.*');
       const re = new RegExp(config.pattern || '.*');
       valid = re.test(value);
       error = valid ? null : `Does not match pattern: ${config.pattern}`;
@@ -409,8 +448,11 @@ function handleCalculate(config, state) {
     switch (config.operation) {
       case 'sum': return round(nums.reduce((a, b) => a + b, 0), precision);
       case 'average': return nums.length ? round(nums.reduce((a, b) => a + b, 0) / nums.length, precision) : 0;
-      case 'max': return Math.max(...nums);
-      case 'min': return Math.min(...nums);
+      // FIX-38: avoid spread on arbitrarily large arrays — Math.max(...nums)
+      // places every element on the call stack; arrays > ~100k can throw
+      // RangeError: Maximum call stack size exceeded. Reduce iterates safely.
+      case 'max': return nums.reduce((a, b) => Math.max(a, b), -Infinity);
+      case 'min': return nums.reduce((a, b) => Math.min(a, b), Infinity);
     }
   }
 
@@ -521,6 +563,9 @@ export class WorkflowExecutor {
     this.results = {};
     this.errors = {};
     this._customHandlers = {};
+    // Max recursion depth for _executeOp (guards against cyclic Conditional /
+    // onError / Loop definitions that would otherwise hang or overflow the stack).
+    this.maxDepth = opts.maxDepth ?? 50;
   }
 
   /** Register a custom operation handler */
@@ -575,12 +620,12 @@ export class WorkflowExecutor {
       if (levels) {
         // DAG mode: execute by levels
         for (const level of levels) {
-          await Promise.all(level.map(opId => this._executeOp(opId, executionId)));
+          await Promise.all(level.map(opId => this._executeOp(opId, executionId, 0)));
         }
       } else {
         // Fallback: sequential
         for (const op of this.operations) {
-          await this._executeOp(op.id, executionId);
+          await this._executeOp(op.id, executionId, 0);
         }
       }
     } catch (err) {
@@ -600,7 +645,15 @@ export class WorkflowExecutor {
   }
 
   /** @private */
-  async _executeOp(opId, executionId) {
+  async _executeOp(opId, executionId, depth = 0) {
+    // Recursion depth guard — prevents hangs / stack overflow from cyclic
+    // Conditional branches, self-referencing onError, or Loops that list
+    // their own opId as a sub-operation. Same error pattern as `!handler`.
+    if (depth > this.maxDepth) {
+      this.errors[opId] = `Max recursion depth (${this.maxDepth}) exceeded — possible cyclic operation reference`;
+      return;
+    }
+
     const op = this.operations.find(o => o.id === opId);
     if (!op) return;
 
@@ -626,13 +679,18 @@ export class WorkflowExecutor {
     try {
       let result;
 
-      if (op.type === 'Loop') {
+      if (config._cached !== undefined && op.type !== 'Conditional' && op.type !== 'Loop') {
+        // FIX-24: CacheMiddleware hit — reuse the cached result and skip the
+        // handler. Conditional/Loop are excluded: they have dynamic side
+        // effects (branch execution / iteration) that must not be skipped.
+        result = config._cached;
+      } else if (op.type === 'Loop') {
         result = await this._executeLoop(config);
       } else if (op.type === 'Conditional') {
         result = handler(config, this.state);
         // Execute branch if specified
         if (result?.executeOperationId) {
-          await this._executeOp(result.executeOperationId, executionId);
+          await this._executeOp(result.executeOperationId, executionId, depth + 1);
         }
       } else {
         result = await handler(config, this.state);
@@ -645,7 +703,7 @@ export class WorkflowExecutor {
       // Middleware: process_result + on_operation_complete
       const duration = performance.now() - startTime;
       for (const mw of this.middleware) {
-        if (mw.processResult) result = await mw.processResult(result, op.type) || result;
+        if (mw.processResult) result = await mw.processResult(result, op.type, config) || result;
         if (mw.onOperationComplete) await mw.onOperationComplete(executionId, opId, op.type, result, duration);
       }
 
@@ -660,7 +718,7 @@ export class WorkflowExecutor {
       // onError fallback
       if (op.onError) {
         try {
-          await this._executeOp(op.onError, executionId);
+          await this._executeOp(op.onError, executionId, depth + 1);
           // Copy fallback result to original outputPath
           const fallbackOp = this.operations.find(o => o.id === op.onError);
           if (fallbackOp && this.results[op.onError] !== undefined) {
@@ -687,7 +745,7 @@ export class WorkflowExecutor {
       const iterResult = {};
 
       for (const subOpId of subOps) {
-        await this._executeOp(subOpId, 'loop');
+        await this._executeOp(subOpId, 'loop', depth + 1);
         iterResult[subOpId] = this.results[subOpId];
       }
 
@@ -723,6 +781,11 @@ export class CacheMiddleware {
 
   processConfig(config, opType) {
     const key = `${opType}:${JSON.stringify(config)}`;
+    // FIX-24: stash the key on the config so processResult can store the
+    // freshly computed result under the same key. (config is a fresh per-op
+    // copy, so these private fields never leak into the cache key, which was
+    // already computed above from the clean config.)
+    config._cacheKey = key;
     const cached = this._cache.get(key);
     if (cached && Date.now() - cached.ts < this._ttl) {
       this.hits++;
@@ -733,8 +796,12 @@ export class CacheMiddleware {
     return config;
   }
 
-  processResult(result, opType) {
-    // Result is stored after execution
+  processResult(result, opType, config) {
+    // FIX-24: actually populate the cache. Previously this hook was a no-op,
+    // so the cache never stored anything and every execution was a miss.
+    if (config && config._cacheKey) {
+      this._cache.set(config._cacheKey, { result, ts: Date.now() });
+    }
     return result;
   }
 
@@ -744,6 +811,34 @@ export class CacheMiddleware {
 // ---------------------------------------------------------------------------
 // HELPERS
 // ---------------------------------------------------------------------------
+
+// FIX-24: ReDoS guard for user-supplied regex patterns (ExtractText,
+// ValidateData.custom). Same shape as the guards in core/db.js and
+// core/vector.js: (1) reject patterns longer than a fixed cap, (2) a heuristic
+// for nested quantifiers like (x+)+ / (x*)* that cause catastrophic
+// backtracking. Fail-closed — the pattern comes from an untrusted workflow
+// definition, so on doubt we reject rather than risk hanging the event loop.
+// Deliberately conservative; may over-reject valid but complex patterns.
+const REGEX_MAX_LEN = 200;
+function _validateRegexPattern(src) {
+  if (typeof src !== 'string') src = String(src ?? '');
+  if (src.length > REGEX_MAX_LEN) {
+    throw new Error(`Regex pattern too long (max ${REGEX_MAX_LEN} chars)`);
+  }
+  // Strip escapes (\., \+, ...) and character classes [..] so they don't
+  // confuse the nested-quantifier heuristic.
+  let s = src.replace(/\\./g, '').replace(/\[(?:[^\]\\]|\\.)*\]/g, 'X');
+  // Collapse quantified groups from the inside out; if a quantified group's
+  // body already contains a * or +, it's nested -> catastrophic.
+  for (let i = 0; i < 32; i++) {
+    const m = s.match(/\(([^()]*)\)([*+])/);
+    if (!m) break;
+    if (/[*+]/.test(m[1])) {
+      throw new Error('Regex pattern rejected: potential catastrophic backtracking');
+    }
+    s = s.replace(/\(([^()]*)\)([*+])/, 'Q');
+  }
+}
 
 function evalCondition(val, op, expected) {
   switch (op) {

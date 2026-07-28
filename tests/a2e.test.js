@@ -2,9 +2,9 @@
  * Tests: core/a2e.js — A2E Workflow Executor
  */
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import {
-  WorkflowExecutor, AuditMiddleware,
+  WorkflowExecutor, AuditMiddleware, CacheMiddleware,
   getPath, setPath, resolvePath, buildDAG, evalCondition,
 } from '../core/a2e.js';
 
@@ -133,6 +133,39 @@ describe('SetData + Calculate', () => {
     });
     const r = await ex.execute();
     expect(r.results.total).toBe(60);
+  });
+
+  it('calculate max/min on small arrays', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load({
+      operations: [
+        { id: 'nums', op: 'SetData', value: [10, 50, 20, 5, 35] },
+        { id: 'mx', op: 'Calculate', inputPath: '/workflow/nums', operation: 'max' },
+        { id: 'mn', op: 'Calculate', inputPath: '/workflow/nums', operation: 'min' },
+      ],
+      execute: 'nums',
+    });
+    const r = await ex.execute();
+    expect(r.results.mx).toBe(50);
+    expect(r.results.mn).toBe(5);
+  });
+
+  it('calculate max/min on huge arrays does not overflow the stack', async () => {
+    const N = 200000;
+    const big = new Array(N);
+    for (let i = 0; i < N; i++) big[i] = i + 1; // 1..N, max=N, min=1
+    const ex = new WorkflowExecutor();
+    ex.load({
+      operations: [
+        { id: 'nums', op: 'SetData', value: big },
+        { id: 'mx', op: 'Calculate', inputPath: '/workflow/nums', operation: 'max' },
+        { id: 'mn', op: 'Calculate', inputPath: '/workflow/nums', operation: 'min' },
+      ],
+      execute: 'nums',
+    });
+    const r = await ex.execute();
+    expect(r.results.mx).toBe(N);
+    expect(r.results.mn).toBe(1);
   });
 });
 
@@ -442,4 +475,363 @@ describe('Full pipeline', () => {
     expect(r.results.names).toEqual([{ name: 'Alice' }, { name: 'Carol' }]);
     expect(Object.keys(r.errors).length).toBe(0);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Recursion depth guard (cyclic operation references)
+// ---------------------------------------------------------------------------
+
+describe('Recursion depth guard', () => {
+  it('terminates a self-referencing Conditional branch with a registered error', async () => {
+    const ex = new WorkflowExecutor({ maxDepth: 10 });
+    ex.load({
+      operations: [
+        { id: 'score', op: 'SetData', value: 85 },
+        // ifTrue points back to 'check' itself → infinite recursion without the guard.
+        { id: 'check', op: 'Conditional', condition: { path: '/workflow/score', operator: '>=', value: 70 }, ifTrue: 'check', ifFalse: 'check' },
+      ],
+      execute: 'score',
+    });
+    const r = await ex.execute();
+    expect(r.errors.check).toBeDefined();
+    expect(r.errors.check).toContain('Max recursion depth');
+  }, 2000);
+
+  it('terminates a self-referencing onError fallback with a registered error', async () => {
+    const ex = new WorkflowExecutor({ maxDepth: 10 });
+    ex.registerHandler('Fail', () => { throw new Error('boom'); });
+    ex.load({
+      operations: [
+        // onError points to itself → infinite fallback recursion without the guard.
+        { id: 'risky', op: 'Fail', onError: 'risky' },
+      ],
+      execute: 'risky',
+    });
+    const r = await ex.execute();
+    expect(r.errors.risky).toBeDefined();
+    expect(r.errors.risky).toContain('Max recursion depth');
+  }, 2000);
+
+  it('allows reasonable nesting well within the default limit', async () => {
+    // A 5-deep chain of Conditional branches — normal usage, must not trip the guard.
+    const ops = [{ id: 'seed', op: 'SetData', value: 1 }];
+    const depth = 5;
+    for (let i = 0; i < depth; i++) {
+      const next = i < depth - 1 ? `c${i + 1}` : 'leaf';
+      ops.push({
+        id: `c${i}`,
+        op: 'Conditional',
+        condition: { path: '/workflow/seed', operator: '==', value: 1 },
+        ifTrue: next,
+        ifFalse: 'leaf',
+      });
+    }
+    ops.push({ id: 'leaf', op: 'SetData', value: 'done' });
+
+    const ex = new WorkflowExecutor();
+    ex.load({ operations: ops, execute: 'seed' });
+    const r = await ex.execute();
+    expect(r.errors.leaf).toBeUndefined();
+    expect(r.results.leaf).toBe('done');
+  }, 2000);
+});
+
+// ---------------------------------------------------------------------------
+// SSRF guards — ApiCall & ExecuteN8nWorkflow (FIX-11)
+// ---------------------------------------------------------------------------
+
+// Helper: install a fetch spy that records calls and returns a synthetic
+// response. Returns { calls, restore }. If the guard works, calls stays empty
+// for the blocked-destination tests.
+function installFetchSpy() {
+  const calls = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = function spy(url, opts) {
+    calls.push({ url: String(url), opts });
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({ ok: true }),
+      text: async () => '',
+    });
+  };
+  return {
+    calls,
+    restore: () => { globalThis.fetch = original; },
+  };
+}
+
+describe('SSRF guard: ApiCall', () => {
+  it('rejects an internal destination (169.254.169.254) without fetching', async () => {
+    const spy = installFetchSpy();
+    try {
+      const ex = new WorkflowExecutor();
+      ex.load({
+        operations: [
+          { id: 'api', op: 'ApiCall', url: 'http://169.254.169.254/latest/meta-data/', method: 'GET' },
+        ],
+        execute: 'api',
+      });
+      const r = await ex.execute();
+      expect(r.errors.api).toBeDefined();
+      expect(r.errors.api).toContain('net-guard');
+      // No real fetch was issued against the metadata endpoint.
+      expect(spy.calls.length).toBe(0);
+    } finally {
+      spy.restore();
+    }
+  });
+
+  it('allows a public destination and performs the fetch', async () => {
+    const spy = installFetchSpy();
+    try {
+      const ex = new WorkflowExecutor();
+      ex.load({
+        operations: [
+          { id: 'api', op: 'ApiCall', url: 'https://example.com/api', method: 'GET' },
+        ],
+        execute: 'api',
+      });
+      const r = await ex.execute();
+      expect(r.errors.api).toBeUndefined();
+      expect(spy.calls.length).toBe(1);
+      expect(spy.calls[0].url).toBe('https://example.com/api');
+    } finally {
+      spy.restore();
+    }
+  });
+});
+
+describe('SSRF guard: ExecuteN8nWorkflow', () => {
+  // Ensure a deterministic env for the API-key source across these tests.
+  const prevKey = process.env.N8N_API_KEY;
+  beforeEach(() => { delete process.env.N8N_API_KEY; });
+  afterEach(() => {
+    if (prevKey === undefined) delete process.env.N8N_API_KEY;
+    else process.env.N8N_API_KEY = prevKey;
+  });
+
+  it('rejects an internal n8nUrl (169.254.169.254) without fetching', async () => {
+    const spy = installFetchSpy();
+    try {
+      const ex = new WorkflowExecutor();
+      ex.load({
+        operations: [
+          { id: 'wf', op: 'ExecuteN8nWorkflow', n8nUrl: 'http://169.254.169.254/', workflowId: '123', payload: { a: 1 } },
+        ],
+        execute: 'wf',
+      });
+      const r = await ex.execute();
+      expect(r.errors.wf).toBeDefined();
+      expect(r.errors.wf).toContain('net-guard');
+      expect(spy.calls.length).toBe(0);
+    } finally {
+      spy.restore();
+    }
+  });
+
+  it('rejects the localhost default when no n8nUrl / N8N_URL is set', async () => {
+    const prevUrl = process.env.N8N_URL;
+    delete process.env.N8N_URL;
+    const spy = installFetchSpy();
+    try {
+      const ex = new WorkflowExecutor();
+      ex.load({
+        operations: [
+          { id: 'wf', op: 'ExecuteN8nWorkflow', workflowId: '123' },
+        ],
+        execute: 'wf',
+      });
+      const r = await ex.execute();
+      expect(r.errors.wf).toBeDefined();
+      expect(r.errors.wf).toContain('net-guard');
+      expect(spy.calls.length).toBe(0);
+    } finally {
+      spy.restore();
+      if (prevUrl === undefined) delete process.env.N8N_URL;
+      else process.env.N8N_URL = prevUrl;
+    }
+  });
+
+  it('does not use config.n8nApiKey as the API key source', async () => {
+    // config.n8nApiKey is a potentially untrusted operation field. It must NOT
+    // be sent as X-N8N-API-KEY; only env/vault is used.
+    const spy = installFetchSpy();
+    try {
+      const ex = new WorkflowExecutor();
+      ex.load({
+        operations: [
+          { id: 'wf', op: 'ExecuteN8nWorkflow', n8nUrl: 'https://n8n.example.com', workflowId: '123', n8nApiKey: 'LEAKED-KEY' },
+        ],
+        execute: 'wf',
+      });
+      await ex.execute();
+      expect(spy.calls.length).toBe(1);
+      const sentHeaders = spy.calls[0].opts.headers;
+      expect(sentHeaders['X-N8N-API-KEY']).not.toBe('LEAKED-KEY');
+      expect(sentHeaders['X-N8N-API-KEY']).toBe('');
+    } finally {
+      spy.restore();
+    }
+  });
+
+  it('uses N8N_API_KEY from env for a public n8nUrl', async () => {
+    process.env.N8N_API_KEY = 'env-secret';
+    const spy = installFetchSpy();
+    try {
+      const ex = new WorkflowExecutor();
+      ex.load({
+        operations: [
+          { id: 'wf', op: 'ExecuteN8nWorkflow', n8nUrl: 'https://n8n.example.com', workflowId: '123' },
+        ],
+        execute: 'wf',
+      });
+      await ex.execute();
+      expect(spy.calls.length).toBe(1);
+      expect(spy.calls[0].opts.headers['X-N8N-API-KEY']).toBe('env-secret');
+    } finally {
+      spy.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX-24 — Hallazgo 2: CacheMiddleware actually caches
+// ---------------------------------------------------------------------------
+
+describe('CacheMiddleware (FIX-24: cache populated + served)', () => {
+  it('serves a cached result and skips the handler on a repeat execution', async () => {
+    let calls = 0;
+    const cache = new CacheMiddleware();
+    const ex = new WorkflowExecutor({ middleware: [cache] });
+    ex.registerHandler('Counted', () => { calls++; return `r${calls}`; });
+    ex.load({
+      operations: [{ id: 'a', op: 'Counted', outputPath: '/workflow/a' }],
+      execute: 'a',
+    });
+
+    const r1 = await ex.execute();
+    const r2 = await ex.execute();
+
+    expect(calls).toBe(1);                 // handler ran once; 2nd run hit the cache
+    expect(r1.results.a).toBe('r1');
+    expect(r2.results.a).toBe('r1');       // cached value reused, not recomputed
+    expect(cache.stats().hits).toBe(1);
+    expect(cache.stats().misses).toBe(1);
+    expect(cache.stats().size).toBe(1);
+  }, 2000);
+});
+
+// ---------------------------------------------------------------------------
+// FIX-24 — Hallazgo 3: ReDoS guard on user-supplied regex patterns
+// ---------------------------------------------------------------------------
+
+describe('ReDoS guard (FIX-24: catastrophic patterns rejected pre-compile)', () => {
+  it('rejects a catastrophic ExtractText pattern before compiling', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load({
+      operations: [
+        { id: 'text', op: 'SetData', value: 'a'.repeat(40) + '!' },
+        { id: 'nums', op: 'ExtractText', inputPath: '/workflow/text', pattern: '(a+)+b' },
+      ],
+      execute: 'text',
+    });
+    const r = await ex.execute();
+    expect(r.errors.nums).toBeDefined();
+    expect(r.errors.nums).toMatch(/catastrophic|too long/i);
+  }, 2000);
+
+  it('rejects a catastrophic custom ValidateData pattern before compiling', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load({
+      operations: [
+        { id: 'text', op: 'SetData', value: 'a'.repeat(40) },
+        { id: 'v', op: 'ValidateData', inputPath: '/workflow/text', validationType: 'custom', pattern: '(a+)+b' },
+      ],
+      execute: 'text',
+    });
+    const r = await ex.execute();
+    expect(r.errors.v).toBeDefined();
+    expect(r.errors.v).toMatch(/catastrophic|too long/i);
+  }, 2000);
+
+  it('still allows a benign ExtractText pattern (no over-rejection)', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load({
+      operations: [
+        { id: 'text', op: 'SetData', value: 'Prices: 100, 200' },
+        { id: 'nums', op: 'ExtractText', inputPath: '/workflow/text', pattern: '\\d+', extractAll: true },
+      ],
+      execute: 'text',
+    });
+    const r = await ex.execute();
+    expect(r.errors.nums).toBeUndefined();
+    expect(r.results.nums).toEqual(['100', '200']);
+  }, 2000);
+});
+
+// ---------------------------------------------------------------------------
+// FIX-24 — Hallazgo 1: DAG models dynamic deps (onError + Conditional branches)
+// ---------------------------------------------------------------------------
+
+describe('DAG dynamic dependencies (FIX-24: no race on Conditional/onError)', () => {
+  it('onError fallback is a real dependency — op reads fallback output after it resolves', async () => {
+    // `risky` references its own fallback's outputPath (/workflow/safe) and
+    // always fails, with onError: 'safe'. Before the fix the onError target
+    // was excluded as a dependency, so risky ran in parallel with safe and read
+    // /workflow/safe before safe resolved (undefined -> 'safe-not-ready'). With
+    // the edge, risky runs after safe, reads the value, then fails 'boom'.
+    const ex = new WorkflowExecutor();
+    ex.registerHandler('SlowSafe', async () => {
+      await new Promise(r => setTimeout(r, 20));
+      return 'safe-value';
+    });
+    ex.registerHandler('ReadSafeThenFail', (config, state) => {
+      const v = getPath(state, '/workflow/safe');
+      if (v === undefined) throw new Error('safe-not-ready');
+      throw new Error('boom');
+    });
+    ex.load({
+      operations: [
+        { id: 'safe', op: 'SlowSafe', outputPath: '/workflow/safe' },
+        { id: 'risky', op: 'ReadSafeThenFail', inputPath: '/workflow/safe', onError: 'safe', outputPath: '/workflow/risky' },
+      ],
+      execute: 'safe',
+    });
+    const r = await ex.execute();
+    expect(r.errors.risky).toBe('boom');            // saw safe's value, then intentionally failed
+    expect(r.results.risky._fallback).toBe(true);
+    expect(r.results.risky.result).toBe('safe-value');
+  }, 2000);
+
+  it('Conditional branch is ordered after the Conditional, not in parallel', async () => {
+    // Records the execution order of the Conditional and its branch op.
+    // Before the fix the branch had no dependency on the Conditional, so it
+    // was scheduled in an earlier level and ran BEFORE the Conditional. With
+    // the fix the branch depends on the Conditional and runs after it.
+    const order = [];
+    let n = 0;
+    const ex = new WorkflowExecutor();
+    ex.registerHandler('Conditional', (config, state) => {
+      order.push({ name: 'check', n: n++ });
+      const value = getPath(state, config.condition.path);
+      const result = evalCondition(value, config.condition.operator, config.condition.value);
+      return { conditionResult: result, executeOperationId: result ? config.ifTrue : config.ifFalse };
+    });
+    ex.registerHandler('OrdPass', () => { order.push({ name: 'pass', n: n++ }); return 'PASSED'; });
+    ex.load({
+      operations: [
+        { id: 'score', op: 'SetData', value: 85 },
+        { id: 'check', op: 'Conditional', condition: { path: '/workflow/score', operator: '>=', value: 70 }, ifTrue: 'pass', ifFalse: 'fail' },
+        { id: 'pass', op: 'OrdPass', outputPath: '/workflow/pass' },
+        { id: 'fail', op: 'SetData', value: 'FAILED' },
+      ],
+      execute: 'score',
+    });
+    await ex.execute();
+    const checkN = order.find(o => o.name === 'check').n;
+    const passFirst = order.find(o => o.name === 'pass').n;
+    expect(passFirst).toBeGreaterThan(checkN);     // branch runs after the Conditional
+  }, 2000);
 });
