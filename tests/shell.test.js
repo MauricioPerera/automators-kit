@@ -183,7 +183,12 @@ describe('Shell exec', () => {
   let shell;
 
   beforeEach(() => {
-    shell = new Shell();
+    // Unrestricted on purpose: these tests exercise exec mechanics (args,
+    // pipelines, JQ filter, dry-run), not RBAC — RBAC has its own describe
+    // block further down. `new Shell()` alone now defaults to the
+    // 'restricted' profile's permissions (fail-closed, see Shell
+    // constructor), so this needs to opt in to admin explicitly.
+    shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
     shell.registry.register('users', 'list', {
       description: 'List users',
       params: [{ name: 'limit', type: 'number', default: 50 }],
@@ -377,7 +382,8 @@ describe('Permissions', () => {
 
 describe('Built-in skills', () => {
   let shell;
-  beforeEach(() => { shell = new Shell(); });
+  // Unrestricted on purpose — see the note in 'Shell exec' above.
+  beforeEach(() => { shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin }); });
 
   it('encode:base64 + decode:base64', async () => {
     const enc = await shell.exec('encode:base64 --text hello');
@@ -468,6 +474,39 @@ describe('FIX-32: fail-closed default profile', () => {
   it('help reflects the restricted default profile', () => {
     const shell = new Shell();
     expect(shell.help()).toContain('current: restricted');
+  });
+
+  // Found while building examples/content-pipeline: `profile` was documented
+  // as fail-closed but AGENT_PROFILES was never consulted for the actual
+  // `permissions` array — `new Shell({ profile: 'restricted' })` alone
+  // enforced nothing (permissions still defaulted to `['*']`). Fixed so
+  // `permissions` derives from `profile` via AGENT_PROFILES unless the
+  // caller passes `permissions` explicitly.
+  it('a bare profile (no explicit permissions) actually restricts what can run', async () => {
+    const shell = new Shell({ registry: new CommandRegistry(), profile: 'restricted' });
+    shell.registry.register('users', 'list', { description: 'list' }, async () => ['a', 'b']);
+
+    const denied = await shell.exec('users:list');
+    expect(denied.code).not.toBe(0);
+    expect(denied.error).toMatch(/permission denied/i);
+    expect(shell.permissions).toEqual(AGENT_PROFILES.restricted);
+  });
+
+  it('a bare admin profile (no explicit permissions) still allows everything', async () => {
+    const shell = new Shell({ registry: new CommandRegistry(), profile: 'admin' });
+    shell.registry.register('users', 'list', { description: 'list' }, async () => ['a', 'b']);
+    const r = await shell.exec('users:list');
+    expect(r.code).toBe(0);
+  });
+
+  it('explicit permissions always win over the profile default', () => {
+    const shell = new Shell({ profile: 'restricted', permissions: ['*'] });
+    expect(shell.permissions).toEqual(['*']);
+  });
+
+  it('an unrecognized profile fails closed to restricted, not wide open', () => {
+    const shell = new Shell({ profile: 'totally-made-up' });
+    expect(shell.permissions).toEqual(AGENT_PROFILES.restricted);
   });
 });
 

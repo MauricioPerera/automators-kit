@@ -93,7 +93,11 @@ export function workflowRoutes(cms, engine) {
 
   r.post('/webhook/:path', async (ctx) => {
     const body = await ctx.json();
-    const workflowId = engine.webhookTrigger(ctx.params.path, body);
+    // Secret is read from a header, never from the body/query (avoids logging
+    // it in access logs or URL history). Same generic 404 whether the path
+    // isn't registered or the secret is wrong — don't leak which case it is.
+    const secret = ctx.req.headers.get('X-Webhook-Secret');
+    const workflowId = engine.webhookTrigger(ctx.params.path, body, secret);
     if (!workflowId) return error('No workflow registered for this webhook', 404);
     return json({ triggered: workflowId });
   });

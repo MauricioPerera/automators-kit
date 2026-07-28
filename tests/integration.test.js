@@ -222,6 +222,60 @@ describe('Taxonomies API', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Webhook trigger (secret enforcement over real HTTP — FIX-10 wiring)
+// ---------------------------------------------------------------------------
+
+describe('Webhook trigger', () => {
+  it('rejects a webhook call missing the configured secret, accepts it with the right header', async () => {
+    const createRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'Secure webhook',
+      trigger: { type: 'webhook', config: { path: 'secure-hook', secret: 'top-secret' } },
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: '{{_trigger.msg}}' } }],
+      active: true,
+    }, adminToken));
+    expect(createRes.status).toBe(201);
+
+    // No secret header at all → treated the same as an unregistered path (404),
+    // not 200 — proves the secret is actually enforced over HTTP, not just in
+    // core/triggers.js unit tests.
+    const noSecretRes = await app.handle(req('POST', '/api/workflows/webhook/secure-hook', { msg: 'hi' }));
+    expect(noSecretRes.status).toBe(404);
+
+    // Wrong secret → same 404.
+    const wrongHeaderReq = new Request('http://localhost/api/workflows/webhook/secure-hook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': 'nope' },
+      body: JSON.stringify({ msg: 'hi' }),
+    });
+    const wrongSecretRes = await app.handle(wrongHeaderReq);
+    expect(wrongSecretRes.status).toBe(404);
+
+    // Correct secret → triggers the workflow.
+    const rightHeaderReq = new Request('http://localhost/api/workflows/webhook/secure-hook', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': 'top-secret' },
+      body: JSON.stringify({ msg: 'hi' }),
+    });
+    const okRes = await app.handle(rightHeaderReq);
+    expect(okRes.status).toBe(200);
+    expect((await json(okRes)).triggered).toBeTruthy();
+  });
+
+  it('webhook without a configured secret still works with no header (backward compatible)', async () => {
+    const createRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'Open webhook',
+      trigger: { type: 'webhook', config: { path: 'open-hook' } },
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: '{{_trigger.msg}}' } }],
+      active: true,
+    }, adminToken));
+    expect(createRes.status).toBe(201);
+
+    const res = await app.handle(req('POST', '/api/workflows/webhook/open-hook', { msg: 'hi' }));
+    expect(res.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 404
 // ---------------------------------------------------------------------------
 

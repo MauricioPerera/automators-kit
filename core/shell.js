@@ -371,9 +371,15 @@ export class Shell {
    */
   constructor(opts = {}) {
     this.registry = opts.registry || new CommandRegistry();
-    this.permissions = opts.permissions || ['*'];
     // Fail-closed default: an unspecified profile is 'restricted', not 'admin'.
     this.profile = opts.profile || 'restricted';
+    // Explicit `permissions` always wins. Otherwise derive from `profile` via
+    // AGENT_PROFILES so passing just `{ profile: 'restricted' }` actually
+    // restricts — previously `profile` was descriptive only and every Shell
+    // defaulted to `['*']` (full access) unless a caller ALSO passed
+    // `permissions` by hand. Unrecognized profile names fail closed to
+    // `restricted`, not `['*']`.
+    this.permissions = opts.permissions || AGENT_PROFILES[this.profile] || AGENT_PROFILES.restricted;
     // When debug is true, internal error messages are surfaced to the caller.
     // Default false keeps internal details out of agent-facing responses.
     this.debug = !!opts.debug;

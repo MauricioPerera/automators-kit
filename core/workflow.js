@@ -266,8 +266,8 @@ export class WorkflowEngine {
   }
 
   /** Webhook trigger (called from HTTP route) */
-  webhookTrigger(path, data) {
-    return this._triggers.fireWebhook(path, data);
+  webhookTrigger(path, data, secret) {
+    return this._triggers.fireWebhook(path, data, secret);
   }
 
   // ─── HISTORY ─────────────────────────────────────────────
