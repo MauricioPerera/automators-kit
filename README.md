@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-625 tests | 0 deps | 21 modules | Bun + Deno + Node.js
+633 tests | 0 deps | 21 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -99,15 +99,24 @@ inspection with RBAC, wired up with the framework's public API. Run it with
 walkthrough, including live checks of the SSRF guard and body-size limit
 against a running server (not just unit tests).
 
+**[`examples/command-gateway/`](examples/command-gateway/)** — "let an agent
+operate the system through a safe, curated command surface, never raw DB
+access." One `CommandRegistry` (the entire reachable set of commands) mounted
+at 4 HTTP endpoints, each backed by its own `Shell` instance with a different
+permission scope (admin / editor / read-only / public), so the same commands
+exist everywhere but what each persona can reach differs — including a
+custom scope (create+publish, no delete) that isn't one of the 4 built-in
+`AGENT_PROFILES`. Run it with `bun examples/command-gateway/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 625 tests across 22 files, ~7 seconds
+bun test tests/    # 633 tests across 23 files, ~7 seconds
 ```
 
-22 test files covering all core modules plus the `examples/content-pipeline`
-end-to-end scenario (includes the regression tests added by the 2026-07
-security audit — see [Security](#security) below).
+23 test files covering all core modules plus the `examples/content-pipeline`
+and `examples/command-gateway` end-to-end scenarios (includes the regression
+tests added by the 2026-07 security audit — see [Security](#security) below).
 
 ## Multi-runtime
 

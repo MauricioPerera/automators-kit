@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 625 tests | 0 deps | 21 core modules
+By automators.work | 633 tests | 0 deps | 21 core modules
 
 ## Architecture
 
@@ -50,6 +50,16 @@ setup in `pipeline.js`, runnable demo in `setup.js`
 `tests/examples-content-pipeline.test.js`. Good reference for wiring custom
 nodes (`workflowEngine.nodes.add(...)`) and shell commands
 (`shell.registry.register(...)`) on top of `createApp()`.
+
+`examples/command-gateway/` — scoped-RBAC command gateway prototype: one
+`CommandRegistry` (`registry.js` — the entire command surface an agent can
+reach, no raw DB access) mounted at 4 HTTP endpoints
+(`/api/gateway/{admin,editor,support,public}`), each backed by its own
+`Shell` instance with a different `profile`/`permissions` scope — including
+a custom scope not among the 4 built-in `AGENT_PROFILES`. Demonstrates
+per-persona command history isolation too (`GET /api/gateway/:persona/history`).
+Run with `bun examples/command-gateway/setup.js`; regression test in
+`tests/examples-command-gateway.test.js`.
 
 ## MCP Server
 
