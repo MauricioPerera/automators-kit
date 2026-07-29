@@ -31,6 +31,10 @@ parallel.js        Task orchestration: race/merge/all strategies, timeout, weigh
 net-guard.js       SSRF guard: blocks loopback/RFC1918/link-local/cloud-metadata destinations
 ```
 
+**Similar-sounding modules, when to reach for which:**
+- `memory.js` (keyword/term recall, time decay, zero ML dependency — see `examples/agent-memory-backend/`) vs `vector.js` (real cosine-similarity over embeddings YOU provide, never calls an embedding API itself — see `examples/vector-memory/`). Default to `memory.js`; move to `vector.js` when word-overlap recall isn't good enough.
+- `workflow.js` (n8n-style: named nodes wired by `{{ref}}` templates, webhook/cron/poll/manual triggers, DAG-parallel) vs `a2e.js` (smaller declarative multi-step executor: `SetData`/`FilterData`/`ApiCall`/`Conditional`/`Loop`/..., its own separate DAG + middleware). These are two independent engines, not layers — they share no code, so an improvement ported to one (e.g. DAG-parallel scheduling) doesn't automatically apply to the other.
+
 ## Quick Start
 
 ```bash
