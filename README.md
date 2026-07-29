@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-711 tests | 0 deps | 23 modules | Bun + Deno + Node.js
+717 tests | 0 deps | 23 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -177,17 +177,30 @@ gotcha: `HNSWIndex` has no persistence of its own (no `save()`/`load()`) —
 confirmed by reading the whole module. Run with
 `bun examples/large-catalog-search/setup.js`.
 
+**[`examples/job-queue/`](examples/job-queue/)** — "kick off slow work,
+return immediately, poll for status," using `core/queue.js`'s `JobQueue`
+for retries with exponential backoff and dead-letter handling off the HTTP
+request/response path entirely (the same "kick off + poll" shape the MCP
+Tasks extension formalizes for long-running tool calls — see the
+`mcp.js`/`shell-mcp.js` note above). Verified live end-to-end: a job
+exhausts its retries into the dead letter, gets retried, and completes.
+Found a real API-consistency gap while building: `queue.retry()` returns
+the raw new job document, not the `{jobId, status}` shape `enqueue()`'s
+other callers get — `tools.js` normalizes it. Run with
+`bun examples/job-queue/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 711 tests across 30 files, ~9 seconds
+bun test tests/    # 717 tests across 31 files, ~9 seconds
 ```
 
-30 test files covering all core modules plus the `examples/content-pipeline`,
+31 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
-`examples/provider-fanout`, and `examples/large-catalog-search` end-to-end
-scenarios (includes the regression tests added by the 2026-07 security audit
+`examples/provider-fanout`, `examples/large-catalog-search`, and
+`examples/job-queue` end-to-end scenarios (includes the regression tests
+added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
 `duration_ms > 0` on an operation that can legitimately finish in under

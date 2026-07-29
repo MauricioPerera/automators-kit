@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 711 tests | 0 deps | 23 core modules
+By automators.work | 717 tests | 0 deps | 23 core modules
 
 ## Architecture
 
@@ -159,6 +159,23 @@ examples). Found a real gotcha: `HNSWIndex` has no persistence of its
 own — no `save()`/`load()`, confirmed by reading the whole module — so a
 real deployment must rebuild the index from a source of truth at boot or
 write its own serialization layer.
+
+`examples/job-queue/` — "kick off slow work, return immediately, poll for
+status": `core/queue.js`'s `JobQueue` doing retries with exponential
+backoff and dead-letter handling off the HTTP request/response path
+entirely (same "kick off + poll" shape as the MCP Tasks extension
+formalizes for long-running tool calls). Verified live end-to-end: a job
+exhausts its retries into the dead letter, gets retried, and completes.
+Run with `bun examples/job-queue/setup.js`; regression test in
+`tests/examples-job-queue.test.js` (`MemoryStorageAdapter`, fast
+poll/backoff — job processing is inherently async on a real timer, so the
+test polls for status like a real client would, no fake timers). Found 2
+real gaps while building: `JobQueue` has no `getById()` of its own (only
+`list()`/`deadLetter()`, both filtered-list views) — `tools.js` reaches
+the internal `_queue_jobs` collection directly via `DocStore`'s public
+API instead; and `queue.retry()` returns the raw new job document, not
+the `{jobId, status}` shape `enqueue()`'s other callers get — `tools.js`
+normalizes it.
 
 ## MCP Server
 
