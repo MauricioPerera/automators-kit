@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 702 tests | 0 deps | 23 core modules
+By automators.work | 711 tests | 0 deps | 23 core modules
 
 ## Architecture
 
@@ -141,6 +141,24 @@ reason as `integrations`/`scheduled-sync`). Found a real gotcha:
 option defaulting to 0, which silently discards a winner whose custom
 scorer returns a negative value — a naive `-price` "cheapest wins" scorer
 must be `1/price` instead (same ordering, always positive).
+
+`examples/large-catalog-search/` — "when does `vector.js`'s linear scan
+stop being good enough?", answered with real measured numbers. Indexes
+8000 synthetic products into `core/hnsw.js`'s standalone `HNSWIndex`
+(not integrated with `vector.js`/`DocStore` — its own thing), then runs
+every query both ways: approximate HNSW graph search vs. a brute-force
+exact cosine scan over the same vectors. Measured live: 4.9x-8.5x
+speedup, recall 0.7-1.0 depending on the query (ANN is genuinely
+approximate — ties at the top-k cutoff can make HNSW surface a different,
+equally-valid subset than the exact linear sort). Run with
+`bun examples/large-catalog-search/setup.js`; regression test in
+`tests/examples-large-catalog-search.test.js` (a 200-product catalog
+instead of the demo's 8000, for speed — `HNSWIndex` is pure in-process,
+no real server/`fetch()` needed here, unlike the `Connector`-based
+examples). Found a real gotcha: `HNSWIndex` has no persistence of its
+own — no `save()`/`load()`, confirmed by reading the whole module — so a
+real deployment must rebuild the index from a source of truth at boot or
+write its own serialization layer.
 
 ## MCP Server
 

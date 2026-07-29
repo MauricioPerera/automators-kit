@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-702 tests | 0 deps | 23 modules | Bun + Deno + Node.js
+711 tests | 0 deps | 23 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -165,17 +165,29 @@ returns a negative value — a naive "lower price wins" scorer needs a
 positive-valued score (`1/price`, not `-price`). Run with
 `bun examples/provider-fanout/setup.js`.
 
+**[`examples/large-catalog-search/`](examples/large-catalog-search/)** —
+"when does `vector.js`'s linear scan stop being good enough?", answered
+with real measured numbers instead of asserting it. Indexes 8000 synthetic
+products into `core/hnsw.js`'s standalone `HNSWIndex`, then runs every
+query both ways — approximate HNSW graph search vs. a brute-force exact
+cosine scan over the same vectors — and reports timing and recall
+honestly: 4.9x–8.5x faster, recall between 0.7 and 1.0 depending on the
+query (ANN is genuinely approximate, not always perfect). Documents a real
+gotcha: `HNSWIndex` has no persistence of its own (no `save()`/`load()`) —
+confirmed by reading the whole module. Run with
+`bun examples/large-catalog-search/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 702 tests across 29 files, ~8 seconds
+bun test tests/    # 711 tests across 30 files, ~9 seconds
 ```
 
-29 test files covering all core modules plus the `examples/content-pipeline`,
+30 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
-and `examples/provider-fanout` end-to-end scenarios (includes the regression
-tests added by the 2026-07 security audit
+`examples/provider-fanout`, and `examples/large-catalog-search` end-to-end
+scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
 `duration_ms > 0` on an operation that can legitimately finish in under
