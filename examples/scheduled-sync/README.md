@@ -86,3 +86,10 @@ to fail **more times than `runSync`'s own `Connector.retries` budget**
 (`api.retries = 2` → 3 attempts) to actually reach `tools.js`'s failure
 handling; a single simulated failure gets silently absorbed by
 `core/connector.js`'s own retry logic first.
+
+Related: `runSync` distinguishes "the API kept 500-ing" from "we couldn't
+reach it at all" using the retry-exhaustion contract documented in
+`core/connector.js`'s class doc comment (a persistent 5xx resolves with
+`ok:false`, a network failure throws) — found and fixed alongside
+`examples/integrations`, which hit the same thing independently. Both cases
+now carry an `attempts` count for visibility into how many tries it took.

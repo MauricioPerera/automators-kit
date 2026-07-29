@@ -20,6 +20,18 @@
  * build a Connector with `baseUrl`/`path` sourced from UNTRUSTED input (user
  * workflows, external data) MUST enable `opts.blockInternalHosts` so each
  * request is validated with `assertPublicUrl` before the fetch is performed.
+ *
+ * Retry-exhaustion contract (read this before writing failure-handling code):
+ * exhausting all attempts due to a NETWORK/TIMEOUT failure throws a
+ * `ConnectorError` (with `.details.attempts`); exhausting all attempts due to
+ * a persistent 5xx response instead RESOLVES normally with the last response
+ * (`{ ok: false, status: 5xx, ... }`), same as a first-try 5xx — it never
+ * throws for that case. This mirrors `fetch()` itself (resolves for any HTTP
+ * response, rejects only on a transport-level failure) but is easy to miss:
+ * code that only wraps calls in try/catch will silently not notice an
+ * exhausted-retries HTTP failure. Always check `.ok` in addition to
+ * catching. Both paths report how many attempts were made — `.attempts` on
+ * the resolved result, `.details.attempts` on the thrown error.
  */
 
 import { assertPublicUrl } from './net-guard.js';
@@ -75,7 +87,13 @@ export class Connector {
    * @param {string} path
    * @param {object|string|null} body
    * @param {object} opts - { headers, params, raw, timeout }
-   * @returns {Promise<{ ok: boolean, status: number, data: any, headers: object }>}
+   * @returns {Promise<{ ok: boolean, status: number, data: any, headers: object, attempts: number }>}
+   *   `attempts` is how many HTTP requests this call actually made (1 if it
+   *   succeeded — or failed with no retries left — on the first try).
+   *   See the retry-exhaustion contract in the class doc comment above:
+   *   a network/timeout failure that exhausts retries THROWS ConnectorError
+   *   instead of resolving; a persistent 5xx that exhausts retries resolves
+   *   normally with `ok: false`.
    */
   async request(method, path, body = null, opts = {}) {
     // Build URL with query params
@@ -155,6 +173,7 @@ export class Connector {
           status: response.status,
           data,
           headers: resHeaders,
+          attempts: attempt + 1,
         };
 
         // Don't retry on client errors (4xx)

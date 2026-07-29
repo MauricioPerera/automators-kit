@@ -101,6 +101,16 @@ function okResponse() {
   };
 }
 
+function errorResponse(status) {
+  return {
+    ok: false,
+    status,
+    headers: new Map([['content-type', 'application/json']]),
+    json: async () => ({ error: `HTTP ${status}` }),
+    text: async () => `{"error":"HTTP ${status}"}`,
+  };
+}
+
 describe('SSRF guard (blockInternalHosts)', () => {
   it('rejects internal destination when flag is on, without fetching', async () => {
     const fetch = stubFetch(() => okResponse());
@@ -153,6 +163,69 @@ describe('SSRF guard (blockInternalHosts)', () => {
       expect(f2.calls()[0].url).toBe('https://api.example.com/v1/users');
     } finally {
       f2.restore();
+    }
+  });
+});
+
+describe('Retry-exhaustion contract', () => {
+  // Documented in the class + request() doc comments after this was found
+  // independently in examples/integrations and examples/scheduled-sync:
+  // exhausting retries on a persistent 5xx resolves normally (ok:false),
+  // it does NOT throw — only a network/timeout failure throws ConnectorError.
+  // Both paths now report `attempts`.
+
+  it('a persistent 5xx exhausts retries and resolves normally with attempts = maxAttempts', async () => {
+    const fetch = stubFetch(() => errorResponse(503));
+    try {
+      const c = new Connector('https://api.example.com', { retries: 2, retryDelay: 1 });
+      const res = await c.get('/flaky');
+      expect(res.ok).toBe(false);
+      expect(res.status).toBe(503);
+      expect(res.attempts).toBe(3); // retries:2 -> 3 total attempts
+      expect(fetch.calls().length).toBe(3);
+    } finally {
+      fetch.restore();
+    }
+  });
+
+  it('a 5xx followed by success resolves ok:true with attempts reflecting the retry', async () => {
+    let call = 0;
+    const fetch = stubFetch(() => (call++ === 0 ? errorResponse(503) : okResponse()));
+    try {
+      const c = new Connector('https://api.example.com', { retries: 2, retryDelay: 1 });
+      const res = await c.get('/flaky');
+      expect(res.ok).toBe(true);
+      expect(res.attempts).toBe(2); // failed once, succeeded on the 2nd
+    } finally {
+      fetch.restore();
+    }
+  });
+
+  it('a network failure exhausting retries THROWS ConnectorError with details.attempts (unlike the 5xx case above)', async () => {
+    const fetch = stubFetch(() => { throw new TypeError('fetch failed'); });
+    try {
+      const c = new Connector('https://api.example.com', { retries: 1, retryDelay: 1 });
+      let thrown;
+      try {
+        await c.get('/down');
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(ConnectorError);
+      expect(thrown.details.attempts).toBe(2); // retries:1 -> 2 total attempts
+    } finally {
+      fetch.restore();
+    }
+  });
+
+  it('a single successful call reports attempts = 1', async () => {
+    const fetch = stubFetch(() => okResponse());
+    try {
+      const c = new Connector('https://api.example.com');
+      const res = await c.get('/ok');
+      expect(res.attempts).toBe(1);
+    } finally {
+      fetch.restore();
     }
   });
 });

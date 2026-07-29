@@ -56,7 +56,11 @@ exhausted because the server kept returning **5xx**, it returns the last
 response normally — `{ ok: false, status: 503, ... }` — no exception. If
 your integration code only wraps calls in `try/catch` to detect failure,
 you'll silently miss an exhausted-retries HTTP failure; check `res.ok` too.
-Covered by a dedicated test in `tests/examples-integrations.test.js`.
+Covered by a dedicated test in `tests/examples-integrations.test.js`. Since
+found, this is now documented directly in `core/connector.js`'s class doc
+comment, and every result (thrown or resolved) carries an `attempts` count
+(`res.attempts` / `err.details.attempts`) so you can tell it was retried
+without inferring it from timing.
 
 ## Regression test
 
