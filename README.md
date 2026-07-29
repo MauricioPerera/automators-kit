@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-674 tests | 0 deps | 22 modules | Bun + Deno + Node.js
+680 tests | 0 deps | 22 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -152,17 +152,28 @@ gotcha: a single simulated failure gets silently absorbed by
 `core/connector.js`'s own retry logic before the sync's own failure handling
 ever sees it. Run with `bun examples/scheduled-sync/setup.js`.
 
+**[`examples/provider-fanout/`](examples/provider-fanout/)** — "ask 3
+redundant suppliers for the same quote and take the best or fastest
+answer," using `core/parallel.js` (`parallelRace` for fastest-wins,
+`parallelMerge` for strategy-based winner selection) fanned out over
+`core/connector.js` calls, so one slow or failing supplier never blocks
+the others. Documents a real gotcha: `parallelMerge`'s default
+`minConfidence` (0) silently discards a winner whose custom scorer
+returns a negative value — a naive "lower price wins" scorer needs a
+positive-valued score (`1/price`, not `-price`). Run with
+`bun examples/provider-fanout/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 674 tests across 27 files, ~7 seconds
+bun test tests/    # 680 tests across 28 files, ~8 seconds
 ```
 
-27 test files covering all core modules plus the `examples/content-pipeline`,
+28 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
-`examples/vector-memory`, `examples/integrations`, and
-`examples/scheduled-sync` end-to-end scenarios (includes the regression tests
-added by the 2026-07 security audit
+`examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
+and `examples/provider-fanout` end-to-end scenarios (includes the regression
+tests added by the 2026-07 security audit
 — see [Security](#security) below).
 
 ## Multi-runtime

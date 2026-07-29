@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 674 tests | 0 deps | 22 core modules
+By automators.work | 680 tests | 0 deps | 22 core modules
 
 ## Architecture
 
@@ -124,6 +124,21 @@ simulated mock failure gets silently absorbed by `core/connector.js`'s own
 retry logic before `tools.js`'s failure handling ever sees it — the mock
 must fail more times than `runSync`'s own retry budget to exercise that
 path for real.
+
+`examples/provider-fanout/` — "ask 3 redundant suppliers for the same
+quote and take the best or fastest answer": `core/parallel.js`'s
+`parallelRace` (first supplier to answer wins, ignores failures unless
+all fail) and `parallelMerge` (all suppliers answer, then a strategy
+picks the winner — highest confidence, or a custom cheapest-price
+scorer) fanned out over `core/connector.js` calls to 3 mock suppliers, so
+one slow/dead supplier never blocks the others. Run with
+`bun examples/provider-fanout/setup.js`; regression test in
+`tests/examples-provider-fanout.test.js` (also a real `Bun.serve()`, same
+reason as `integrations`/`scheduled-sync`). Found a real gotcha:
+`parallelMerge`'s `highest-confidence` strategy has a `minConfidence`
+option defaulting to 0, which silently discards a winner whose custom
+scorer returns a negative value — a naive `-price` "cheapest wins" scorer
+must be `1/price` instead (same ordering, always positive).
 
 ## MCP Server
 
