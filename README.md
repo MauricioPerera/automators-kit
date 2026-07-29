@@ -2,13 +2,13 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-688 tests | 0 deps | 22 modules | Bun + Deno + Node.js
+702 tests | 0 deps | 23 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
 ## What it is
 
-A full-stack automation toolkit in vanilla JavaScript with zero npm dependencies. 22 core modules covering: document database, vector search (HNSW), HTTP router, CMS, n8n-style workflow engine, A2E executor, agent shell (command gateway), job queue, cron scheduler, agent memory, and more.
+A full-stack automation toolkit in vanilla JavaScript with zero npm dependencies. 23 core modules covering: document database, vector search (HNSW), HTTP router, CMS, n8n-style workflow engine, A2E executor, agent shell (command gateway), job queue, cron scheduler, agent memory, and more.
 
 Born from merging and distilling ideas from 10+ repos (lokiCMS, js-doc-store, js-vector-store, a2e, minimemory, Agent-Shell, php-agent-memory, EasyDB, RepoMemory, EmDash, ATDF) into a single portable project.
 
@@ -23,7 +23,7 @@ bun server-bun.js  # start at http://localhost:3000
 
 No `npm install`. Zero dependencies.
 
-## 22 Core Modules
+## 23 Core Modules
 
 | Module | What it does |
 |--------|-------------|
@@ -42,7 +42,8 @@ No `npm install`. Zero dependencies.
 | **nodes.js** | Node registry: 20 built-in nodes (core, communication, data, AI) + ARDF export |
 | **triggers.js** | Trigger system: manual, webhook, cron, polling with change detection |
 | **credentials.js** | Credential vault: AES-256-GCM encrypted API keys and tokens |
-| **shell.js** | Agent shell: command gateway, 2 MCP tools (~600 constant tokens), pipeline, JQ filter, RBAC |
+| **shell.js** | Agent shell: command gateway, parser, pipeline, JQ filter, RBAC |
+| **shell-mcp.js** | Exposes `shell.js` over MCP as exactly 2 fixed tools (`shell_help`/`shell_exec`), ~600 constant tokens regardless of registry size — port of [Agent-Shell](https://github.com/MauricioPerera/Agent-Shell)'s `McpServer` |
 | **queue.js** | Job queue: async processing, retries with exponential backoff, dead letter, stuck-job lease reclaim |
 | **cron.js** | Cron scheduler: 5-field expressions, enable/disable, manual run, anti-reentrancy guard |
 | **connector.js** | HTTP client: auth presets (bearer/basic/apikey), retries, timeout, optional SSRF guard |
@@ -53,6 +54,7 @@ No `npm install`. Zero dependencies.
 **Picking between similar-sounding modules:**
 - **`memory.js` vs `vector.js`** — `memory.js`'s `recall()` is keyword/term matching with time decay, zero ML dependency, works out of the box (see [`examples/agent-memory-backend`](examples/agent-memory-backend/)). `vector.js` does real cosine-similarity search over embeddings *you* provide — it never calls an embedding API itself (see [`examples/vector-memory`](examples/vector-memory/)). Reach for `memory.js` first; reach for `vector.js` when word-overlap isn't good enough and you're willing to bring an embedding function.
 - **`workflow.js` vs `a2e.js`** — two separate execution engines, not layers of one system. `workflow.js` is the n8n-style engine: named nodes wired by `{{ref}}` templates, triggered by webhook/cron/poll/manual, DAG-parallel. `a2e.js` is a smaller, declarative multi-step executor (`SetData`/`FilterData`/`ApiCall`/`Conditional`/`Loop`/...) with its own DAG and middleware, generally used standalone or from an `a2e.js`-authored node. They share the DAG level-scheduling algorithm itself (`dag.js`) since it was byte-for-byte duplicated code, but each keeps its own dependency-detection convention — an engine-specific improvement (e.g. how deps are inferred) still has to be ported to the other by hand.
+- **`mcp.js` vs `shell-mcp.js`** — two different answers to "how many MCP tools should this expose." `mcp.js` gives each capability its own tool with a real JSON schema (`list_entries`, `create_entry`...) — the client sees full discovery via `tools/list`, but context cost grows with every tool added. `shell-mcp.js` exposes `shell.js`'s entire command registry through exactly 2 fixed tools (`shell_help`/`shell_exec`); the agent discovers commands at runtime via `shell_exec("search ...")`/`("describe ...")` instead of `tools/list`, so the tool-list cost stays constant no matter how large the registry gets. Verified against a real external MCP client (poolside.ai's `pool exec`): given only `shell_help`/`shell_exec`, it correctly called help first, searched for the right commands, described their params, then executed them — no schema handed to it upfront.
 
 ## Usage
 
@@ -166,10 +168,10 @@ positive-valued score (`1/price`, not `-price`). Run with
 ## Testing
 
 ```bash
-bun test tests/    # 688 tests across 28 files, ~8 seconds
+bun test tests/    # 702 tests across 29 files, ~8 seconds
 ```
 
-28 test files covering all core modules plus the `examples/content-pipeline`,
+29 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 and `examples/provider-fanout` end-to-end scenarios (includes the regression
