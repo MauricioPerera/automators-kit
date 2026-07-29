@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 661 tests | 0 deps | 21 core modules
+By automators.work | 665 tests | 0 deps | 21 core modules
 
 ## Architecture
 
@@ -104,6 +104,21 @@ real gotcha: `connector.js` only throws `ConnectorError` when retries are
 exhausted by a network/timeout failure — exhausting retries on repeated 5xx
 returns the last response normally (`{ok:false, status:503}`), no
 exception; callers must check `.ok`, not only catch.
+
+`examples/scheduled-sync/` — the reverse of `integrations` above: pushes
+published CMS entries OUT to an external system on a `core/cron.js`
+schedule (every 5 min) via `core/connector.js`, tracked with a cursor
+(`_sync_state` collection) so re-runs never resend what already synced.
+`tools.js`'s `runSync` documents the trade-off: the cursor only advances
+past entries that pushed successfully, in order — a failure stops the run
+there (gap-free, at-least-once) rather than tracking individually-failed
+ids and continuing past them. Run with `bun examples/scheduled-sync/setup.js`;
+regression test in `tests/examples-scheduled-sync.test.js` (also a real
+`Bun.serve()`, same reason as `integrations`). Found that a single
+simulated mock failure gets silently absorbed by `core/connector.js`'s own
+retry logic before `tools.js`'s failure handling ever sees it — the mock
+must fail more times than `runSync`'s own retry budget to exercise that
+path for real.
 
 ## MCP Server
 

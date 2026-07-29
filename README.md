@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-661 tests | 0 deps | 21 modules | Bun + Deno + Node.js
+665 tests | 0 deps | 21 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -137,16 +137,26 @@ Slack/Discord/a flaky third-party API, so retries and delivery are visible
 end-to-end with zero real webhook URLs; swap in production URLs and the
 integration code doesn't change. Run with `bun examples/integrations/setup.js`.
 
+**[`examples/scheduled-sync/`](examples/scheduled-sync/)** — the reverse of
+`integrations` above: pushes published CMS entries OUT to an external system
+on a `core/cron.js` schedule via `core/connector.js`, tracked with a cursor
+so re-runs never resend what already synced. Documents the trade-off of
+simple cursor-based sync (a failure stops the cursor there — gap-free,
+at-least-once, but blocks newer entries until it's retried) and a real
+gotcha: a single simulated failure gets silently absorbed by
+`core/connector.js`'s own retry logic before the sync's own failure handling
+ever sees it. Run with `bun examples/scheduled-sync/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 661 tests across 26 files, ~7 seconds
+bun test tests/    # 665 tests across 27 files, ~7 seconds
 ```
 
-26 test files covering all core modules plus the `examples/content-pipeline`,
+27 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
-`examples/vector-memory`, and `examples/integrations` end-to-end scenarios
-(includes the regression tests
+`examples/vector-memory`, `examples/integrations`, and
+`examples/scheduled-sync` end-to-end scenarios (includes the regression tests
 added by the 2026-07 security audit
 — see [Security](#security) below).
 
