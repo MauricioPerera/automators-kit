@@ -617,3 +617,91 @@ describe('Namespaced search/describe/help/history/context are not shadowed by th
     expect(Array.isArray(historyRes.data)).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Found while auditing shell.js: batch didn't isolate a thrown exception,
+// and the ' | ' / ' >> ' / ',' split points weren't quote-aware.
+// ---------------------------------------------------------------------------
+
+describe('batch isolates a thrown handler exception (does not sink sibling results)', () => {
+  it('one command throwing does not discard the other commands\' successful results', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
+    shell.registry.register('a', 'ok', { description: 'ok' }, async () => ({ good: true }));
+    shell.registry.register('b', 'boom', { description: 'boom' }, async () => { throw new Error('kaboom'); });
+
+    const errSpy = console.error;
+    console.error = () => {};
+    let r;
+    try {
+      r = await shell.exec('batch [a:ok, b:boom]');
+    } finally {
+      console.error = errSpy;
+    }
+
+    expect(r.code).toBe(0); // the batch itself always succeeds; per-item status is inside data
+    expect(r.data).toEqual([
+      { command: 'a:ok', code: 0, data: { good: true }, error: null },
+      { command: 'b:boom', code: 1, data: null, error: 'Internal command error' },
+    ]);
+  });
+
+  it('debug mode preserves the internal message for a thrown batch item too', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin, debug: true });
+    shell.registry.register('b', 'boom', { description: 'boom' }, async () => { throw new Error('kaboom'); });
+
+    const errSpy = console.error;
+    console.error = () => {};
+    let r;
+    try {
+      r = await shell.exec('batch [b:boom]');
+    } finally {
+      console.error = errSpy;
+    }
+
+    expect(r.data[0].error).toBe('kaboom');
+  });
+});
+
+describe('quote-aware split points: | (filter), >> (pipeline), , (batch)', () => {
+  it('a quoted arg containing " | " is not mistaken for a JQ filter separator', () => {
+    const r = parse('text:template --template "a | b" --data {}');
+    expect(r.type).toBe('single');
+    expect(r.filter).toBeNull();
+    expect(r.commands[0].args.template).toBe('a | b');
+  });
+
+  it('a quoted arg containing " >> " is not mistaken for a pipeline separator', () => {
+    const r = parse('text:template --template "a >> b" --data {}');
+    expect(r.type).toBe('single');
+    expect(r.commands.length).toBe(1);
+    expect(r.commands[0].args.template).toBe('a >> b');
+  });
+
+  it('a quoted arg containing "," inside a batch is not mistaken for the batch item separator', () => {
+    const r = parse('batch [text:template --template "a, b", math:calc --a 1 --op + --b 2]');
+    expect(r.type).toBe('batch');
+    expect(r.commands.length).toBe(2);
+    expect(r.commands[0].args.template).toBe('a, b');
+    expect(r.commands[1].command).toBe('calc');
+  });
+
+  it('a real JQ filter after a quoted arg still splits correctly', () => {
+    const r = parse('text:template --template "hello" --data {} | .length');
+    expect(r.filter).toBe('.length');
+    expect(r.commands[0].args.template).toBe('hello');
+  });
+
+  it('a real pipeline after a quoted arg still splits correctly', () => {
+    const r = parse('text:template --template "hello" >> json:filter --expression .');
+    expect(r.type).toBe('pipeline');
+    expect(r.commands.length).toBe(2);
+    expect(r.commands[0].args.template).toBe('hello');
+  });
+
+  it('end-to-end: a quoted filter-like value now executes and returns the literal string, not undefined', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
+    const r = await shell.exec('text:template --template "a | b" --data {}');
+    expect(r.code).toBe(0);
+    expect(r.data).toBe('a | b');
+  });
+});

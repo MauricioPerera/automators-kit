@@ -33,14 +33,14 @@ export function parse(input) {
   if (input.startsWith('batch [') || input.startsWith('batch[')) {
     const inner = input.slice(input.indexOf('[') + 1, input.lastIndexOf(']'));
     if (!inner) return { error: 'Empty batch' };
-    const cmds = inner.split(',').map(s => s.trim()).filter(Boolean);
+    const cmds = splitOutsideQuotes(inner, ',').map(s => s.trim()).filter(Boolean);
     if (cmds.length > MAX_BATCH) return { error: `Batch too large (max ${MAX_BATCH})` };
     return { type: 'batch', commands: cmds.map(parseCommand), filter: null };
   }
 
   // Pipeline: cmd1 >> cmd2 >> cmd3
-  if (input.includes(' >> ')) {
-    const segments = input.split(' >> ');
+  if (indexOfOutsideQuotes(input, ' >> ') !== -1) {
+    const segments = splitOutsideQuotes(input, ' >> ');
     if (segments.length > MAX_PIPELINE) return { error: `Pipeline too deep (max ${MAX_PIPELINE})` };
     // Last segment may have a JQ filter
     const last = segments[segments.length - 1];
@@ -56,10 +56,42 @@ export function parse(input) {
 }
 
 function splitFilter(input) {
-  // Split on ' | ' but not inside quotes
-  const idx = input.indexOf(' | ');
+  const idx = indexOfOutsideQuotes(input, ' | ');
   if (idx === -1) return { cmd: input, filter: null };
   return { cmd: input.slice(0, idx), filter: input.slice(idx + 3).trim() };
+}
+
+/**
+ * Find the first index of `needle` in `str` that is NOT inside a single- or
+ * double-quoted span (quote-tracking mirrors tokenize()'s rules: a quote
+ * character toggles quoting on/off, no escape sequences). Returns -1 if
+ * `needle` only occurs inside quotes, or not at all.
+ */
+function indexOfOutsideQuotes(str, needle) {
+  let inQuote = null;
+  for (let i = 0; i <= str.length - needle.length; i++) {
+    const ch = str[i];
+    if (inQuote) {
+      if (ch === inQuote) inQuote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { inQuote = ch; continue; }
+    if (str.startsWith(needle, i)) return i;
+  }
+  return -1;
+}
+
+/** Split `str` on every occurrence of `needle` that is outside quotes. */
+function splitOutsideQuotes(str, needle) {
+  const segments = [];
+  let rest = str;
+  let idx;
+  while ((idx = indexOfOutsideQuotes(rest, needle)) !== -1) {
+    segments.push(rest.slice(0, idx));
+    rest = rest.slice(idx + needle.length);
+  }
+  segments.push(rest);
+  return segments;
 }
 
 function parseCommand(input) {
@@ -580,8 +612,13 @@ Profiles: admin, operator, reader, restricted (current: ${this.profile})`;
   }
 
   async _execBatch(commands) {
+    // Each item runs isolated: a thrown handler exception must not sink the
+    // whole batch via Promise.all's fail-fast rejection, which would discard
+    // sibling results that already completed successfully. _execSingleSafe
+    // converts a throw into the same generic-error shape _error() commands
+    // already return, so one bad command never costs the others their result.
     const results = await Promise.all(
-      commands.map(cmd => this._execSingle(cmd))
+      commands.map(cmd => this._execSingleSafe(cmd))
     );
     return this._ok(results.map((r, i) => ({
       command: commands[i].namespace ? `${commands[i].namespace}:${commands[i].command}` : commands[i].command,
@@ -589,6 +626,17 @@ Profiles: admin, operator, reader, restricted (current: ${this.profile})`;
       data: r.data,
       error: r.error,
     })));
+  }
+
+  async _execSingleSafe(cmd) {
+    try {
+      return await this._execSingle(cmd);
+    } catch (err) {
+      const id = cmd.namespace ? `${cmd.namespace}:${cmd.command}` : cmd.command;
+      console.error(`[shell] internal error in batch item "${id}":`, err && err.message);
+      const error = this.debug ? (err && err.message) || 'Internal command error' : 'Internal command error';
+      return this._error(1, error);
+    }
   }
 
   // ─── BUILT-IN COMMANDS ───────────────────────────────────
