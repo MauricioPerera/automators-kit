@@ -68,6 +68,18 @@ describe('Command gateway: admin persona', () => {
     expect(deleted.code).toBe(0);
     expect(deleted.data.deleted).toBe(id);
   });
+
+  // Regression: core/shell.js's builtin dispatch used to shadow ANY
+  // registered `<namespace>:search` command with its own bare `search`
+  // builtin, regardless of namespace — content:search silently never
+  // reached registry.js's own handler. Fixed; this pins the fix here too.
+  it('content:search reaches the registered handler, not the shell\'s bare search builtin', async () => {
+    await exec('admin', 'content:create --title "Findable via search" --body "x"');
+    const res = await exec('admin', 'content:search --q Findable');
+    expect(res.code).toBe(0);
+    expect(Array.isArray(res.data)).toBe(true);
+    expect(res.data.some((e) => e.title === 'Findable via search')).toBe(true);
+  });
 });
 
 describe('Command gateway: editor persona (custom scope, not a built-in profile)', () => {

@@ -493,11 +493,19 @@ Profiles: admin, operator, reader, restricted (current: ${this.profile})`;
   async _execSingle(cmd) {
     if (!cmd.command) return this._error(1, 'Empty command');
 
-    // Public built-in commands (no permission check — discovery only)
-    switch (cmd.command) {
-      case 'search': return this._cmdSearch(cmd);
-      case 'describe': return this._cmdDescribe(cmd);
-      case 'help': return this._ok(this.help());
+    // Public built-in commands (no permission check — discovery only).
+    // Only bare, namespace-less `search`/`describe`/`help` are the
+    // built-ins — a registered `<namespace>:search` (or :describe/:help)
+    // command must resolve normally below, not be shadowed by matching on
+    // `cmd.command` alone regardless of namespace (found while building
+    // examples/vector-memory: a `notes:search` command silently always hit
+    // this switch and never reached its own handler).
+    if (!cmd.namespace) {
+      switch (cmd.command) {
+        case 'search': return this._cmdSearch(cmd);
+        case 'describe': return this._cmdDescribe(cmd);
+        case 'help': return this._ok(this.help());
+      }
     }
 
     // Gated built-in commands — shell state, subject to RBAC like any other command

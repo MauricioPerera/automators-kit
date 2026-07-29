@@ -545,3 +545,45 @@ describe('FIX-32: generic error messages on handler throw', () => {
     }
   });
 });
+
+describe('Namespaced search/describe/help are not shadowed by the builtins', () => {
+  // Found while building examples/vector-memory: `_execSingle`'s builtin
+  // dispatch matched on `cmd.command` alone ('search'/'describe'/'help'),
+  // regardless of `cmd.namespace` — so a registered `notes:search` (or
+  // `<any-ns>:describe`/`:help`) NEVER reached its own handler, always
+  // silently hit the bare builtin instead. Only a namespace-less command
+  // literally named `search`/`describe`/`help` is the builtin now.
+  it('a registered `<ns>:search` command reaches its own handler, not _cmdSearch', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
+    shell.registry.register('notes', 'search', { description: 'custom search' }, async (args) => ({ custom: true, query: args.query || args._0 }));
+    const r = await shell.exec('notes:search hello');
+    expect(r.code).toBe(0);
+    expect(r.data).toEqual({ custom: true, query: 'hello' });
+  });
+
+  it('a registered `<ns>:describe` command reaches its own handler, not _cmdDescribe', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
+    shell.registry.register('widgets', 'describe', { description: 'custom describe' }, async () => ({ custom: true }));
+    const r = await shell.exec('widgets:describe');
+    expect(r.code).toBe(0);
+    expect(r.data).toEqual({ custom: true });
+  });
+
+  it('a registered `<ns>:help` command reaches its own handler, not the shell help protocol', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
+    shell.registry.register('widgets', 'help', { description: 'custom help' }, async () => 'custom help text');
+    const r = await shell.exec('widgets:help');
+    expect(r.code).toBe(0);
+    expect(r.data).toBe('custom help text');
+  });
+
+  it('the bare (namespace-less) builtins still work as before', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
+    shell.registry.register('users', 'list', { description: 'list' }, async () => ['alice']);
+    const searchRes = await shell.exec('search users');
+    expect(searchRes.code).toBe(0);
+    const helpRes = await shell.exec('help');
+    expect(helpRes.code).toBe(0);
+    expect(typeof helpRes.data).toBe('string');
+  });
+});
