@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { buildTools, handleMCPRequest } from '../core/mcp.js';
+import { buildTools, handleMCPRequest, buildAllTools } from '../core/mcp.js';
 
 // ---------------------------------------------------------------------------
 // Fake CMS + spies
@@ -274,5 +274,45 @@ describe('MCP tool error sanitization', () => {
     expect(text).not.toContain('/secret/path');
     const body = JSON.parse(text);
     expect(body.error).toMatch(/internal error processing tool call/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildAllTools — opts.includeCmsTools (point #3 from the 6-examples review)
+// ---------------------------------------------------------------------------
+
+describe('buildAllTools: opts.includeCmsTools', () => {
+  it('defaults to including the base CMS tools alongside extraTools', () => {
+    const cms = makeFakeCms();
+    const allTools = buildAllTools(cms, { my_tool: { description: 'x', inputSchema: {}, handler: async () => {} } });
+    expect(Object.keys(allTools)).toContain('list_entries');
+    expect(Object.keys(allTools)).toContain('my_tool');
+  });
+
+  it('includeCmsTools: false excludes every base CMS tool, keeping only extraTools', () => {
+    const cms = makeFakeCms();
+    const allTools = buildAllTools(
+      cms,
+      { my_tool: { description: 'x', inputSchema: {}, handler: async () => {} } },
+      { includeCmsTools: false },
+    );
+    expect(Object.keys(allTools)).toEqual(['my_tool']);
+    expect(allTools.list_entries).toBeUndefined();
+    expect(allTools.create_entry).toBeUndefined();
+  });
+
+  it('a purpose-built tool set still dispatches correctly through handleMCPRequest', async () => {
+    const cms = makeFakeCms();
+    const allTools = buildAllTools(
+      cms,
+      { echo: { description: 'echo', inputSchema: { type: 'object', properties: { msg: { type: 'string' } }, required: ['msg'] }, handler: async (args) => ({ echoed: args.msg }) } },
+      { includeCmsTools: false },
+    );
+
+    const listRes = await handleMCPRequest({ id: 1, method: 'tools/list' }, allTools);
+    expect(listRes.result.tools.map((t) => t.name)).toEqual(['echo']);
+
+    const callRes = await handleMCPRequest({ id: 2, method: 'tools/call', params: { name: 'echo', arguments: { msg: 'hi' } } }, allTools);
+    expect(parseContentText(callRes)).toEqual({ echoed: 'hi' });
   });
 });

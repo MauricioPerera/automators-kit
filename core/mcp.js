@@ -361,13 +361,34 @@ export async function handleMCPRequest(request, allTools) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Compute the merged tool set a server would expose. Pulled out of
+ * `createMCPServer` so it's testable without touching stdio (that function
+ * wires a real `process.stdin` readline listener with no way to tear it
+ * down from outside — calling it in a test suite risks leaking a listener
+ * that keeps the test process alive).
+ * @param {import('./cms.js').CMS} cms
+ * @param {Record<string, object>} extraTools
+ * @param {{ includeCmsTools?: boolean }} opts
+ */
+export function buildAllTools(cms, extraTools = {}, opts = {}) {
+  const cmsTools = opts.includeCmsTools === false ? {} : buildTools(cms);
+  return { ...cmsTools, ...extraTools };
+}
+
+/**
  * Create and start an MCP server over stdio.
  * @param {import('./cms.js').CMS} cms
  * @param {Record<string, object>} extraTools - Additional tools from plugins
+ * @param {object} [opts]
+ * @param {boolean} [opts.includeCmsTools=true] - When `false`, the server
+ *   exposes ONLY `extraTools` — none of the base CMS tools
+ *   (list_entries/create_entry/etc). Useful for a purpose-built MCP server
+ *   (e.g. exposing just an agent's memory, or just a plugin's own tools)
+ *   where the CMS tools would just be noise for the client. `cms` is still
+ *   required either way — the stdio loop calls `cms.shutdown()` on close.
  */
-export function createMCPServer(cms, extraTools = {}) {
-  const cmsTools = buildTools(cms);
-  const allTools = { ...cmsTools, ...extraTools };
+export function createMCPServer(cms, extraTools = {}, opts = {}) {
+  const allTools = buildAllTools(cms, extraTools, opts);
 
   const rl = createInterface({ input: process.stdin, terminal: false });
 
