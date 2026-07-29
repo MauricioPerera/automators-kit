@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-657 tests | 0 deps | 21 modules | Bun + Deno + Node.js
+661 tests | 0 deps | 21 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -129,15 +129,24 @@ name alone regardless of namespace, silently shadowing any registered
 `<namespace>:search`/`:describe`/`:help` command (this had already broken
 `content:search` in `command-gateway` unnoticed).
 
+**[`examples/integrations/`](examples/integrations/)** — "wire up Slack +
+Discord + a REST API without standing up infra," using `core/connector.js`
+(auth presets, retry/backoff, optional SSRF guard) + `core/credentials.js`
+(encrypted vault). Runs fully offline — local mocks stand in for
+Slack/Discord/a flaky third-party API, so retries and delivery are visible
+end-to-end with zero real webhook URLs; swap in production URLs and the
+integration code doesn't change. Run with `bun examples/integrations/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 657 tests across 25 files, ~7 seconds
+bun test tests/    # 661 tests across 26 files, ~7 seconds
 ```
 
-25 test files covering all core modules plus the `examples/content-pipeline`,
-`examples/command-gateway`, `examples/agent-memory-backend`, and
-`examples/vector-memory` end-to-end scenarios (includes the regression tests
+26 test files covering all core modules plus the `examples/content-pipeline`,
+`examples/command-gateway`, `examples/agent-memory-backend`,
+`examples/vector-memory`, and `examples/integrations` end-to-end scenarios
+(includes the regression tests
 added by the 2026-07 security audit
 — see [Security](#security) below).
 

@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 657 tests | 0 deps | 21 core modules
+By automators.work | 661 tests | 0 deps | 21 core modules
 
 ## Architecture
 
@@ -90,6 +90,20 @@ shadowing any registered `<namespace>:search`/`:describe`/`:help` command
 (this had already broken `content:search` in `command-gateway`, unnoticed
 until this example's test exercised it) — fixed, with regression tests in
 `tests/shell.test.js`.
+
+`examples/integrations/` — wire up Slack + Discord + a REST API with
+`core/connector.js` (auth presets `slack()`/`discord()`/`restApi()`/
+`apiKey()`, retry/backoff, optional `blockInternalHosts` SSRF guard) +
+`core/credentials.js` (encrypted vault) — no infra to stand up. Runs fully
+offline: `mocks.js` stands in for Slack/Discord/a flaky third-party API on
+the same server, so retries and delivery are visible end-to-end with zero
+real webhook URLs. Run with `bun examples/integrations/setup.js`; regression
+test in `tests/examples-integrations.test.js` starts a real `Bun.serve()`
+(not just `app.handle()`) since `Connector` uses real `fetch()`. Found a
+real gotcha: `connector.js` only throws `ConnectorError` when retries are
+exhausted by a network/timeout failure — exhausting retries on repeated 5xx
+returns the last response normally (`{ok:false, status:503}`), no
+exception; callers must check `.ok`, not only catch.
 
 ## MCP Server
 
