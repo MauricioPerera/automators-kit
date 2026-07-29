@@ -2,13 +2,13 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-665 tests | 0 deps | 21 modules | Bun + Deno + Node.js
+674 tests | 0 deps | 22 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
 ## What it is
 
-A full-stack automation toolkit in vanilla JavaScript with zero npm dependencies. 21 core modules covering: document database, vector search (HNSW), HTTP router, CMS, n8n-style workflow engine, A2E executor, agent shell (command gateway), job queue, cron scheduler, agent memory, and more.
+A full-stack automation toolkit in vanilla JavaScript with zero npm dependencies. 22 core modules covering: document database, vector search (HNSW), HTTP router, CMS, n8n-style workflow engine, A2E executor, agent shell (command gateway), job queue, cron scheduler, agent memory, and more.
 
 Born from merging and distilling ideas from 10+ repos (lokiCMS, js-doc-store, js-vector-store, a2e, minimemory, Agent-Shell, php-agent-memory, EasyDB, RepoMemory, EmDash, ATDF) into a single portable project.
 
@@ -23,7 +23,7 @@ bun server-bun.js  # start at http://localhost:3000
 
 No `npm install`. Zero dependencies.
 
-## 21 Core Modules
+## 22 Core Modules
 
 | Module | What it does |
 |--------|-------------|
@@ -38,6 +38,7 @@ No `npm install`. Zero dependencies.
 | **mcp.js** | MCP server: JSON-RPC 2.0 over stdio, 20 tools for AI agents |
 | **a2e.js** | A2E executor: 19 declarative operations, DAG parallel execution, middleware |
 | **workflow.js** | Workflow engine: n8n-style nodes, triggers, credentials, execution history, DAG-parallel execution |
+| **dag.js** | Shared DAG level-scheduling (Kahn's algorithm), used by both `workflow.js` and `a2e.js` |
 | **nodes.js** | Node registry: 20 built-in nodes (core, communication, data, AI) + ARDF export |
 | **triggers.js** | Trigger system: manual, webhook, cron, polling with change detection |
 | **credentials.js** | Credential vault: AES-256-GCM encrypted API keys and tokens |
@@ -51,7 +52,7 @@ No `npm install`. Zero dependencies.
 
 **Picking between similar-sounding modules:**
 - **`memory.js` vs `vector.js`** — `memory.js`'s `recall()` is keyword/term matching with time decay, zero ML dependency, works out of the box (see [`examples/agent-memory-backend`](examples/agent-memory-backend/)). `vector.js` does real cosine-similarity search over embeddings *you* provide — it never calls an embedding API itself (see [`examples/vector-memory`](examples/vector-memory/)). Reach for `memory.js` first; reach for `vector.js` when word-overlap isn't good enough and you're willing to bring an embedding function.
-- **`workflow.js` vs `a2e.js`** — two separate execution engines, not layers of one system. `workflow.js` is the n8n-style engine: named nodes wired by `{{ref}}` templates, triggered by webhook/cron/poll/manual, DAG-parallel. `a2e.js` is a smaller, declarative multi-step executor (`SetData`/`FilterData`/`ApiCall`/`Conditional`/`Loop`/...) with its own DAG and middleware, generally used standalone or from an `a2e.js`-authored node. They don't share code — an improvement ported to one (e.g. the DAG-parallel scheduling) has to be ported to the other by hand if you want it there too.
+- **`workflow.js` vs `a2e.js`** — two separate execution engines, not layers of one system. `workflow.js` is the n8n-style engine: named nodes wired by `{{ref}}` templates, triggered by webhook/cron/poll/manual, DAG-parallel. `a2e.js` is a smaller, declarative multi-step executor (`SetData`/`FilterData`/`ApiCall`/`Conditional`/`Loop`/...) with its own DAG and middleware, generally used standalone or from an `a2e.js`-authored node. They share the DAG level-scheduling algorithm itself (`dag.js`) since it was byte-for-byte duplicated code, but each keeps its own dependency-detection convention — an engine-specific improvement (e.g. how deps are inferred) still has to be ported to the other by hand.
 
 ## Usage
 
@@ -154,7 +155,7 @@ ever sees it. Run with `bun examples/scheduled-sync/setup.js`.
 ## Testing
 
 ```bash
-bun test tests/    # 665 tests across 27 files, ~7 seconds
+bun test tests/    # 674 tests across 27 files, ~7 seconds
 ```
 
 27 test files covering all core modules plus the `examples/content-pipeline`,
