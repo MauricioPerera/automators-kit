@@ -143,6 +143,7 @@ export { validate, validateBody, createValidator } from './core/validate.js';
 export { HookSystem, PluginRegistry, createPluginAPI } from './core/plugins.js';
 export { toHTML, toMarkdown, toPlainText, fromMarkdown, validateBlocks, extractText, findBlocks, wordCount } from './core/portable-text.js';
 export { createMCPServer } from './core/mcp.js';
+export { createShellMCPServer, handleShellMCPRequest } from './core/shell-mcp.js';
 export { JobQueue } from './core/queue.js';
 export { CronScheduler, parseCron, matchesCron } from './core/cron.js';
 export { Connector, ConnectorError, slack, discord, restApi, apiKey } from './core/connector.js';
