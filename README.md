@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-645 tests | 0 deps | 21 modules | Bun + Deno + Node.js
+657 tests | 0 deps | 21 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -118,15 +118,27 @@ per `agentId` on the same underlying db, and self-maintains via an hourly
 `core/cron.js` job running the heuristic dedup cycle. Run with
 `bun examples/agent-memory-backend/setup.js`.
 
+**[`examples/vector-memory/`](examples/vector-memory/)** — semantic search
+for a personal assistant using `core/vector.js`'s real cosine-similarity
+`VectorStore` (not keyword recall like `agent-memory-backend` above). Ships
+a zero-dependency offline embedding (the hashing trick, no API key) that's a
+drop-in-replaceable stand-in for a real embeddings API. Run with
+`bun examples/vector-memory/setup.js`. Building it found and fixed a real bug:
+`core/shell.js`'s builtin dispatch was matching `search`/`describe`/`help` by
+name alone regardless of namespace, silently shadowing any registered
+`<namespace>:search`/`:describe`/`:help` command (this had already broken
+`content:search` in `command-gateway` unnoticed).
+
 ## Testing
 
 ```bash
-bun test tests/    # 645 tests across 24 files, ~7 seconds
+bun test tests/    # 657 tests across 25 files, ~7 seconds
 ```
 
-24 test files covering all core modules plus the `examples/content-pipeline`,
-`examples/command-gateway`, and `examples/agent-memory-backend` end-to-end
-scenarios (includes the regression tests added by the 2026-07 security audit
+25 test files covering all core modules plus the `examples/content-pipeline`,
+`examples/command-gateway`, `examples/agent-memory-backend`, and
+`examples/vector-memory` end-to-end scenarios (includes the regression tests
+added by the 2026-07 security audit
 — see [Security](#security) below).
 
 ## Multi-runtime

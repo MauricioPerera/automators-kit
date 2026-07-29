@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 645 tests | 0 deps | 21 core modules
+By automators.work | 657 tests | 0 deps | 21 core modules
 
 ## Architecture
 
@@ -75,6 +75,21 @@ sessions. Memory is isolated per `agentId` on the same underlying db.
 Regression test in `tests/examples-agent-memory-backend.test.js` covers
 both surfaces, using `handleMCPRequest()` directly for MCP (no stdio
 needed for testing).
+
+`examples/vector-memory/` — real cosine-similarity semantic search
+(`core/vector.js`'s `VectorStore`) over notes, not keyword recall like
+`agent-memory-backend` above. `embed.js` is a zero-dependency offline
+embedding (hashing trick, deterministic, no API key) explicitly designed
+to be swapped for a real embeddings API — same `(text) => number[]`
+signature `core/vector.js`'s `Reranker.autoSearch` already expects via its
+`embedFn` param. Run with `bun examples/vector-memory/setup.js`; regression
+test in `tests/examples-vector-memory.test.js`. Building this found a real
+bug in `core/shell.js`: the builtin command dispatch matched
+`search`/`describe`/`help` by name alone regardless of namespace, silently
+shadowing any registered `<namespace>:search`/`:describe`/`:help` command
+(this had already broken `content:search` in `command-gateway`, unnoticed
+until this example's test exercised it) — fixed, with regression tests in
+`tests/shell.test.js`.
 
 ## MCP Server
 
