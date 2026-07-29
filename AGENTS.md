@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 680 tests | 0 deps | 22 core modules
+By automators.work | 688 tests | 0 deps | 22 core modules
 
 ## Architecture
 
@@ -422,6 +422,15 @@ over real HTTP; and `core/shell.js` exported `AGENT_PROFILES` but never consulte
 `new Shell({ profile: 'restricted' })` alone enforced nothing unless `permissions` was *also*
 passed explicitly. `permissions` now derives from `profile` when omitted (unrecognized profiles
 fail closed to `restricted`).
+
+**Line-by-line audit (2026-07), `core/shell.js`:** a manual read of the whole command-gateway
+module (parser, RBAC, batch/pipeline execution) found 2 real correctness bugs, both fixed with
+regression tests: `batch [...]` used `Promise.all` directly over each command, so one handler
+*throwing* (vs returning a normal error) silently discarded every sibling command's
+already-succeeded result instead of isolating the failure; and the `' | '`/`' >> '`/`','` split
+points used plain `indexOf`/`split` with no quote-awareness — a quoted argument containing the
+literal delimiter (e.g. `--template "a | b"`) was silently mis-parsed into a broken command plus
+a garbage filter, succeeding with corrupted/`undefined` output instead of erroring.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
