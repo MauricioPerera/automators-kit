@@ -546,13 +546,17 @@ describe('FIX-32: generic error messages on handler throw', () => {
   });
 });
 
-describe('Namespaced search/describe/help are not shadowed by the builtins', () => {
+describe('Namespaced search/describe/help/history/context are not shadowed by the builtins', () => {
   // Found while building examples/vector-memory: `_execSingle`'s builtin
   // dispatch matched on `cmd.command` alone ('search'/'describe'/'help'),
   // regardless of `cmd.namespace` — so a registered `notes:search` (or
   // `<any-ns>:describe`/`:help`) NEVER reached its own handler, always
   // silently hit the bare builtin instead. Only a namespace-less command
   // literally named `search`/`describe`/`help` is the builtin now.
+  //
+  // The `history`/`context` gated builtins had the exact same bug, missed
+  // in that first fix — found while auditing all 6 examples afterward and
+  // fixed the same way.
   it('a registered `<ns>:search` command reaches its own handler, not _cmdSearch', async () => {
     const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
     shell.registry.register('notes', 'search', { description: 'custom search' }, async (args) => ({ custom: true, query: args.query || args._0 }));
@@ -577,6 +581,24 @@ describe('Namespaced search/describe/help are not shadowed by the builtins', () 
     expect(r.data).toBe('custom help text');
   });
 
+  it('a registered `<ns>:history` command reaches its own handler, not getHistory()', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
+    shell.registry.register('audit', 'history', { description: 'custom history' }, async () => ({ custom: true }));
+    await shell.exec('search users'); // put something in the shell's real history first
+    const r = await shell.exec('audit:history');
+    expect(r.code).toBe(0);
+    expect(r.data).toEqual({ custom: true }); // not the shell's own (non-empty) history array
+  });
+
+  it('a registered `<ns>:context` command reaches its own handler, not getContext()', async () => {
+    const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
+    shell.setContext('someKey', 'someValue');
+    shell.registry.register('audit', 'context', { description: 'custom context' }, async () => ({ custom: true }));
+    const r = await shell.exec('audit:context');
+    expect(r.code).toBe(0);
+    expect(r.data).toEqual({ custom: true }); // not the shell's own context object
+  });
+
   it('the bare (namespace-less) builtins still work as before', async () => {
     const shell = new Shell({ profile: 'admin', permissions: AGENT_PROFILES.admin });
     shell.registry.register('users', 'list', { description: 'list' }, async () => ['alice']);
@@ -585,5 +607,13 @@ describe('Namespaced search/describe/help are not shadowed by the builtins', () 
     const helpRes = await shell.exec('help');
     expect(helpRes.code).toBe(0);
     expect(typeof helpRes.data).toBe('string');
+
+    shell.setContext('k', 'v');
+    const contextRes = await shell.exec('context');
+    expect(contextRes.code).toBe(0);
+    expect(contextRes.data).toEqual({ k: 'v' });
+    const historyRes = await shell.exec('history');
+    expect(historyRes.code).toBe(0);
+    expect(Array.isArray(historyRes.data)).toBe(true);
   });
 });

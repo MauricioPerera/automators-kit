@@ -508,8 +508,14 @@ Profiles: admin, operator, reader, restricted (current: ${this.profile})`;
       }
     }
 
-    // Gated built-in commands — shell state, subject to RBAC like any other command
-    if (cmd.command === 'history' || cmd.command === 'context') {
+    // Gated built-in commands — shell state, subject to RBAC like any other
+    // command. Same namespace guard as search/describe/help above: only a
+    // bare, namespace-less `history`/`context` is the builtin — a registered
+    // `<namespace>:history`/`:context` command must resolve normally below,
+    // not be shadowed here (this is the same shape of bug fixed for
+    // search/describe/help while building examples/vector-memory; it was
+    // missed here at the time — found while auditing all 6 examples).
+    if (!cmd.namespace && (cmd.command === 'history' || cmd.command === 'context')) {
       if (!this._checkPermission(cmd.command)) {
         return this._error(3, `Permission denied: ${cmd.command}`);
       }
