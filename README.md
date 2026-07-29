@@ -176,7 +176,10 @@ bun test tests/    # 702 tests across 29 files, ~8 seconds
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 and `examples/provider-fanout` end-to-end scenarios (includes the regression
 tests added by the 2026-07 security audit
-— see [Security](#security) below).
+— see [Security](#security) below). Fully deterministic — no known-flaky
+tests: `memory.test.js`'s dream-heuristic test used to assert
+`duration_ms > 0` on an operation that can legitimately finish in under
+0.5ms (rounds to exactly 0), now asserts the type/shape instead.
 
 ## Multi-runtime
 
