@@ -25,6 +25,7 @@ import { NodeRegistry } from './nodes.js';
 import { TriggerManager, TriggerType } from './triggers.js';
 import { CredentialVault } from './credentials.js';
 import { generateId } from './db.js';
+import { buildLevels } from './dag.js';
 
 // ---------------------------------------------------------------------------
 // WORKFLOW ENGINE
@@ -416,9 +417,11 @@ export class WorkflowEngine {
  * Groups a workflow's nodes into levels that can each run in parallel: a
  * node depends on every other node id referenced via `{{nodeId...}}` in its
  * `inputs` (a `{{_trigger...}}` reference is not a dependency — trigger data
- * is available from the start). Levels are produced with Kahn's algorithm;
- * within a level, ids are kept in their original array order so behavior is
- * deterministic and nodeResults commit order matches the workflow definition.
+ * is available from the start). The dependency detection here is
+ * workflow.js-specific (its `{{ref}}` template convention); the actual
+ * level-scheduling algorithm (Kahn's) is shared with core/a2e.js's DAG via
+ * `./dag.js` — see that module's doc comment for why only THAT part is
+ * shared and not the dependency detection itself.
  *
  * @param {Array<{id: string, inputs?: object}>} nodes
  * @returns {string[][]|null} Array of levels (each an array of node ids), or
@@ -440,21 +443,5 @@ function _buildWorkflowDAG(nodes) {
     }
   }
 
-  const inDegree = new Map(ids.map((id) => [id, deps.get(id).size]));
-  const remaining = new Set(ids);
-  const levels = [];
-
-  while (remaining.size > 0) {
-    const ready = ids.filter((id) => remaining.has(id) && inDegree.get(id) === 0);
-    if (ready.length === 0) return null; // cycle
-    levels.push(ready);
-    for (const id of ready) {
-      remaining.delete(id);
-      for (const other of remaining) {
-        if (deps.get(other).has(id)) inDegree.set(other, inDegree.get(other) - 1);
-      }
-    }
-  }
-
-  return levels;
+  return buildLevels(ids, deps);
 }

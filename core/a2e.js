@@ -12,6 +12,7 @@
  */
 
 import { assertPublicUrl } from './net-guard.js';
+import { buildLevels } from './dag.js';
 
 // ---------------------------------------------------------------------------
 // DATA MODEL — path get/set
@@ -116,32 +117,11 @@ function buildDAG(operations) {
     }
   }
 
-  // Kahn's algorithm — group into parallel levels
-  const inDegree = new Map();
-  for (const [id, deps] of graph) inDegree.set(id, deps.size);
-
-  const levels = [];
-  const visited = new Set();
-
-  while (visited.size < operations.length) {
-    const level = [];
-    for (const [id, deg] of inDegree) {
-      if (!visited.has(id) && deg === 0) level.push(id);
-    }
-    if (level.length === 0) break; // cycle detected — fallback to sequential
-    for (const id of level) {
-      visited.add(id);
-      // Decrement dependents
-      for (const [otherId, deps] of graph) {
-        if (deps.has(id)) inDegree.set(otherId, inDegree.get(otherId) - 1);
-      }
-    }
-    levels.push(level);
-  }
-
-  // If not all visited, fallback
-  if (visited.size < operations.length) return null;
-  return levels;
+  // Level-scheduling (Kahn's algorithm) is shared with core/workflow.js's DAG
+  // via ./dag.js — see that module's doc comment for why only the scheduler
+  // is shared and not this file's own /workflow/<opId> + onError + Conditional
+  // dependency detection above.
+  return buildLevels(operations.map((op) => op.id), graph);
 }
 
 // ---------------------------------------------------------------------------
