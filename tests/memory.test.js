@@ -317,7 +317,13 @@ describe('Dream Cycle', () => {
     // Dream without LLM (heuristic mode)
     const report = await mem.dream();
 
-    expect(report.duration_ms).toBeGreaterThan(0);
+    // A heuristic dedup over 4 in-memory docs can legitimately complete in
+    // under 0.5ms, and Math.round() rounds that to exactly 0 — asserting
+    // strictly > 0 here is flaky by construction (fails whenever the JIT is
+    // warm enough to run this fast, e.g. after earlier tests in this file
+    // already exercised dream()). Assert the type/shape instead.
+    expect(typeof report.duration_ms).toBe('number');
+    expect(report.duration_ms).toBeGreaterThanOrEqual(0);
     expect(report.agentId).toBe('test-agent');
     expect(report.log.length).toBeGreaterThan(0);
     // Should have reduced entries
