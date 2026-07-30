@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-717 tests | 0 deps | 23 modules | Bun + Deno + Node.js
+726 tests | 0 deps | 23 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -189,17 +189,43 @@ the raw new job document, not the `{jobId, status}` shape `enqueue()`'s
 other callers get — `tools.js` normalizes it. Run with
 `bun examples/job-queue/setup.js`.
 
+**[`examples/plugin-system/`](examples/plugin-system/)** — "extend the CMS
+with third-party modules without giving them raw DB access," using
+`core/plugins.js`'s capability-gated `createPluginAPI` + `loadPlugins`.
+3 real local plugins with deliberately narrow, different capabilities
+(`entries:read`+`database:write`, and two with `entries:read` only).
+Verified live: a plugin without `database:write` genuinely has no
+`api.database` property at all. Found and documented a real gotcha:
+`core/cms.js`'s ~30 hook call sites never pass `{ throwOnHookError: true }`,
+so a plugin hook can observe/mutate an operation but can never veto it —
+confirmed live, not just by reading the code. Run with
+`bun examples/plugin-system/setup.js`.
+
+**[`examples/workflow-engine/`](examples/workflow-engine/)** — the n8n-style
+engine itself, front and center: a webhook-triggered order workflow with 3
+independent enrichment nodes measured running in genuine DAG-parallel
+(186ms total vs. ~450ms sequential), `{{ref}}`-wired nodes, and
+vault-backed credentials. Found a real gotcha: built-in HTTP nodes
+(`email.send` and similar, with no custom `handler`) always call
+net-guard's `assertPublicUrl` with **no opt-out** — unlike
+`core/connector.js`'s opt-in `blockInternalHosts` — so they correctly
+reject this example's own local mock API; the demo keeps that failure
+visible (`continueOnError: true`) and adds a custom-handler node using the
+same credential to show the working alternative. Run with
+`bun examples/workflow-engine/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 717 tests across 31 files, ~9 seconds
+bun test tests/    # 726 tests across 33 files, ~10 seconds
 ```
 
-31 test files covering all core modules plus the `examples/content-pipeline`,
+33 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
-`examples/provider-fanout`, `examples/large-catalog-search`, and
-`examples/job-queue` end-to-end scenarios (includes the regression tests
+`examples/provider-fanout`, `examples/large-catalog-search`,
+`examples/job-queue`, `examples/plugin-system`, and
+`examples/workflow-engine` end-to-end scenarios (includes the regression tests
 added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert

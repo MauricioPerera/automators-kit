@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 717 tests | 0 deps | 23 core modules
+By automators.work | 726 tests | 0 deps | 23 core modules
 
 ## Architecture
 
@@ -176,6 +176,42 @@ the internal `_queue_jobs` collection directly via `DocStore`'s public
 API instead; and `queue.retry()` returns the raw new job document, not
 the `{jobId, status}` shape `enqueue()`'s other callers get — `tools.js`
 normalizes it.
+
+`examples/plugin-system/` — "extend the CMS with third-party modules
+without giving them raw DB access": `core/plugins.js`'s capability-gated
+`createPluginAPI` + `loadPlugins`. 3 real local plugin files
+(`audit-log.js`: `entries:read`+`database:write`; `webhook-notifier.js`
+and `blocking-validator.js`: `entries:read` only), loaded through
+`loadPlugins()` against a real `createApp()` + `cms.entries.create/publish`
+flow. Verified live: `webhook-notifier` genuinely has no `api.database`
+property at all (not a stub, absent) since it wasn't granted
+`database:write`. Run with `bun examples/plugin-system/setup.js`;
+regression test in `tests/examples-plugin-system.test.js`. Found a real
+gotcha: `core/cms.js`'s ~30 `this.cms.hook(name, payload)` call sites
+never pass `{ throwOnHookError: true }`, so a plugin hook can observe and
+mutate an operation's payload but can never veto it — `blocking-validator`
+throws from `entry:beforeCreate` to try to block a banned word, the throw
+is logged, and the entry is created anyway. Confirmed live before writing
+it up, not assumed from reading the code.
+
+`examples/workflow-engine/` — the n8n-style engine itself, front and
+center (`content-pipeline` only touches it in passing): a
+webhook-triggered order workflow with 3 independent enrichment nodes,
+`{{ref}}`-wired summary/notify nodes, and vault-backed credentials.
+Verified live: the 3 parallel nodes start within 0.15ms of each other
+(186ms total execution vs. ~450ms sequential). Run with
+`bun examples/workflow-engine/setup.js`; regression test in
+`tests/examples-workflow-engine.test.js` (real `Bun.serve()`, drives the
+actual `/api/workflows/webhook/:path` route, not a direct `execute()`
+call). Found a real gotcha: `core/nodes.js`'s generic HTTP node path
+(`_executeApi`, used by any node without a custom `handler`, e.g.
+`email.send`) always calls net-guard's `assertPublicUrl` with **no
+opt-out** — unlike `core/connector.js`'s opt-in `blockInternalHosts` — so
+it correctly rejects this example's own local mock API. Rather than work
+around it, the demo keeps `email.send` failing as designed
+(`continueOnError: true`) and adds a custom-handler node
+(`notify.email`) using the same vault credential to show the working,
+offline-safe alternative.
 
 ## MCP Server
 
