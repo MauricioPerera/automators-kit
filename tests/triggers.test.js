@@ -217,6 +217,63 @@ describe('TriggerManager', () => {
     }
   });
 
+  it('a non-ok HTTP response (valid JSON error body) counts as a poll failure, not a data change', async () => {
+    const originalFetch = globalThis.fetch;
+    const fired = [];
+    globalThis.fetch = async () => ({ ok: false, status: 503, json: async () => ({ error: 'simulated outage' }) });
+    try {
+      const tm = new TriggerManager({ onTrigger: (id, data) => fired.push({ id, data }), maxConsecutiveFailures: 3 });
+      tm.register('wf1', {
+        type: TriggerType.POLL,
+        config: { url: 'https://example.com/feed.json', interval: 999999 },
+      });
+      await tm._pollOnce('wf1');
+      // The 503's JSON error body must NOT be treated as changed data.
+      expect(fired.length).toBe(0);
+      expect(tm._pollers.get('wf1')._failures).toBe(1);
+
+      await tm._pollOnce('wf1');
+      await tm._pollOnce('wf1');
+      // 3 consecutive non-ok responses trip the circuit-breaker exactly like
+      // 3 consecutive network failures do.
+      expect(tm._pollers.has('wf1')).toBe(false);
+      expect(tm._pollerErrors.get('wf1').lastError).toBe('HTTP 503');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('list() surfaces a circuit-broken poller\'s error state (not just the private _pollerErrors map)', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => { throw new Error('boom'); };
+    try {
+      const tm = new TriggerManager({ onTrigger: () => {}, maxConsecutiveFailures: 2 });
+      tm.register('wf1', {
+        type: TriggerType.POLL,
+        config: { url: 'https://example.com/feed.json', interval: 999999 },
+      });
+      // Still active before the threshold trips.
+      expect(tm.list().find((t) => t.workflowId === 'wf1').pollerStatus).toBe('active');
+
+      for (let i = 0; i < 2; i++) await tm._pollOnce('wf1');
+
+      const row = tm.list().find((t) => t.workflowId === 'wf1');
+      expect(row.pollerStatus).toBe('error');
+      expect(row.pollerError.lastError).toBe('boom');
+      expect(row.pollerError.failures).toBe(2);
+      tm.unregister('wf1');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('list() does not include pollerStatus for non-poll trigger types', () => {
+    const tm = new TriggerManager({ onTrigger: () => {} });
+    tm.register('wf1', { type: TriggerType.MANUAL, config: {} });
+    expect(tm.list()[0].pollerStatus).toBeUndefined();
+    tm.unregister('wf1');
+  });
+
   it('poller resets the failure counter on success and stays registered', async () => {
     const originalFetch = globalThis.fetch;
     let calls = 0;
@@ -224,7 +281,7 @@ describe('TriggerManager', () => {
       calls++;
       // Alternate: odd calls fail, even calls succeed.
       if (calls % 2 === 1) throw new Error('transient');
-      return { json: async () => ({ v: calls }) };
+      return { ok: true, status: 200, json: async () => ({ v: calls }) };
     };
     try {
       const tm = new TriggerManager({ onTrigger: () => {}, maxConsecutiveFailures: 3 });

@@ -171,6 +171,14 @@ export class TriggerManager {
       const res = await fetch(poller.config.url, {
         headers: poller.config.headers || {},
       });
+      // An HTTP-level error (4xx/5xx) with a valid JSON error body used to
+      // fall straight through to the "success" path below — res.json()
+      // parses fine, so the error body itself was treated as changed data
+      // and fired onTrigger, while the consecutive-failure counter (and
+      // therefore the circuit-breaker) never saw it. Routing !res.ok into
+      // the same catch block below reuses the existing failure/teardown
+      // logic instead of duplicating it.
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const current = this._pollers.get(workflowId);
       if (!current) return; // unregistered during await
@@ -204,11 +212,23 @@ export class TriggerManager {
     }
   }
 
-  /** List all registered triggers */
+  /**
+   * List all registered triggers. For a `poll` trigger, includes
+   * `pollerStatus` ('active' | 'error') so a circuit-broken poller (see
+   * `_pollOnce`) is observable here too — previously only `_pollerErrors`
+   * (private) recorded that state, so a poller could die from repeated
+   * fetch failures while `list()` kept showing it as an ordinary,
+   * apparently-still-running registration.
+   */
   list() {
-    return Array.from(this._registered.entries()).map(([id, trigger]) => ({
-      workflowId: id,
-      ...trigger,
-    }));
+    return Array.from(this._registered.entries()).map(([id, trigger]) => {
+      const row = { workflowId: id, ...trigger };
+      if (trigger.type === TriggerType.POLL) {
+        const errState = this._pollerErrors.get(id);
+        row.pollerStatus = errState ? 'error' : 'active';
+        if (errState) row.pollerError = errState;
+      }
+      return row;
+    });
   }
 }
