@@ -340,6 +340,27 @@ them into the response — only the 429-blocked path (built inline)
 carried real ones. Measured live: `/api/public/ping`'s `Remaining` steps
 4,3,2,1,0 then a real 429 with `Retry-After` on the 6th request.
 
+`examples/trigger-hub/` — `core/triggers.js`'s `TriggerManager`, front and
+center: all 4 trigger types (manual, webhook, cron, poll) feeding one
+unified `onTrigger` callback. No CMS, no `WorkflowEngine` — same à la
+carte spirit as `examples/doc-store-analytics`. Run with
+`bun examples/trigger-hub/setup.js`; regression test in
+`tests/examples-trigger-hub.test.js` (real `Bun.serve()`, real 1s poll
+interval — poll behavior is fundamentally about real elapsed time, not
+something a pure-dispatch test can fake). Found and fixed 2 real bugs in
+`core/triggers.js`: `list()` never surfaced a poll trigger's
+circuit-breaker error state (only a **private** `_pollerErrors` map
+recorded it — confirmed by the module's own unit tests reaching into it
+directly), so a dead poller kept showing as an ordinary, still-running
+registration; and `_pollOnce` never checked `res.ok`, so an HTTP error
+(503) with a valid JSON body was silently treated as **changed data**,
+firing the trigger with the error body as its payload and **resetting**
+the failure counter instead of tripping the breaker. Verified live
+before/after both fixes over a real HTTP round trip. Also documents a
+hard, verified-live constraint: poll triggers can't target `localhost` at
+all — `register()` calls net-guard's `assertPublicUrl` with no opt-out
+(unlike `connector.js`'s `blockInternalHosts`).
+
 ### Combined examples
 
 `examples/resilient-notify/` — every example above demonstrates ONE
@@ -707,6 +728,19 @@ protocol would get a real side effect instead of a preview. Fixed by mirroring t
 `--dry-run` branch: `--confirm` now returns a preview (`mode: "confirm"`,
 `requiresConfirmation: true`) without running the handler; re-issuing the same command without
 `--confirm` executes it for real — verified end-to-end through the real `shell-mcp` MCP server.
+
+**`core/triggers.js` (2026-07, found while building `examples/trigger-hub`):** 2 real bugs, both
+fixed with regression tests. `list()` never surfaced a poll trigger's circuit-breaker error
+state — only a **private** `_pollerErrors` map recorded it (confirmed by the module's own unit
+tests reaching into it directly), so a dead poller kept showing as an ordinary, still-running
+registration; `list()` now merges in `pollerStatus`/`pollerError` for poll rows. `_pollOnce`
+never checked `res.ok` — an HTTP error (503) with a valid JSON body parsed fine and fell into
+the "success" path, firing the trigger with the error body as its payload and **resetting** the
+consecutive-failure counter instead of incrementing it, so the circuit-breaker never tripped on
+real HTTP errors, only network-level failures. Both verified live over a real HTTP round trip,
+before and after. Also documented (not a bug): `register()` calls net-guard's `assertPublicUrl`
+unconditionally for poll triggers, no opt-out unlike `connector.js`'s `blockInternalHosts` — a
+poll trigger cannot target `localhost` at all, confirmed live.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

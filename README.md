@@ -40,7 +40,7 @@ No `npm install`. Zero dependencies.
 | **workflow.js** | Workflow engine: n8n-style nodes, triggers, credentials, execution history, DAG-parallel execution |
 | **dag.js** | Shared DAG level-scheduling (Kahn's algorithm), used by both `workflow.js` and `a2e.js` |
 | **nodes.js** | Node registry: 20 built-in nodes (core, communication, data, AI) + ARDF export |
-| **triggers.js** | Trigger system: manual, webhook, cron, polling with change detection |
+| **triggers.js** | Trigger system: manual, webhook, cron, polling with change detection (see [`examples/trigger-hub`](examples/trigger-hub/)) |
 | **credentials.js** | Credential vault: AES-256-GCM encrypted API keys and tokens |
 | **shell.js** | Agent shell: command gateway, parser, pipeline, JQ filter, RBAC |
 | **shell-mcp.js** | Exposes `shell.js` over MCP as exactly 2 fixed tools (`shell_help`/`shell_exec`), ~600 constant tokens regardless of registry size — port of [Agent-Shell](https://github.com/MauricioPerera/Agent-Shell)'s `McpServer` |
@@ -309,6 +309,24 @@ carried real ones. Measured live: `/api/public/ping`'s `Remaining` steps
 4,3,2,1,0 then a real 429 with `Retry-After` on the 6th request. Run with
 `bun examples/api-gateway/setup.js`.
 
+**[`examples/trigger-hub/`](examples/trigger-hub/)** — `core/triggers.js`'s
+`TriggerManager`, front and center: all 4 trigger types (manual, webhook,
+cron, poll) feeding one unified `onTrigger` callback, no CMS/`WorkflowEngine`
+needed. Found and fixed 2 real bugs in `core/triggers.js`: `list()` never
+surfaced a poll trigger's circuit-breaker error state (only a **private**
+`_pollerErrors` map recorded it — confirmed by the module's own unit tests
+reaching into it directly), so a dead poller kept showing as an ordinary,
+still-running registration; and `_pollOnce` never checked `res.ok`, so an
+HTTP error (503) with a valid JSON body was silently treated as *changed
+data* — firing the trigger with the error body as its payload and
+**resetting** the failure counter instead of tripping the breaker.
+Verified live over a real HTTP round trip, real 1s poll interval, before
+and after both fixes. Also documents a hard, verified-live constraint:
+poll triggers can't target `localhost` at all — `register()` calls
+net-guard's `assertPublicUrl` with **no opt-out** (unlike
+`connector.js`'s `blockInternalHosts`). Run with
+`bun examples/trigger-hub/setup.js`.
+
 ### Combined examples
 
 Every example above demonstrates ONE module. This one composes three of
@@ -331,10 +349,10 @@ just the one whose result the job returns. Run with
 ## Testing
 
 ```bash
-bun test tests/    # 788 tests across 41 files, ~10 seconds
+bun test tests/    # 797 tests across 42 files, ~11 seconds
 ```
 
-41 test files covering all core modules plus the `examples/content-pipeline`,
+42 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -342,7 +360,7 @@ bun test tests/    # 788 tests across 41 files, ~10 seconds
 `examples/a2e-pipeline`, `examples/content-formats`,
 `examples/doc-store-analytics`, `examples/api-validation`,
 `examples/mcp-cms`, `examples/api-gateway`, `examples/resilient-notify`,
-and `examples/shell-mcp`
+`examples/shell-mcp`, and `examples/trigger-hub`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -376,6 +394,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`parallel.js` confirmed while building `examples/resilient-notify`)**: not a bug — `parallel.js`'s own doc comments already say JS cannot truly cancel an in-flight promise — but a real, easy-to-miss consequence confirmed live: `parallelRace` doesn't stop the "losing" tasks, so for anything with a side effect (an HTTP POST to a notification channel, not a read-only lookup), a losing task that finishes in time still fully executes — two channels with similar latency can **both** deliver the same message, not just the one whose result the caller sees. Fine for redundant alerting; worth knowing before reusing the pattern for anything where a duplicate side effect (e.g. a charge) would matter.
 - **2026-07 (`examples/scheduled-sync` flaky-test root cause)**: not a bug in `core/cms.js` — `EntryService.findAll()` defaulting to `createdAt` DESCENDING when no sort is specified is documented behavior — but a real ordering bug in the example's own `runSync()`: it called `findAll()` with no explicit sort, then re-sorted client-side by `updatedAt` ascending. That re-sort was a silent no-op whenever `updatedAt` ties between entries created in the same millisecond (~85% of the time at in-memory speed), leaving `findAll()`'s descending order in place uncorrected. Reproduced live end-to-end (~10% of runs synced entries out of order); fixed by requesting `sortBy`/`sortOrder` directly from `findAll()` instead of re-sorting after the fact.
 - **2026-07 (`shell.js` found while building `examples/shell-mcp`)**: `--confirm` was advertised by `help()` (and `shell_exec`'s own MCP tool description) as "Preview before execute," but the flag was parsed into `cmd.flags.confirm` and never checked anywhere in `_execSingle` — a command carrying `--confirm` executed for real, immediately, identical to not passing it. Verified live: deleting a record "with confirm" deleted it for real. For a destructive command this meant an agent (or a human) trusting the shell's own documented protocol would get a real side effect instead of a preview. Fixed by mirroring the existing `--dry-run` branch: `--confirm` now returns a preview (`mode: "confirm"`, `requiresConfirmation: true`) without running the handler; re-issuing the same command without `--confirm` executes it for real.
+- **2026-07 (`triggers.js` found while building `examples/trigger-hub`)**: 2 real bugs, both fixed with regression tests. `list()` never surfaced a poll trigger's circuit-breaker error state — only a **private** `_pollerErrors` map recorded it (confirmed by the module's own unit tests reaching into it directly), so a dead poller kept showing as an ordinary, still-running registration; `list()` now merges in `pollerStatus`/`pollerError` for poll rows. `_pollOnce` never checked `res.ok` — an HTTP error (503) with a valid JSON body parsed fine and fell into the "success" path, firing the trigger with the error body as its payload and **resetting** the consecutive-failure counter instead of incrementing it, so the circuit-breaker never tripped on real HTTP errors, only network-level failures. Both verified live over a real HTTP round trip, before and after. Also documented (not a bug): `register()` calls net-guard's `assertPublicUrl` unconditionally for poll triggers, no opt-out unlike `connector.js`'s `blockInternalHosts` — a poll trigger cannot target `localhost` at all, confirmed live.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
