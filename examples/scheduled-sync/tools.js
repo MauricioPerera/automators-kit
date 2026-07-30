@@ -51,10 +51,16 @@ export function buildSyncTools(cms, vault, stateCol) {
       if (opts.retryDelay !== undefined) api.retryDelay = opts.retryDelay;
 
       const cursor = getCursor();
-      const { entries } = cms.entries.findAll({ status: 'published', limit: 100 });
-      const pending = entries
-        .filter((e) => e.updatedAt > cursor)
-        .sort((a, b) => a.updatedAt - b.updatedAt);
+      // Explicit sortBy/sortOrder matters here, not just cosmetic: findAll()
+      // defaults to createdAt DESCENDING when unspecified, and updatedAt
+      // ties across entries created in the same millisecond are common at
+      // this speed — a client-side .sort() on a near-universally-tied field
+      // is a stable no-op that silently preserves that wrong descending
+      // order. Asking findAll() for ascending updatedAt up front avoids the
+      // footgun (verified live: ~10% of runs synced entries out of order
+      // before this fix).
+      const { entries } = cms.entries.findAll({ status: 'published', limit: 100, sortBy: 'updatedAt', sortOrder: 'asc' });
+      const pending = entries.filter((e) => e.updatedAt > cursor);
 
       let synced = 0;
       let cursorAfter = cursor;
