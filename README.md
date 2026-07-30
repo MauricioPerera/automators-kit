@@ -230,7 +230,12 @@ added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
 `duration_ms > 0` on an operation that can legitimately finish in under
-0.5ms (rounds to exactly 0), now asserts the type/shape instead.
+0.5ms (rounds to exactly 0), now asserts the type/shape instead; and
+`vector.test.js`'s `QuantizedStore` test used to assert the quantized
+top-1 result always exactly matches the float32 top-1 — INT8 quantization
+is lossy by design, so that held only 498/500 over random trials. Now
+asserts the real guarantee (float32's top-1 shows up within the quantized
+top-3, which held 500/500).
 
 ## Multi-runtime
 
