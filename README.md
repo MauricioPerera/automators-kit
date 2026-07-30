@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-755 tests | 0 deps | 23 modules | Bun + Deno + Node.js
+763 tests | 0 deps | 23 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -253,20 +253,34 @@ indexed lookup is ~21x faster than the same query before
 `createIndex()` (1.334ms → 0.062ms on an 8000-product seed). Run with
 `bun examples/doc-store-analytics/setup.js`.
 
+**[`examples/api-validation/`](examples/api-validation/)** —
+`core/validate.js` standalone, no CMS: a signup API using
+`validateBody`/`validateQuery` middleware, with required/type/min-max,
+`format` validators, a `pattern` RegExp, `enum`, nested `object`
+properties, typed `array` items, defaults, `opts.partial`, and a
+cross-field `$refine` rule. Found and fixed a real gotcha: `validate()`
+applies a schema's **function** defaults (like
+`createdAt: () => new Date().toISOString()`) on every call —
+`opts.partial` included — for any field missing from the input. A naive
+partial-update handler that merged the whole validated result back onto
+the existing record silently regenerated `createdAt` on every update,
+even when the caller never mentioned it; verified live before and after
+the fix. Run with `bun examples/api-validation/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 755 tests across 36 files, ~10 seconds
+bun test tests/    # 763 tests across 37 files, ~10 seconds
 ```
 
-36 test files covering all core modules plus the `examples/content-pipeline`,
+37 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
 `examples/job-queue`, `examples/plugin-system`, `examples/workflow-engine`,
-`examples/a2e-pipeline`, `examples/content-formats`, and
-`examples/doc-store-analytics` end-to-end scenarios
-(includes the regression tests added by the 2026-07 security audit
+`examples/a2e-pipeline`, `examples/content-formats`,
+`examples/doc-store-analytics`, and `examples/api-validation` end-to-end
+scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
 `duration_ms > 0` on an operation that can legitimately finish in under
@@ -294,6 +308,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`shell.js` line-by-line audit)**: a manual read of the whole command-gateway module (parser, RBAC, batch/pipeline execution) found 2 real correctness bugs, both fixed with regression tests: `batch [...]` used `Promise.all` directly over each command, so one handler *throwing* (vs returning a normal error) silently discarded every sibling command's already-succeeded result instead of isolating the failure; and the `' | '`/`' >> '`/`','` split points used plain `indexOf`/`split` with **no** quote-awareness (despite one of them claiming otherwise in its own comment) — a quoted argument containing the literal delimiter (e.g. `--template "a | b"`) was silently mis-parsed into a broken command plus a garbage filter, succeeding with corrupted/`undefined` output instead of erroring.
 - **2026-07 (`a2e.js` found while building `examples/a2e-pipeline`)**: 2 real correctness bugs in `WorkflowExecutor`, both fixed with regression tests: `Loop` with sub-operations threw a `ReferenceError` on its very first item (a `depth` variable referenced outside its own scope — zero prior test coverage caught it); and `Conditional` always executed **both** branches, with the taken one running **twice** (`execute()`'s DAG-level loop blanket-dispatched every declared operation regardless of which branch was chosen, in addition to `Conditional`'s own dynamic dispatch of the taken one). For any branch with a real side effect (an API call, a payment) this meant unintended executions, not just a cosmetic mismatch.
 - **2026-07 (`portable-text.js` verified while building `examples/content-formats`)**: no bug found, but confirmed *live* rather than assumed — the 2026-07 audit's stored-XSS fix in `core/portable-text.js`'s built-in HTML renderers is still intact (a `<script>` tag typed as plain text renders as `&lt;script&gt;`). Also documented a real API contract clarification: `toHTML`'s `customRenderers` escape hatch does **not** auto-escape — an intentionally unsafe custom renderer let a `<script>` tag straight through in testing, confirming that escaping a custom renderer's own interpolated values is the implementer's responsibility, the same way it already is inside `core/portable-text.js` itself.
+- **2026-07 (`validate.js` found while building `examples/api-validation`)**: not a bug in `core/validate.js` — it does what it's documented to do — but a real footgun confirmed live: `validate()` applies a schema's **function** defaults (e.g. `createdAt: () => new Date().toISOString()`) on every call, `opts.partial: true` included, for any field missing from the input. A naive partial-update handler that merges the whole validated result back onto an existing record silently regenerates such fields on every update the caller never mentioned them in. This example's own `PATCH` handler applies only the keys present in the caller's request body for exactly that reason.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:

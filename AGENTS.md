@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 755 tests | 0 deps | 23 core modules
+By automators.work | 763 tests | 0 deps | 23 core modules
 
 ## Architecture
 
@@ -267,6 +267,21 @@ details), and export/import backup. Run with
 `Bun.serve()` needed). Measured live: an indexed `find({sku})` lookup is
 ~21x faster than the same query before `createIndex('sku', {unique:true})`
 (1.334ms → 0.062ms on an 8000-product seed).
+
+`examples/api-validation/` — `core/validate.js` standalone, no CMS: a
+signup API using `validateBody`/`validateQuery` middleware, covering
+required/type/min-max, `format` validators, a `pattern` RegExp, `enum`,
+nested `object.properties`, typed `array` `items`, static/function
+`default`s, `opts.partial`, and a cross-field `$refine` rule. Run with
+`bun examples/api-validation/setup.js`; regression test in
+`tests/examples-api-validation.test.js` (pure in-process, `Router.handle`
+directly). Found and fixed a real gotcha: `validate()` applies a schema's
+**function** defaults (e.g. `createdAt: () => new Date().toISOString()`)
+on every call, `opts.partial` included, for any field missing from the
+input — a naive `PATCH` handler merging the whole validated result back
+onto the existing record silently regenerated `createdAt` on every
+partial update, verified live before and after the fix (only applying
+the keys present in the caller's own request body).
 
 ## MCP Server
 
@@ -576,6 +591,13 @@ built-in HTML renderers is still intact (`<script>` typed as plain text renders 
 escape hatch does **not** auto-escape — an intentionally unsafe custom renderer let a `<script>`
 tag through raw in testing, confirming that escaping a custom renderer's own interpolated values is
 the implementer's own responsibility, same as inside `core/portable-text.js` itself.
+
+**`core/validate.js` (2026-07, found while building `examples/api-validation`):** not a bug — it does
+what it's documented to do — but a real footgun confirmed live: `validate()` applies a schema's
+**function** defaults (e.g. `createdAt: () => new Date().toISOString()`) on every call,
+`opts.partial: true` included, for any field missing from the input. A naive partial-update handler
+that merges the whole validated result back onto an existing record silently regenerates such fields
+on every update the caller never mentioned them in.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
