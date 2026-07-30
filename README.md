@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-746 tests | 0 deps | 23 modules | Bun + Deno + Node.js
+755 tests | 0 deps | 23 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -241,18 +241,31 @@ confirmed: a custom block only renders where you gave it a renderer —
 `toMarkdown`/`toPlainText` have no equivalent hook and silently drop it.
 Run with `bun examples/content-formats/setup.js`.
 
+**[`examples/doc-store-analytics/`](examples/doc-store-analytics/)** —
+"you don't need the whole CMS to get a document database + HTTP API."
+Unlike every other example, this one never calls `createApp()`: it wires
+`core/db.js`'s `DocStore` directly to `core/http.js`'s `Router` and
+`core/shell.js`'s `Shell` — 3 à la carte modules, zero CMS. An inventory
+service demonstrating real MongoDB-style operators, `$group` aggregation,
+`$lookup` (a real join — top sellers joined to product details, not
+manual post-processing), and export/import backup. Measured live: an
+indexed lookup is ~21x faster than the same query before
+`createIndex()` (1.334ms → 0.062ms on an 8000-product seed). Run with
+`bun examples/doc-store-analytics/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 746 tests across 35 files, ~10 seconds
+bun test tests/    # 755 tests across 36 files, ~10 seconds
 ```
 
-35 test files covering all core modules plus the `examples/content-pipeline`,
+36 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
 `examples/job-queue`, `examples/plugin-system`, `examples/workflow-engine`,
-`examples/a2e-pipeline`, and `examples/content-formats` end-to-end scenarios
+`examples/a2e-pipeline`, `examples/content-formats`, and
+`examples/doc-store-analytics` end-to-end scenarios
 (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert

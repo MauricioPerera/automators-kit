@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 746 tests | 0 deps | 23 core modules
+By automators.work | 755 tests | 0 deps | 23 core modules
 
 ## Architecture
 
@@ -253,6 +253,20 @@ text renders as `&lt;script&gt;`); and `customRenderers` itself does
 own interpolated values is the implementer's own responsibility. Also
 confirmed a custom block only renders where you gave it a renderer:
 `toMarkdown`/`toPlainText` have no equivalent hook and silently drop it.
+
+`examples/doc-store-analytics/` — "you don't need the whole CMS to get a
+document database + HTTP API." Unlike every other example, this one never
+calls `createApp()`: `core/db.js`'s `DocStore` wired directly to
+`core/http.js`'s `Router` and `core/shell.js`'s `Shell` — 3 à la carte
+modules, zero CMS/content-types/auth. An inventory + orders analytics
+service demonstrating real MongoDB-style operators, `$group` aggregation
+(category report), `$lookup` (a real join — top sellers joined to product
+details), and export/import backup. Run with
+`bun examples/doc-store-analytics/setup.js`; regression test in
+`tests/examples-doc-store-analytics.test.js` (pure in-process, no real
+`Bun.serve()` needed). Measured live: an indexed `find({sku})` lookup is
+~21x faster than the same query before `createIndex('sku', {unique:true})`
+(1.334ms → 0.062ms on an 8000-product seed).
 
 ## MCP Server
 
