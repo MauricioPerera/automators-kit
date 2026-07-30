@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 777 tests | 0 deps | 23 core modules
+By automators.work | 781 tests | 0 deps | 23 core modules
 
 ## Architecture
 
@@ -311,6 +311,23 @@ directly). Found and fixed a real bug: `rateLimit()` computed
 them into the response — only the 429-blocked path (built inline)
 carried real ones. Measured live: `/api/public/ping`'s `Remaining` steps
 4,3,2,1,0 then a real 429 with `Retry-After` on the 6th request.
+
+### Combined examples
+
+`examples/resilient-notify/` — every example above demonstrates ONE
+module; this one composes 3 into a pattern none covers alone:
+`examples/job-queue` (background, retryable, dead letter) +
+`examples/provider-fanout` (`parallelRace` over all configured channels —
+reach *someone* fast, don't care which) + `examples/integrations`
+(vault-backed `Connector`s per channel). Run with
+`bun examples/resilient-notify/setup.js`; regression test in
+`tests/examples-resilient-notify.test.js` (real `Bun.serve()`, `Connector`
+uses real `fetch()`). Verified live end-to-end: happy path, one channel
+down not slowing anything, and the full all-channels-down → dead letter →
+retry → recovery cycle. Documents an honest, verified-not-assumed
+gotcha: `parallelRace` doesn't cancel losing tasks — when two channels
+answer with similar latency, both actually deliver the message, not just
+the one whose result the job returns.
 
 ## MCP Server
 
@@ -635,6 +652,13 @@ nothing did the equivalent for rate-limit headers, so a successful request under
 none; only the 429-blocked path (built separately, inline) ever had real ones. Fixed by adding
 `_applyRateLimit()`, mirroring the exact `_applyCors` pattern, verified live before and after
 (including through a mounted sub-router).
+
+**`core/parallel.js` (2026-07, confirmed while building `examples/resilient-notify`):** not a bug —
+`parallel.js`'s own doc comments already say JS cannot truly cancel an in-flight promise — but a
+real, easy-to-miss consequence confirmed live: `parallelRace` doesn't stop the "losing" tasks, so
+for anything with a side effect (an HTTP POST to a notification channel, not a read-only lookup), a
+losing task that finishes in time still fully executes — two channels with similar latency can
+**both** deliver the same message, not just the one whose result the caller sees.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

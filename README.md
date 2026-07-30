@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-777 tests | 0 deps | 23 modules | Bun + Deno + Node.js
+781 tests | 0 deps | 23 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -292,21 +292,40 @@ carried real ones. Measured live: `/api/public/ping`'s `Remaining` steps
 4,3,2,1,0 then a real 429 with `Retry-After` on the 6th request. Run with
 `bun examples/api-gateway/setup.js`.
 
+### Combined examples
+
+Every example above demonstrates ONE module. This one composes three of
+them into a pattern none covers alone:
+
+**[`examples/resilient-notify/`](examples/resilient-notify/)** —
+`examples/job-queue` + `examples/provider-fanout` + `examples/integrations`:
+an alert job that runs in the background (non-blocking, retryable, dead
+letter on total failure) and races all configured channels
+(`parallelRace`) so it reaches *someone* fast without caring which
+channel got through, using vault-backed `Connector`s exactly like
+`integrations`. Verified live end-to-end: happy path, one channel down
+not slowing anything, and the full all-channels-down → dead letter →
+retry → recovery cycle. Documents an honest, verified-not-assumed
+gotcha: `parallelRace` doesn't cancel losing tasks, so when two channels
+answer with similar latency, **both** actually deliver the message — not
+just the one whose result the job returns. Run with
+`bun examples/resilient-notify/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 777 tests across 39 files, ~10 seconds
+bun test tests/    # 781 tests across 40 files, ~10 seconds
 ```
 
-39 test files covering all core modules plus the `examples/content-pipeline`,
+40 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
 `examples/job-queue`, `examples/plugin-system`, `examples/workflow-engine`,
 `examples/a2e-pipeline`, `examples/content-formats`,
 `examples/doc-store-analytics`, `examples/api-validation`,
-`examples/mcp-cms`, and `examples/api-gateway` end-to-end
-scenarios (includes the regression tests added by the 2026-07 security audit
+`examples/mcp-cms`, `examples/api-gateway`, and `examples/resilient-notify`
+end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
 `duration_ms > 0` on an operation that can legitimately finish in under
@@ -336,6 +355,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`portable-text.js` verified while building `examples/content-formats`)**: no bug found, but confirmed *live* rather than assumed — the 2026-07 audit's stored-XSS fix in `core/portable-text.js`'s built-in HTML renderers is still intact (a `<script>` tag typed as plain text renders as `&lt;script&gt;`). Also documented a real API contract clarification: `toHTML`'s `customRenderers` escape hatch does **not** auto-escape — an intentionally unsafe custom renderer let a `<script>` tag straight through in testing, confirming that escaping a custom renderer's own interpolated values is the implementer's responsibility, the same way it already is inside `core/portable-text.js` itself.
 - **2026-07 (`validate.js` found while building `examples/api-validation`)**: not a bug in `core/validate.js` — it does what it's documented to do — but a real footgun confirmed live: `validate()` applies a schema's **function** defaults (e.g. `createdAt: () => new Date().toISOString()`) on every call, `opts.partial: true` included, for any field missing from the input. A naive partial-update handler that merges the whole validated result back onto an existing record silently regenerates such fields on every update the caller never mentioned them in. This example's own `PATCH` handler applies only the keys present in the caller's request body for exactly that reason.
 - **2026-07 (`http.js` found while building `examples/api-gateway`)**: `rateLimit()` computed `X-RateLimit-Limit`/`X-RateLimit-Remaining`/`X-RateLimit-Reset` for an **allowed** request, but `Router`'s post-processing only ever merged CORS headers (`_applyCors`) into the final response — nothing did the equivalent for rate-limit headers, so a successful request under the limit carried none; only the 429-blocked path (built separately, inline) ever had real ones. Fixed by adding `_applyRateLimit()`, mirroring the exact `_applyCors` pattern, verified live before and after (including through a mounted sub-router).
+- **2026-07 (`parallel.js` confirmed while building `examples/resilient-notify`)**: not a bug — `parallel.js`'s own doc comments already say JS cannot truly cancel an in-flight promise — but a real, easy-to-miss consequence confirmed live: `parallelRace` doesn't stop the "losing" tasks, so for anything with a side effect (an HTTP POST to a notification channel, not a read-only lookup), a losing task that finishes in time still fully executes — two channels with similar latency can **both** deliver the same message, not just the one whose result the caller sees. Fine for redundant alerting; worth knowing before reusing the pattern for anything where a duplicate side effect (e.g. a charge) would matter.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
