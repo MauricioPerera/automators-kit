@@ -277,6 +277,19 @@ describe('Workflow Execution', () => {
     expect(history.length).toBe(2);
   });
 
+  it('run()/execute() return an execution with a real _id, reachable via getExecution()', async () => {
+    const wf = engine.create({
+      name: 'HasId',
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: 1 } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(typeof exec._id).toBe('string');
+    expect(exec._id.length).toBeGreaterThan(0);
+    const fetched = engine.getExecution(exec._id);
+    expect(fetched).not.toBeNull();
+    expect(fetched.workflowId).toBe(wf._id);
+  });
+
   it('multi-node pipeline with filter', async () => {
     const wf = engine.create({
       name: 'Pipeline',

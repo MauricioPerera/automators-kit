@@ -283,8 +283,15 @@ export class WorkflowEngine {
     execution.finishedAt = Date.now();
     execution.duration = execution.finishedAt - execution.startedAt;
 
-    // Store execution history
-    this._executions.insert(execution);
+    // Store execution history. insert() returns a CLONE with `_id`
+    // assigned — it does not mutate the object passed in. Previously this
+    // discarded that return value entirely, so callers got an execution
+    // object with no `_id` back from execute()/run(), even though the
+    // stored copy (reachable via getExecutions()) had a real one — making
+    // getExecution(execution._id) unreachable from the return value of a
+    // run you just triggered. Same pattern EntryService.create() already
+    // uses correctly in core/cms.js.
+    execution._id = this._executions.insert(execution)._id;
     this.db.flush();
 
     return execution;
