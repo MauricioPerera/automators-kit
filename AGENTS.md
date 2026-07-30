@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 769 tests | 0 deps | 23 core modules
+By automators.work | 777 tests | 0 deps | 23 core modules
 
 ## Architecture
 
@@ -298,6 +298,19 @@ end-to-end coverage). Verified against a real external MCP client
 confirmed `draft` status, called the custom tool, and correctly reported
 the word count/excerpt it returned — no guessed field names, no
 `search`/`describe` round-trip needed first (unlike `shell-mcp.js`).
+
+`examples/api-gateway/` — `core/http.js`'s `Router` as the star: global
+middleware (`cors`, `logger`), per-route-group rate limiting via mounted
+sub-routers (`/api/public` vs `/api/admin` get genuinely different
+limits — each `Router` instance has its own middleware stack), and a
+custom `keyFn` (rate limit by an API key header instead of client IP).
+Run with `bun examples/api-gateway/setup.js`; regression test in
+`tests/examples-api-gateway.test.js` (pure in-process, `Router.handle`
+directly). Found and fixed a real bug: `rateLimit()` computed
+`X-RateLimit-*` headers for an allowed request, but nothing ever merged
+them into the response — only the 429-blocked path (built inline)
+carried real ones. Measured live: `/api/public/ping`'s `Remaining` steps
+4,3,2,1,0 then a real 429 with `Retry-After` on the 6th request.
 
 ## MCP Server
 
@@ -614,6 +627,14 @@ what it's documented to do — but a real footgun confirmed live: `validate()` a
 `opts.partial: true` included, for any field missing from the input. A naive partial-update handler
 that merges the whole validated result back onto an existing record silently regenerates such fields
 on every update the caller never mentioned them in.
+
+**`core/http.js` (2026-07, found while building `examples/api-gateway`):** `rateLimit()` computed
+`X-RateLimit-Limit`/`X-RateLimit-Remaining`/`X-RateLimit-Reset` for an **allowed** request, but
+`Router`'s post-processing only ever merged CORS headers (`_applyCors`) into the final response —
+nothing did the equivalent for rate-limit headers, so a successful request under the limit carried
+none; only the 429-blocked path (built separately, inline) ever had real ones. Fixed by adding
+`_applyRateLimit()`, mirroring the exact `_applyCors` pattern, verified live before and after
+(including through a mounted sub-router).
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

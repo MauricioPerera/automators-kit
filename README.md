@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-769 tests | 0 deps | 23 modules | Bun + Deno + Node.js
+777 tests | 0 deps | 23 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -280,20 +280,32 @@ and correctly reported the word count and excerpt it returned — no
 guessed field names, no `search`/`describe` round-trip needed first
 (unlike `shell-mcp.js`). Run with `bun examples/mcp-cms/setup.js`.
 
+**[`examples/api-gateway/`](examples/api-gateway/)** — `core/http.js`'s
+`Router` as the star: global middleware (`cors`, `logger`), per-route-group
+rate limiting via mounted sub-routers (`/api/public` vs `/api/admin` get
+genuinely different limits — each `Router` instance has its own
+middleware stack), and a custom `keyFn` (rate limit by an API key header
+instead of client IP). Found and fixed a real bug: `rateLimit()` computed
+`X-RateLimit-*` headers for an **allowed** request, but nothing ever
+merged them into the response — only the 429-blocked path (built inline)
+carried real ones. Measured live: `/api/public/ping`'s `Remaining` steps
+4,3,2,1,0 then a real 429 with `Retry-After` on the 6th request. Run with
+`bun examples/api-gateway/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 769 tests across 38 files, ~10 seconds
+bun test tests/    # 777 tests across 39 files, ~10 seconds
 ```
 
-38 test files covering all core modules plus the `examples/content-pipeline`,
+39 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
 `examples/job-queue`, `examples/plugin-system`, `examples/workflow-engine`,
 `examples/a2e-pipeline`, `examples/content-formats`,
-`examples/doc-store-analytics`, `examples/api-validation`, and
-`examples/mcp-cms` end-to-end
+`examples/doc-store-analytics`, `examples/api-validation`,
+`examples/mcp-cms`, and `examples/api-gateway` end-to-end
 scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -323,6 +335,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`a2e.js` found while building `examples/a2e-pipeline`)**: 2 real correctness bugs in `WorkflowExecutor`, both fixed with regression tests: `Loop` with sub-operations threw a `ReferenceError` on its very first item (a `depth` variable referenced outside its own scope — zero prior test coverage caught it); and `Conditional` always executed **both** branches, with the taken one running **twice** (`execute()`'s DAG-level loop blanket-dispatched every declared operation regardless of which branch was chosen, in addition to `Conditional`'s own dynamic dispatch of the taken one). For any branch with a real side effect (an API call, a payment) this meant unintended executions, not just a cosmetic mismatch.
 - **2026-07 (`portable-text.js` verified while building `examples/content-formats`)**: no bug found, but confirmed *live* rather than assumed — the 2026-07 audit's stored-XSS fix in `core/portable-text.js`'s built-in HTML renderers is still intact (a `<script>` tag typed as plain text renders as `&lt;script&gt;`). Also documented a real API contract clarification: `toHTML`'s `customRenderers` escape hatch does **not** auto-escape — an intentionally unsafe custom renderer let a `<script>` tag straight through in testing, confirming that escaping a custom renderer's own interpolated values is the implementer's responsibility, the same way it already is inside `core/portable-text.js` itself.
 - **2026-07 (`validate.js` found while building `examples/api-validation`)**: not a bug in `core/validate.js` — it does what it's documented to do — but a real footgun confirmed live: `validate()` applies a schema's **function** defaults (e.g. `createdAt: () => new Date().toISOString()`) on every call, `opts.partial: true` included, for any field missing from the input. A naive partial-update handler that merges the whole validated result back onto an existing record silently regenerates such fields on every update the caller never mentioned them in. This example's own `PATCH` handler applies only the keys present in the caller's request body for exactly that reason.
+- **2026-07 (`http.js` found while building `examples/api-gateway`)**: `rateLimit()` computed `X-RateLimit-Limit`/`X-RateLimit-Remaining`/`X-RateLimit-Reset` for an **allowed** request, but `Router`'s post-processing only ever merged CORS headers (`_applyCors`) into the final response — nothing did the equivalent for rate-limit headers, so a successful request under the limit carried none; only the 429-blocked path (built separately, inline) ever had real ones. Fixed by adding `_applyRateLimit()`, mirroring the exact `_applyCors` pattern, verified live before and after (including through a mounted sub-router).
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
