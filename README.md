@@ -33,7 +33,7 @@ No `npm install`. Zero dependencies.
 | **http.js** | HTTP router: Web Standard Request/Response, middleware chain, params, sub-routers, CORS |
 | **validate.js** | Schema validation: types, formats, defaults (replaces Zod) |
 | **cms.js** | CMS: content types, entries, taxonomies, terms, users, roles, autosave |
-| **plugins.js** | Plugin system: hooks, capability-based access control, registry |
+| **plugins.js** | Plugin system: hooks, capability-based access control, registry (see [`examples/plugin-workflow-nodes`](examples/plugin-workflow-nodes/)) |
 | **portable-text.js** | Rich content: JSON blocks to HTML/Markdown/PlainText, fromMarkdown parser |
 | **mcp.js** | MCP server: JSON-RPC 2.0 over stdio, 20 tools for AI agents |
 | **a2e.js** | A2E executor: 19 declarative operations, DAG parallel execution, middleware |
@@ -360,13 +360,29 @@ captures it correctly. Verified live before/after: the same execution,
 fetched right after the fix by the id `run()` itself returned. Run with
 `bun examples/mcp-workflows/setup.js`.
 
+**[`examples/plugin-workflow-nodes/`](examples/plugin-workflow-nodes/)** —
+`examples/plugin-system` + `examples/workflow-engine`: a third-party
+plugin extending `core/workflow.js`'s `NodeRegistry` with a real new node
+type, capability-gated by `core/plugins.js` — something neither example
+demonstrates alone. Building it found a real gap: `createPluginAPI` had
+no way to reach the workflow engine's `NodeRegistry` at all, so a new
+`nodes:register` capability was added (gated exactly like the existing
+`database:write`, threaded through `loadPlugins()`/`createApp()`
+automatically). Designing it surfaced a real security gap:
+`NodeRegistry.add()` has no collision guard — verified live that it
+silently lets any caller overwrite `http.request`, including its
+net-guard SSRF check, for every workflow in the system. The new
+capability's wrapper rejects overwriting an existing node type; a second
+plugin in this example demonstrates the rejection live, not just in a
+unit test. Run with `bun examples/plugin-workflow-nodes/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 803 tests across 43 files, ~17 seconds
+bun test tests/    # 814 tests across 44 files, ~17 seconds
 ```
 
-43 test files covering all core modules plus the `examples/content-pipeline`,
+44 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -374,7 +390,8 @@ bun test tests/    # 803 tests across 43 files, ~17 seconds
 `examples/a2e-pipeline`, `examples/content-formats`,
 `examples/doc-store-analytics`, `examples/api-validation`,
 `examples/mcp-cms`, `examples/api-gateway`, `examples/resilient-notify`,
-`examples/shell-mcp`, `examples/trigger-hub`, and `examples/mcp-workflows`
+`examples/shell-mcp`, `examples/trigger-hub`, `examples/mcp-workflows`,
+and `examples/plugin-workflow-nodes`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -410,6 +427,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`shell.js` found while building `examples/shell-mcp`)**: `--confirm` was advertised by `help()` (and `shell_exec`'s own MCP tool description) as "Preview before execute," but the flag was parsed into `cmd.flags.confirm` and never checked anywhere in `_execSingle` — a command carrying `--confirm` executed for real, immediately, identical to not passing it. Verified live: deleting a record "with confirm" deleted it for real. For a destructive command this meant an agent (or a human) trusting the shell's own documented protocol would get a real side effect instead of a preview. Fixed by mirroring the existing `--dry-run` branch: `--confirm` now returns a preview (`mode: "confirm"`, `requiresConfirmation: true`) without running the handler; re-issuing the same command without `--confirm` executes it for real.
 - **2026-07 (`triggers.js` found while building `examples/trigger-hub`)**: 2 real bugs, both fixed with regression tests. `list()` never surfaced a poll trigger's circuit-breaker error state — only a **private** `_pollerErrors` map recorded it (confirmed by the module's own unit tests reaching into it directly), so a dead poller kept showing as an ordinary, still-running registration; `list()` now merges in `pollerStatus`/`pollerError` for poll rows. `_pollOnce` never checked `res.ok` — an HTTP error (503) with a valid JSON body parsed fine and fell into the "success" path, firing the trigger with the error body as its payload and **resetting** the consecutive-failure counter instead of incrementing it, so the circuit-breaker never tripped on real HTTP errors, only network-level failures. Both verified live over a real HTTP round trip, before and after. Also documented (not a bug): `register()` calls net-guard's `assertPublicUrl` unconditionally for poll triggers, no opt-out unlike `connector.js`'s `blockInternalHosts` — a poll trigger cannot target `localhost` at all, confirmed live.
 - **2026-07 (`workflow.js` found while building `examples/mcp-workflows`)**: `Collection.insert(doc)` clones the input and returns the clone with `_id` assigned — it does not mutate the object passed in. `WorkflowEngine.execute()` called `this._executions.insert(execution)` and discarded the return value, then returned the original `execution` local, which never got an `_id`. Any caller using `run()`'s return value to later fetch the same execution via `getExecution(id)` got `undefined` for the id — `getExecution()` only ever worked for executions already known through `getExecutions()`. `core/cms.js`'s `EntryService.create()` already captures `insert()`'s return value correctly; `workflow.js` just didn't follow its own codebase's existing pattern. Fixed with a 2-line change: capture `insert()`'s return value and assign `_id` onto `execution` before returning it. Verified live before/after through a real MCP server.
+- **2026-07 (`plugins.js` extended while building `examples/plugin-workflow-nodes`)**: not a bug — `createPluginAPI` had no way at all for a plugin to reach `workflow.js`'s `NodeRegistry`, a missing capability, not broken behavior. Added a new `nodes:register` capability (gated exactly like the existing `database:write`; threaded through `loadPlugins()`/`createApp()` automatically) with your explicit approval. Designing it surfaced a real security gap, verified live before adding a guard: `NodeRegistry.add()` itself silently lets **any** caller overwrite an existing node type — including `http.request`, replacing its net-guard SSRF check — for every workflow in the system, not just the caller's own. The new capability's `api.nodes.register()` wrapper rejects overwriting an existing type (built-in or registered by another plugin); a second plugin in the example demonstrates the rejection live.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:

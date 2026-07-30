@@ -400,6 +400,26 @@ in this example's own workflow definition (not core): the
 land a downstream node in a later DAG level, since `workflow.js` infers
 ordering only from literal `{{ref}}` occurrences in a node's inputs.
 
+`examples/plugin-workflow-nodes/` — `examples/plugin-system` +
+`examples/workflow-engine`: a third-party plugin extending
+`core/workflow.js`'s `NodeRegistry` with a real new node type,
+capability-gated by `core/plugins.js` — neither `plugin-system` (never
+touches workflows) nor `workflow-engine` (nodes are all built-in or
+wired by `setup.js`, never a plugin) demonstrates this. Found a real
+gap: `createPluginAPI` had no way to reach the workflow engine's
+`NodeRegistry` at all, so a new `nodes:register` capability was added
+(gated exactly like `database:write`, threaded through
+`loadPlugins()`/`createApp()` automatically). Designing it surfaced a
+real security gap: `NodeRegistry.add()` has no collision guard —
+verified live that it silently lets any caller overwrite `http.request`,
+including its net-guard SSRF check, for every workflow in the system.
+The new capability's wrapper rejects overwriting an existing node type;
+a second plugin in the example demonstrates the rejection live, not just
+in a unit test. Run with `bun examples/plugin-workflow-nodes/setup.js`;
+regression test in `tests/examples-plugin-workflow-nodes.test.js` (real
+`createApp()` + `loadPlugins()` boot path, real plugin files, not a
+hand-built API).
+
 ## MCP Server
 
 ```json
@@ -774,6 +794,17 @@ using `run()`'s return value to later fetch the same execution via `getExecution
 value correctly; `workflow.js` just didn't follow its own codebase's existing pattern. Fixed with
 a 2-line change: capture `insert()`'s return value and assign `_id` onto `execution` before
 returning it. Verified live before/after through a real MCP server.
+
+**`core/plugins.js` (2026-07, extended while building `examples/plugin-workflow-nodes`):** not a
+bug — `createPluginAPI` had no way at all for a plugin to reach `workflow.js`'s `NodeRegistry`, a
+missing capability, not broken behavior. Added a new `nodes:register` capability (gated exactly
+like the existing `database:write`; threaded through `loadPlugins()`/`createApp()`
+automatically) with explicit approval. Designing it surfaced a real security gap, verified live
+before adding a guard: `NodeRegistry.add()` itself silently lets any caller overwrite an existing
+node type — including `http.request`, replacing its net-guard SSRF check — for every workflow in
+the system, not just the caller's own. The new capability's `api.nodes.register()` wrapper
+rejects overwriting an existing type (built-in or registered by another plugin); a second plugin
+in the example demonstrates the rejection live.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
