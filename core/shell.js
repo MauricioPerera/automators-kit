@@ -583,6 +583,23 @@ Profiles: admin, operator, reader, restricted (current: ${this.profile})`;
       return this._ok({ mode: 'validate', command: id, valid: validation.valid, errors: validation.errors });
     }
 
+    // Confirm mode — preview only, same shape as dry-run: the caller must
+    // re-issue the command WITHOUT --confirm to actually run it. Previously
+    // this flag was parsed but never checked here, so a command carrying
+    // --confirm executed for real immediately despite help()'s own
+    // "Preview before execute" description — a real safety gap for any
+    // destructive command an agent guards with --confirm expecting a preview.
+    if (cmd.flags['confirm']) {
+      return this._ok({
+        mode: 'confirm',
+        command: id,
+        args: cmd.args,
+        wouldExecute: true,
+        requiresConfirmation: true,
+        definition: registered.definition,
+      });
+    }
+
     // Execute
     const result = await registered.handler(cmd.args, {
       context: this._context,

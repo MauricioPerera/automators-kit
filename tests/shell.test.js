@@ -243,6 +243,35 @@ describe('Shell exec', () => {
     expect(r.data.valid).toBe(false); // missing --id
   });
 
+  it('--confirm previews without executing the handler', async () => {
+    let ran = false;
+    shell.registry.register('users', 'delete', {
+      description: 'Delete a user',
+      params: [{ name: 'id', type: 'number', required: true }],
+    }, async (args) => { ran = true; return { deletedId: args.id }; });
+
+    const r = await shell.exec('users:delete --id 1 --confirm');
+    expect(r.code).toBe(0);
+    expect(r.data.mode).toBe('confirm');
+    expect(r.data.wouldExecute).toBe(true);
+    expect(r.data.requiresConfirmation).toBe(true);
+    expect(ran).toBe(false);
+  });
+
+  it('re-running the same command without --confirm actually executes it', async () => {
+    let ran = false;
+    shell.registry.register('users', 'delete', {
+      description: 'Delete a user',
+      params: [{ name: 'id', type: 'number', required: true }],
+    }, async (args) => { ran = true; return { deletedId: args.id }; });
+
+    await shell.exec('users:delete --id 1 --confirm');
+    const r = await shell.exec('users:delete --id 1');
+    expect(r.code).toBe(0);
+    expect(r.data).toEqual({ deletedId: 1 });
+    expect(ran).toBe(true);
+  });
+
   it('command not found', async () => {
     const r = await shell.exec('nonexistent:cmd');
     expect(r.code).toBe(2);
