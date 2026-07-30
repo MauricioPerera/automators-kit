@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-726 tests | 0 deps | 23 modules | Bun + Deno + Node.js
+739 tests | 0 deps | 23 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -214,18 +214,32 @@ visible (`continueOnError: true`) and adds a custom-handler node using the
 same credential to show the working alternative. Run with
 `bun examples/workflow-engine/setup.js`.
 
+**[`examples/a2e-pipeline/`](examples/a2e-pipeline/)** — `a2e.js`'s own
+distinctive shape: a declarative compact-JSON signup-batch pipeline using
+`Loop`, `Conditional`, `StoreData`, and both middleware classes
+(`AuditMiddleware`, `CacheMiddleware` — measured live: a repeated slow
+lookup goes from 154ms to 0.2ms on cache hit, ~770x). Building it found
+and fixed **2 real bugs in `core/a2e.js` itself**: `Loop` with
+sub-operations threw a `ReferenceError` on its very first item (a `depth`
+variable referenced outside its scope, zero prior test coverage), and
+`Conditional` always executed **both** branches — the taken one **twice**
+— because `execute()` blanket-dispatched every declared operation
+regardless of which branch was chosen. For anything with a real side
+effect (an API call, a payment) both fixes matter for correctness, not
+just cosmetics. Run with `bun examples/a2e-pipeline/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 726 tests across 33 files, ~10 seconds
+bun test tests/    # 739 tests across 34 files, ~11 seconds
 ```
 
-33 test files covering all core modules plus the `examples/content-pipeline`,
+34 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
-`examples/job-queue`, `examples/plugin-system`, and
-`examples/workflow-engine` end-to-end scenarios (includes the regression tests
+`examples/job-queue`, `examples/plugin-system`, `examples/workflow-engine`,
+and `examples/a2e-pipeline` end-to-end scenarios (includes the regression tests
 added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -252,6 +266,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07**: full-repo audit of all 21 core modules (4 parallel auditors) — 65 findings (7 critical, 13 high, 28 medium, 17 low), all fixed and verified against the real code with regression tests. Highlights: removed the `code.run` node (its "sandbox" was a bypassable keyword denylist over `new Function` — real RCE), added SSRF guards (`net-guard.js`) across HTTP nodes/triggers/a2e/connector, closed prototype-pollution paths (db.js, validate.js, shell.js, workflow.js), fixed stored XSS in `portable-text.js`, bounded the a2e DAG executor's recursion, gated plugin capability bypasses, replaced predictable default secrets (CMS JWT, workflow vault key, credential-vault PBKDF2 salt) with per-instance random values, and fixed assorted correctness/DoS bugs (HNSW memory leak, broken cache middleware, cron reentrancy, `parallelRace([])` hang, non-atomic writes). Full reports and per-fix specs in [`specs/`](specs/).
 - **2026-07 (follow-up)**: building [`examples/content-pipeline/`](examples/content-pipeline/) as a real end-to-end exercise surfaced 2 more gaps the audit's unit tests didn't catch, both fixed: the webhook secret from FIX-10 was enforced in `core/triggers.js` but never wired through `routes/workflows.js`/`WorkflowEngine.webhookTrigger`, so no webhook could actually authenticate over real HTTP; and `core/shell.js` exported `AGENT_PROFILES` but never consulted it — `new Shell({ profile: 'restricted' })` alone enforced nothing unless the caller *also* passed `permissions` explicitly. `permissions` now derives from `profile` when omitted, failing closed to `restricted` for unrecognized profiles.
 - **2026-07 (`shell.js` line-by-line audit)**: a manual read of the whole command-gateway module (parser, RBAC, batch/pipeline execution) found 2 real correctness bugs, both fixed with regression tests: `batch [...]` used `Promise.all` directly over each command, so one handler *throwing* (vs returning a normal error) silently discarded every sibling command's already-succeeded result instead of isolating the failure; and the `' | '`/`' >> '`/`','` split points used plain `indexOf`/`split` with **no** quote-awareness (despite one of them claiming otherwise in its own comment) — a quoted argument containing the literal delimiter (e.g. `--template "a | b"`) was silently mis-parsed into a broken command plus a garbage filter, succeeding with corrupted/`undefined` output instead of erroring.
+- **2026-07 (`a2e.js` found while building `examples/a2e-pipeline`)**: 2 real correctness bugs in `WorkflowExecutor`, both fixed with regression tests: `Loop` with sub-operations threw a `ReferenceError` on its very first item (a `depth` variable referenced outside its own scope — zero prior test coverage caught it); and `Conditional` always executed **both** branches, with the taken one running **twice** (`execute()`'s DAG-level loop blanket-dispatched every declared operation regardless of which branch was chosen, in addition to `Conditional`'s own dynamic dispatch of the taken one). For any branch with a real side effect (an API call, a payment) this meant unintended executions, not just a cosmetic mismatch.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:

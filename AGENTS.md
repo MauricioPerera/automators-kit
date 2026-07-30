@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 726 tests | 0 deps | 23 core modules
+By automators.work | 739 tests | 0 deps | 23 core modules
 
 ## Architecture
 
@@ -212,6 +212,31 @@ around it, the demo keeps `email.send` failing as designed
 (`continueOnError: true`) and adds a custom-handler node
 (`notify.email`) using the same vault credential to show the working,
 offline-safe alternative.
+
+`examples/a2e-pipeline/` — `a2e.js`'s own distinctive shape: a declarative
+compact-JSON signup-batch pipeline using `Loop`, `Conditional`,
+`StoreData`, and both middleware classes (`AuditMiddleware`,
+`CacheMiddleware`). Verified live: a repeated slow lookup (150ms
+simulated) drops to 0.2ms on the second run via `CacheMiddleware`
+(~770x). Run with `bun examples/a2e-pipeline/setup.js`; regression test
+in `tests/examples-a2e-pipeline.test.js` (pure in-process). Found and
+fixed **2 real bugs in `core/a2e.js` itself**, not example-specific:
+`Loop` with sub-operations threw `ReferenceError: depth is not defined`
+on its very first item (a `depth` variable referenced outside its own
+scope — zero prior test coverage); and `Conditional` always executed
+**both** branches, with the taken one running **twice**
+(`execute()`'s DAG-level loop blanket-dispatched every declared
+operation regardless of which branch was chosen, on top of
+`Conditional`'s own dynamic dispatch of the taken one) — fixed via a new
+`conditionalBranchTargets()` helper that excludes branch-target ids from
+blanket dispatch, with a self-referencing-branch edge case (the existing
+recursion-depth-guard test) explicitly preserved. Also confirmed (not
+fixed, documented as a related, out-of-scope finding): `Loop` sub-op ids
+are similarly blanket-dispatched standalone at the top level (same shape
+of bug, but `buildDAG` has no edge-modeling for `Loop.config.operations`
+the way it does for `Conditional` branches), and the workflow
+definition's `execute` field is a no-op — every declared operation always
+runs regardless of it.
 
 ## MCP Server
 
@@ -504,6 +529,15 @@ already-succeeded result instead of isolating the failure; and the `' | '`/`' >>
 points used plain `indexOf`/`split` with no quote-awareness — a quoted argument containing the
 literal delimiter (e.g. `--template "a | b"`) was silently mis-parsed into a broken command plus
 a garbage filter, succeeding with corrupted/`undefined` output instead of erroring.
+
+**`core/a2e.js` (2026-07, found while building `examples/a2e-pipeline`):** 2 real correctness bugs
+in `WorkflowExecutor`, both fixed with regression tests: `Loop` with sub-operations threw a
+`ReferenceError` on its very first item (a `depth` variable referenced outside its own scope —
+zero prior test coverage caught it); and `Conditional` always executed **both** branches, with the
+taken one running **twice** (`execute()`'s DAG-level loop blanket-dispatched every declared
+operation regardless of which branch was chosen, on top of `Conditional`'s own dynamic dispatch of
+the taken one). For a branch with a real side effect (an API call, a payment) this meant unintended
+executions, not a cosmetic mismatch.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
