@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 763 tests | 0 deps | 23 core modules
+By automators.work | 769 tests | 0 deps | 23 core modules
 
 ## Architecture
 
@@ -282,6 +282,22 @@ input — a naive `PATCH` handler merging the whole validated result back
 onto the existing record silently regenerated `createdAt` on every
 partial update, verified live before and after the fix (only applying
 the keys present in the caller's own request body).
+
+`examples/mcp-cms/` — the CMS's own MCP server (`core/mcp.js`), front and
+center: 20 base tools, one per capability, each with a real JSON schema
+seen up front via `tools/list` — the complementary pattern to
+`core/shell-mcp.js`'s 2-tool gateway (see "Similar-sounding modules"
+above). Plus 1 custom tool (`publish_with_stats`, composing `mcp.js` +
+`portable-text.js` in one call) via `buildAllTools`'s `extraTools`. Run
+with `bun examples/mcp-cms/setup.js`; regression test in
+`tests/examples-mcp-cms.test.js` (drives a REAL `createApp()` cms through
+the pure `handleMCPRequest` dispatcher — `tests/mcp.test.js` uses a fake
+cms with spies to test the dispatcher in isolation, this is genuine
+end-to-end coverage). Verified against a real external MCP client
+(poolside.ai's `pool exec`): given only the schemas, it created an entry,
+confirmed `draft` status, called the custom tool, and correctly reported
+the word count/excerpt it returned — no guessed field names, no
+`search`/`describe` round-trip needed first (unlike `shell-mcp.js`).
 
 ## MCP Server
 

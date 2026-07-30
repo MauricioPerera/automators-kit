@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-763 tests | 0 deps | 23 modules | Bun + Deno + Node.js
+769 tests | 0 deps | 23 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -267,19 +267,33 @@ the existing record silently regenerated `createdAt` on every update,
 even when the caller never mentioned it; verified live before and after
 the fix. Run with `bun examples/api-validation/setup.js`.
 
+**[`examples/mcp-cms/`](examples/mcp-cms/)** — the CMS's own MCP server
+(`core/mcp.js`), front and center: 20 base tools, one per capability,
+each with a real JSON schema seen up front via `tools/list` — the
+complementary pattern to [`core/shell-mcp.js`](core/shell-mcp.js)'s
+2-tool gateway (see the module comparison note above). Plus 1 custom tool
+(`publish_with_stats`, composing `mcp.js` + `portable-text.js` in one
+call) via `buildAllTools`'s `extraTools`. Verified against a real
+external MCP client (poolside.ai's `pool exec`): given only the schemas,
+it created an entry, confirmed `draft` status, called the custom tool,
+and correctly reported the word count and excerpt it returned — no
+guessed field names, no `search`/`describe` round-trip needed first
+(unlike `shell-mcp.js`). Run with `bun examples/mcp-cms/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 763 tests across 37 files, ~10 seconds
+bun test tests/    # 769 tests across 38 files, ~10 seconds
 ```
 
-37 test files covering all core modules plus the `examples/content-pipeline`,
+38 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
 `examples/job-queue`, `examples/plugin-system`, `examples/workflow-engine`,
 `examples/a2e-pipeline`, `examples/content-formats`,
-`examples/doc-store-analytics`, and `examples/api-validation` end-to-end
+`examples/doc-store-analytics`, `examples/api-validation`, and
+`examples/mcp-cms` end-to-end
 scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert

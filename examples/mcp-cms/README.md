@@ -1,8 +1,9 @@
 # MCP CMS
 
 The CMS's own MCP server (`core/mcp.js`) — the complementary pattern to
-[`examples/shell-mcp`](../shell-mcp/)'s 2-tool gateway (see that repo's
-main README for the head-to-head comparison). Here it's 20 base tools,
+[`core/shell-mcp.js`](../../core/shell-mcp.js)'s 2-tool gateway (see the
+root README's "Picking between similar-sounding modules" note for the
+head-to-head comparison). Here it's 20 base tools,
 one per capability (`create_entry`, `publish_entry`, `list_users`, ...),
 each with a real JSON schema the client sees up front via `tools/list` —
 no runtime discovery needed. Plus 1 custom tool
