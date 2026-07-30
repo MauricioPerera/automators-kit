@@ -438,6 +438,27 @@ sample. No core changes — entirely example-scoped. Run with
 `bun examples/hybrid-recall/setup.js`; regression test in
 `tests/examples-hybrid-recall.test.js`.
 
+`examples/poll-to-queue/` — `examples/trigger-hub` + `examples/job-queue`:
+a poll trigger watching an external feed, enqueueing one durable,
+independently retryable job per genuinely new item instead of one
+all-or-nothing event per poll cycle — a real production ingestion
+pattern neither example covers alone (`trigger-hub` only logs fired
+events; `job-queue` has no poll source). Found a real gotcha, no core
+changes needed — fixed entirely in the example's own bridge logic
+(`hub.js`): `TriggerManager`'s poll never fires `onTrigger` on its first
+cycle (that cycle only establishes the baseline hash), so without an
+explicit baseline fetch before the poll trigger starts, the first real
+fire would treat every pre-existing feed item as new and enqueue it —
+verified live, then fixed by seeding a `seenIds` set from an initial
+fetch first, same cursor philosophy as `examples/scheduled-sync` applied
+to inbound polling. Verified live end-to-end: baseline seeding, a new
+item becoming a processed job within one poll cycle, a persistently
+failing item reaching the dead letter isolated from others, and the poll
+circuit-breaker (the `triggers.js` fix from `trigger-hub`) tripping on 3
+real HTTP 503s with zero spurious enqueues. Run with
+`bun examples/poll-to-queue/setup.js`; regression test in
+`tests/examples-poll-to-queue.test.js`.
+
 ## MCP Server
 
 ```json
@@ -834,6 +855,16 @@ zero shared vocabulary, `vector.search()` never does — coverage, not intellige
 `lowConfidence` threshold (0.3) was also verified live to mislabel a clearly unrelated query as
 confident (score 0.429); corrected to 0.5 against a 10-query empirical sample and documented as
 approximate, not a statistical guarantee.
+
+**`examples/poll-to-queue` bridge-logic gotcha (2026-07):** not a core bug — `TriggerManager`'s
+poll never firing `onTrigger` on its first cycle (it only establishes the baseline hash) is
+documented, intentional behavior. But it's a real footgun for exactly the pattern this example
+builds: without an explicit baseline fetch before the poll trigger starts, the first real fire
+would hand the whole current item list to a fresh, empty `seenIds` set, making every pre-existing
+feed item look "new" and get (re)enqueued. Verified live, then fixed entirely in the example's
+own bridge logic (`hub.js`) by seeding `seenIds` from an initial fetch first — same cursor
+philosophy `examples/scheduled-sync` already uses for outbound sync, applied here to inbound
+polling.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

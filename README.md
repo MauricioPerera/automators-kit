@@ -393,13 +393,34 @@ clearly unrelated query as confident at 0.429, verified live) and
 corrected to 0.5 against a 10-query empirical sample. Run with
 `bun examples/hybrid-recall/setup.js`.
 
+**[`examples/poll-to-queue/`](examples/poll-to-queue/)** —
+`examples/trigger-hub` + `examples/job-queue`: a poll trigger watching an
+external feed, enqueueing **one durable, independently retryable job per
+genuinely new item** instead of one all-or-nothing event per poll cycle
+— a real production ingestion pattern neither example covers alone
+(`trigger-hub` only logs fired events; `job-queue` has no poll source).
+Found a real gotcha, no core changes needed — fixed entirely in the
+example's own bridge logic: `TriggerManager`'s poll never fires
+`onTrigger` on its first cycle (that cycle only establishes the baseline
+hash), so without an explicit baseline fetch before the poll trigger
+starts, the first real fire would treat every pre-existing feed item as
+new and enqueue it — verified live, then fixed by seeding a `seenIds` set
+from an initial fetch first, the same cursor philosophy
+[`examples/scheduled-sync`](examples/scheduled-sync/) already uses for
+outbound sync, applied to inbound polling. Verified live end-to-end:
+baseline seeding, a new item becoming a processed job within one poll
+cycle, a persistently failing item reaching the dead letter isolated from
+others, and the poll circuit-breaker (the `triggers.js` fix from
+`trigger-hub`) tripping on 3 real HTTP 503s with zero spurious enqueues.
+Run with `bun examples/poll-to-queue/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 820 tests across 45 files, ~17 seconds
+bun test tests/    # 824 tests across 46 files, ~26 seconds
 ```
 
-45 test files covering all core modules plus the `examples/content-pipeline`,
+46 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -408,7 +429,8 @@ bun test tests/    # 820 tests across 45 files, ~17 seconds
 `examples/doc-store-analytics`, `examples/api-validation`,
 `examples/mcp-cms`, `examples/api-gateway`, `examples/resilient-notify`,
 `examples/shell-mcp`, `examples/trigger-hub`, `examples/mcp-workflows`,
-`examples/plugin-workflow-nodes`, and `examples/hybrid-recall`
+`examples/plugin-workflow-nodes`, `examples/hybrid-recall`, and
+`examples/poll-to-queue`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -446,6 +468,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`workflow.js` found while building `examples/mcp-workflows`)**: `Collection.insert(doc)` clones the input and returns the clone with `_id` assigned — it does not mutate the object passed in. `WorkflowEngine.execute()` called `this._executions.insert(execution)` and discarded the return value, then returned the original `execution` local, which never got an `_id`. Any caller using `run()`'s return value to later fetch the same execution via `getExecution(id)` got `undefined` for the id — `getExecution()` only ever worked for executions already known through `getExecutions()`. `core/cms.js`'s `EntryService.create()` already captures `insert()`'s return value correctly; `workflow.js` just didn't follow its own codebase's existing pattern. Fixed with a 2-line change: capture `insert()`'s return value and assign `_id` onto `execution` before returning it. Verified live before/after through a real MCP server.
 - **2026-07 (`plugins.js` extended while building `examples/plugin-workflow-nodes`)**: not a bug — `createPluginAPI` had no way at all for a plugin to reach `workflow.js`'s `NodeRegistry`, a missing capability, not broken behavior. Added a new `nodes:register` capability (gated exactly like the existing `database:write`; threaded through `loadPlugins()`/`createApp()` automatically) with your explicit approval. Designing it surfaced a real security gap, verified live before adding a guard: `NodeRegistry.add()` itself silently lets **any** caller overwrite an existing node type — including `http.request`, replacing its net-guard SSRF check — for every workflow in the system, not just the caller's own. The new capability's `api.nodes.register()` wrapper rejects overwriting an existing type (built-in or registered by another plugin); a second plugin in the example demonstrates the rejection live.
 - **2026-07 (`examples/hybrid-recall` premise correction)**: not a core bug — a caught-before-shipping flaw in this example's own original design. The plan was "keyword recall first, vector search as a semantic fallback for paraphrases." Verified empirically *before writing the example*: the offline hashing-trick embedding shared with `examples/vector-memory` has no synonym understanding, and a genuine paraphrase query ranked an unrelated stored doc above the real match. Rebuilt around the honestly-verified value instead — `memory.recall()` hard-empties on zero shared vocabulary, `vector.search()` never does — coverage, not intelligence. A first-pass `lowConfidence` threshold (0.3) was also verified live to mislabel a clearly unrelated query as confident (score 0.429); corrected to 0.5 against a 10-query empirical sample and documented as approximate, not a statistical guarantee.
+- **2026-07 (`examples/poll-to-queue` bridge-logic gotcha)**: not a core bug — `TriggerManager`'s poll never firing `onTrigger` on its first cycle (it only establishes the baseline hash) is documented, intentional behavior. But it's a real footgun for exactly the pattern this example builds: without an explicit baseline fetch before the poll trigger starts, the first real fire would hand the whole current item list to a fresh, empty `seenIds` set, making every pre-existing feed item look "new" and get (re)enqueued. Verified live, then fixed entirely in the example's own bridge logic (`hub.js`) by seeding `seenIds` from an initial fetch first — same cursor philosophy `examples/scheduled-sync` already uses for outbound sync, applied here to inbound polling.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
