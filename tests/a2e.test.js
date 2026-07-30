@@ -371,6 +371,7 @@ describe('Flow control', () => {
     const r = await ex.execute();
     expect(r.results.check.conditionResult).toBe(true);
     expect(r.results.pass).toBe('PASSED');
+    expect(r.results.fail).toBeUndefined(); // untaken branch never ran
   });
 
   it('Wait delays execution', async () => {
@@ -382,6 +383,150 @@ describe('Flow control', () => {
     const start = performance.now();
     await ex.execute();
     expect(performance.now() - start).toBeGreaterThanOrEqual(40);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Conditional branch skipping — found broken (no prior test coverage):
+// execute() blanket-dispatched EVERY declared op regardless of which branch
+// a Conditional chose, so the untaken branch always ran too, and the taken
+// branch ran twice (once via Conditional's own dynamic dispatch, once again
+// via the blanket dispatch reaching its DAG level). Fixed by excluding
+// Conditional branch-target ids from execute()'s blanket dispatch — see
+// conditionalBranchTargets().
+// ---------------------------------------------------------------------------
+
+describe('Conditional branch skipping', () => {
+  it('does not execute the untaken ifFalse branch (side-effecting handler never fires)', async () => {
+    const ex = new WorkflowExecutor();
+    let failCalls = 0;
+    ex.registerHandler('Sentinel', () => { failCalls++; return 'ran'; });
+    ex.load({
+      operations: [
+        { id: 'score', op: 'SetData', value: 85 },
+        { id: 'check', op: 'Conditional', condition: { path: '/workflow/score', operator: '>=', value: 70 }, ifTrue: 'pass', ifFalse: 'fail' },
+        { id: 'pass', op: 'SetData', value: 'PASSED' },
+        { id: 'fail', op: 'Sentinel' }, // stand-in for a real side effect: ApiCall, StoreData, a payment call
+      ],
+      execute: 'score',
+    });
+    const r = await ex.execute();
+    expect(r.results.pass).toBe('PASSED');
+    expect(r.results.fail).toBeUndefined();
+    expect(r.errors.fail).toBeUndefined();
+    expect(failCalls).toBe(0);
+  });
+
+  it('does not execute the untaken ifTrue branch when the condition is false', async () => {
+    const ex = new WorkflowExecutor();
+    let passCalls = 0;
+    ex.registerHandler('Sentinel', () => { passCalls++; return 'ran'; });
+    ex.load({
+      operations: [
+        { id: 'score', op: 'SetData', value: 40 },
+        { id: 'check', op: 'Conditional', condition: { path: '/workflow/score', operator: '>=', value: 70 }, ifTrue: 'pass', ifFalse: 'fail' },
+        { id: 'pass', op: 'Sentinel' },
+        { id: 'fail', op: 'SetData', value: 'FAILED' },
+      ],
+      execute: 'score',
+    });
+    const r = await ex.execute();
+    expect(r.results.fail).toBe('FAILED');
+    expect(r.results.pass).toBeUndefined();
+    expect(passCalls).toBe(0);
+  });
+
+  it('executes the taken branch exactly once, not twice', async () => {
+    const ex = new WorkflowExecutor();
+    let passCalls = 0;
+    ex.registerHandler('Counted', () => { passCalls++; return 'PASSED'; });
+    ex.load({
+      operations: [
+        { id: 'score', op: 'SetData', value: 85 },
+        { id: 'check', op: 'Conditional', condition: { path: '/workflow/score', operator: '>=', value: 70 }, ifTrue: 'pass', ifFalse: 'fail' },
+        { id: 'pass', op: 'Counted' },
+        { id: 'fail', op: 'SetData', value: 'FAILED' },
+      ],
+      execute: 'score',
+    });
+    await ex.execute();
+    expect(passCalls).toBe(1);
+  });
+
+  it('a Conditional nested inside a Loop runs only the correct branch per iteration', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load({
+      operations: [
+        { id: 'items', op: 'SetData', value: [10, 200, 30] },
+        { id: 'check', op: 'Conditional', condition: { path: '/loop/current', operator: '>=', value: 100 }, ifTrue: 'big', ifFalse: 'small' },
+        { id: 'big', op: 'SetData', value: 'BIG' },
+        { id: 'small', op: 'SetData', value: 'SMALL' },
+        { id: 'loop1', op: 'Loop', inputPath: '/workflow/items', operations: ['check'] },
+      ],
+      execute: 'loop1',
+    });
+    const r = await ex.execute();
+    expect(r.errors).toEqual({});
+    // Known limitation (not introduced by this fix, pre-existing property of
+    // how Loop aggregates results): only the LAST iteration that touched a
+    // branch-target id survives outside the loop's own per-iteration array —
+    // item 30 (last) takes ifFalse, so /workflow/small is what's left.
+    expect(r.results.small).toBe('SMALL');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loop — found broken (no prior test coverage): _executeLoop(config)
+// referenced a `depth` variable never in its scope (only `config` was a
+// param), so any Loop with sub-operations threw "depth is not defined" on
+// its very first sub-op. Fixed by threading depth through from _executeOp.
+// ---------------------------------------------------------------------------
+
+describe('Loop', () => {
+  it('runs sub-operations once per item and collects a result per iteration', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load({
+      operations: [
+        { id: 'items', op: 'SetData', value: [1, 2, 3] },
+        { id: 'double', op: 'Calculate', inputPath: '/loop/current', operation: 'multiply', operand: 2 },
+        { id: 'loop1', op: 'Loop', inputPath: '/workflow/items', operations: ['double'] },
+      ],
+      execute: 'loop1',
+    });
+    const r = await ex.execute();
+    expect(r.errors).toEqual({});
+    expect(r.results.loop1).toEqual([{ double: 2 }, { double: 4 }, { double: 6 }]);
+  });
+
+  it('exposes both /loop/current and /loop/index to sub-operations, reset after the loop', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load({
+      operations: [
+        { id: 'items', op: 'SetData', value: [10, 20] },
+        // current + index proves both are live per-iteration: iter0 10+0=10, iter1 20+1=21
+        { id: 'combine', op: 'Calculate', inputPath: '/loop/current', operation: 'add', operand: '/loop/index' },
+        { id: 'loop1', op: 'Loop', inputPath: '/workflow/items', operations: ['combine'] },
+      ],
+      execute: 'loop1',
+    });
+    const r = await ex.execute();
+    expect(r.results.loop1).toEqual([{ combine: 10 }, { combine: 21 }]);
+    expect(r.state.loop).toEqual({}); // reset after the loop finishes
+  });
+
+  it('a Loop nested past maxDepth still hits the recursion guard, not a crash', async () => {
+    const ex = new WorkflowExecutor({ maxDepth: 1 });
+    ex.load({
+      operations: [
+        { id: 'items', op: 'SetData', value: [1] },
+        { id: 'inner', op: 'SetData', value: 'x' },
+        { id: 'loop2', op: 'Loop', inputPath: '/workflow/items', operations: ['inner'] },
+        { id: 'loop1', op: 'Loop', inputPath: '/workflow/items', operations: ['loop2'] },
+      ],
+      execute: 'loop1',
+    });
+    const r = await ex.execute();
+    expect(r.errors.inner).toMatch(/Max recursion depth/);
   });
 });
 

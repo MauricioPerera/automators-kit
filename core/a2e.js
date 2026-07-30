@@ -124,6 +124,37 @@ function buildDAG(operations) {
   return buildLevels(operations.map((op) => op.id), graph);
 }
 
+/**
+ * Ids declared as the ifTrue/ifFalse branch target of some Conditional
+ * operation in `operations`, excluding self-references (an op whose own id
+ * is its own branch target must stay reachable via the normal blanket
+ * dispatch — nothing else invokes it the first time).
+ *
+ * These ids already get their own DAG level (they depend on their
+ * Conditional, see the FIX-24 edge above), but they must never be
+ * blanket-dispatched by execute()'s per-level / sequential-fallback loop —
+ * they should run only when the Conditional that references them actually
+ * resolves to that branch, via the existing dynamic
+ * `_executeOp(result.executeOperationId, ...)` call. Excluding them here is
+ * what makes the untaken branch never execute; as a side effect it also
+ * stops the TAKEN branch from being invoked a second, redundant time
+ * (previously: once via that dynamic call, once again via blanket dispatch
+ * once its own DAG level was reached).
+ *
+ * @param {Array<{id: string, type: string, config?: object}>} operations
+ * @returns {Set<string>}
+ */
+function conditionalBranchTargets(operations) {
+  const targets = new Set();
+  for (const op of operations) {
+    if (op.type !== 'Conditional' || !op.config) continue;
+    for (const branchId of [op.config.ifTrue, op.config.ifFalse]) {
+      if (typeof branchId === 'string' && branchId !== op.id) targets.add(branchId);
+    }
+  }
+  return targets;
+}
+
 // ---------------------------------------------------------------------------
 // COMPACT FORMAT PARSER
 // ---------------------------------------------------------------------------
@@ -596,15 +627,21 @@ export class WorkflowExecutor {
     try {
       // Try DAG parallel execution
       const levels = buildDAG(this.operations);
+      // Untaken/taken Conditional branch targets are dispatched dynamically
+      // by _executeOp's own Conditional case — never blanket-dispatch them
+      // here, or the untaken branch runs anyway and the taken one runs twice.
+      const branchTargets = conditionalBranchTargets(this.operations);
 
       if (levels) {
         // DAG mode: execute by levels
         for (const level of levels) {
-          await Promise.all(level.map(opId => this._executeOp(opId, executionId, 0)));
+          const toRun = level.filter(opId => !branchTargets.has(opId));
+          await Promise.all(toRun.map(opId => this._executeOp(opId, executionId, 0)));
         }
       } else {
         // Fallback: sequential
         for (const op of this.operations) {
+          if (branchTargets.has(op.id)) continue;
           await this._executeOp(op.id, executionId, 0);
         }
       }
@@ -665,7 +702,7 @@ export class WorkflowExecutor {
         // effects (branch execution / iteration) that must not be skipped.
         result = config._cached;
       } else if (op.type === 'Loop') {
-        result = await this._executeLoop(config);
+        result = await this._executeLoop(config, depth);
       } else if (op.type === 'Conditional') {
         result = handler(config, this.state);
         // Execute branch if specified
@@ -713,7 +750,7 @@ export class WorkflowExecutor {
   }
 
   /** @private */
-  async _executeLoop(config) {
+  async _executeLoop(config, depth) {
     const data = getPath(this.state, config.inputPath);
     if (!Array.isArray(data)) throw new Error('Loop: input must be an array');
 
@@ -898,4 +935,4 @@ function round(n, precision) {
 }
 
 // Export helpers for testing
-export { getPath, setPath, resolvePath, buildDAG, evalCondition, HANDLERS };
+export { getPath, setPath, resolvePath, buildDAG, evalCondition, HANDLERS, conditionalBranchTargets };
