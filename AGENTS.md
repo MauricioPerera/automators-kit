@@ -35,7 +35,7 @@ net-guard.js       SSRF guard: blocks loopback/RFC1918/link-local/cloud-metadata
 
 **Similar-sounding modules, when to reach for which:**
 - `memory.js` (keyword/term recall, time decay, zero ML dependency — see `examples/agent-memory-backend/`) vs `vector.js` (real cosine-similarity over embeddings YOU provide, never calls an embedding API itself — see `examples/vector-memory/`). Default to `memory.js`; move to `vector.js` when word-overlap recall isn't good enough. Combining them as keyword-first/vector-fallback is NOT a semantic upgrade with the zero-dependency offline embedding either ships with — see `examples/hybrid-recall/` for the verified, honest value the combination actually has (coverage, not paraphrase understanding).
-- `workflow.js` (n8n-style: named nodes wired by `{{ref}}` templates, webhook/cron/poll/manual triggers, DAG-parallel) vs `a2e.js` (smaller declarative multi-step executor: `SetData`/`FilterData`/`ApiCall`/`Conditional`/`Loop`/..., its own separate DAG + middleware). These are two independent engines, not layers. They now share the actual DAG level-scheduling algorithm (`dag.js`'s `buildLevels`, Kahn's algorithm) since it was byte-for-byte duplicated code, but each keeps its own dependency-detection convention (`{{ref}}` template scanning vs `/workflow/<opId>` + `onError` + `Conditional` branch edges) — an engine-specific improvement still doesn't automatically apply to the other.
+- `workflow.js` (n8n-style: named nodes wired by `{{ref}}` templates, webhook/cron/poll/manual triggers, DAG-parallel) vs `a2e.js` (smaller declarative multi-step executor: `SetData`/`FilterData`/`ApiCall`/`Conditional`/`Loop`/..., its own separate DAG + middleware). These are two independent engines, not layers. They now share the actual DAG level-scheduling algorithm (`dag.js`'s `buildLevels`, Kahn's algorithm) since it was byte-for-byte duplicated code, but each keeps its own dependency-detection convention (`{{ref}}` template scanning vs `/workflow/<opId>` + `onError` + `Conditional` branch edges) — an engine-specific improvement still doesn't automatically apply to the other. Two more real differences, verified while building `examples/a2e-vault-api/`: `WorkflowExecutor.execute()` takes no per-call input at all (unlike `workflow.js`'s `execute(id, triggerData)`) — reuse means reloading the pipeline definition, not injecting data into an already-loaded run; and `execute()`'s DAG-level dispatch does NOT stop on a failed op (`workflow.js`'s does, unless `continueOnError`), so a downstream `Conditional` reading a failed op's never-written output silently gets `undefined` unless an explicit `onError` fallback is used.
 - `mcp.js` (one MCP tool per capability, real JSON schema per tool, `tools/list` gives full discovery — context cost grows with tool count; see `examples/mcp-cms/`) vs `shell-mcp.js` (`shell.js`'s entire command registry through exactly 2 fixed tools, `shell_help`/`shell_exec` — constant ~600-token cost no matter the registry size; discovery happens at runtime via `shell_exec("search ...")`/`("describe ...")` instead of `tools/list`; see `examples/shell-mcp/`). Port of [Agent-Shell](https://github.com/MauricioPerera/Agent-Shell)'s `McpServer`; verified end-to-end against a real external MCP client (poolside.ai's `pool exec`), which correctly called help, searched, described, then executed with no schema handed to it upfront.
 
 ## Quick Start
@@ -459,6 +459,22 @@ real HTTP 503s with zero spurious enqueues. Run with
 `bun examples/poll-to-queue/setup.js`; regression test in
 `tests/examples-poll-to-queue.test.js`.
 
+`examples/a2e-vault-api/` — combines `core/a2e.js`'s declarative executor
+with `core/credentials.js`'s vault + `core/connector.js`'s retrying HTTP
+client, calling a REAL external API from a pipeline step — something
+`examples/a2e-pipeline` doesn't cover (fully offline). Uses the
+custom-handler extension point `a2e.js` already has
+(`WorkflowExecutor.registerHandler()`) but never demonstrated with a real
+network call; `a2e.js`'s own built-in `ApiCall` op has no credential
+injection at all. No core changes — composition, not a new capability.
+Found 2 real, verified differences from `workflow.js` (see "Similar-
+sounding modules" above): no per-call input on `execute()`, and no
+stop-on-error across DAG levels — a failed lookup silently routed into
+the same path as a genuine standard-tier lead until an explicit
+`onError` fallback made the failure state distinguishable, verified live
+before and after. Run with `bun examples/a2e-vault-api/setup.js`;
+regression test in `tests/examples-a2e-vault-api.test.js`.
+
 ## MCP Server
 
 ```json
@@ -865,6 +881,18 @@ feed item look "new" and get (re)enqueued. Verified live, then fixed entirely in
 own bridge logic (`hub.js`) by seeding `seenIds` from an initial fetch first — same cursor
 philosophy `examples/scheduled-sync` already uses for outbound sync, applied here to inbound
 polling.
+
+**`core/a2e.js` found while building `examples/a2e-vault-api` (2026-07):** not a core bug —
+existing, documented behavior of `execute()`'s DAG-level dispatch. But a real, verified footgun:
+when a custom operation handler throws, `execute()` does NOT stop subsequent DAG levels (unlike
+`workflow.js`'s `execute()`, which does unless `continueOnError`). The failed op's default
+`outputPath` never gets written, so a downstream `Conditional` reading it silently resolves to
+`undefined` — which evaluated to `false` and routed a failed API lookup into the exact same
+branch as a genuine negative result, indistinguishable without inspecting `errors`. Verified live
+before and after; fixed entirely at the example level (not core) using `onError`, an existing
+`a2e.js` mechanism, to write an explicit failure marker instead of leaving the state undefined.
+Also documented: `WorkflowExecutor.execute()` takes no per-call input at all, unlike
+`workflow.js`'s `execute(id, triggerData)`.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
