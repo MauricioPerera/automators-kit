@@ -329,8 +329,8 @@ net-guard's `assertPublicUrl` with **no opt-out** (unlike
 
 ### Combined examples
 
-Every example above demonstrates ONE module. This one composes three of
-them into a pattern none covers alone:
+Every example above demonstrates ONE module. These compose 2-3 of them
+into a pattern none covers alone:
 
 **[`examples/resilient-notify/`](examples/resilient-notify/)** —
 `examples/job-queue` + `examples/provider-fanout` + `examples/integrations`:
@@ -346,13 +346,27 @@ answer with similar latency, **both** actually deliver the message — not
 just the one whose result the job returns. Run with
 `bun examples/resilient-notify/setup.js`.
 
+**[`examples/mcp-workflows/`](examples/mcp-workflows/)** —
+`examples/shell-mcp` + `examples/workflow-engine`: `core/shell-mcp.js`'s
+2-tool MCP gateway driving **real** `core/workflow.js` executions — an
+agent runs and inspects a real workflow (Ticket Triage) via
+`shell_exec`, something neither `mcp-cms` (CMS ops, not workflows) nor
+`workflow-engine` (HTTP/webhook-driven, no MCP) demonstrates. Found and
+fixed a real bug: `WorkflowEngine.execute()`/`run()` discarded the
+return value of `insert()` (which clones with `_id` assigned, doesn't
+mutate the input) and returned an execution object with no `_id` at
+all — unlike `core/cms.js`'s `EntryService.create()`, which already
+captures it correctly. Verified live before/after: the same execution,
+fetched right after the fix by the id `run()` itself returned. Run with
+`bun examples/mcp-workflows/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 797 tests across 42 files, ~11 seconds
+bun test tests/    # 803 tests across 43 files, ~17 seconds
 ```
 
-42 test files covering all core modules plus the `examples/content-pipeline`,
+43 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -360,7 +374,7 @@ bun test tests/    # 797 tests across 42 files, ~11 seconds
 `examples/a2e-pipeline`, `examples/content-formats`,
 `examples/doc-store-analytics`, `examples/api-validation`,
 `examples/mcp-cms`, `examples/api-gateway`, `examples/resilient-notify`,
-`examples/shell-mcp`, and `examples/trigger-hub`
+`examples/shell-mcp`, `examples/trigger-hub`, and `examples/mcp-workflows`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -395,6 +409,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`examples/scheduled-sync` flaky-test root cause)**: not a bug in `core/cms.js` — `EntryService.findAll()` defaulting to `createdAt` DESCENDING when no sort is specified is documented behavior — but a real ordering bug in the example's own `runSync()`: it called `findAll()` with no explicit sort, then re-sorted client-side by `updatedAt` ascending. That re-sort was a silent no-op whenever `updatedAt` ties between entries created in the same millisecond (~85% of the time at in-memory speed), leaving `findAll()`'s descending order in place uncorrected. Reproduced live end-to-end (~10% of runs synced entries out of order); fixed by requesting `sortBy`/`sortOrder` directly from `findAll()` instead of re-sorting after the fact.
 - **2026-07 (`shell.js` found while building `examples/shell-mcp`)**: `--confirm` was advertised by `help()` (and `shell_exec`'s own MCP tool description) as "Preview before execute," but the flag was parsed into `cmd.flags.confirm` and never checked anywhere in `_execSingle` — a command carrying `--confirm` executed for real, immediately, identical to not passing it. Verified live: deleting a record "with confirm" deleted it for real. For a destructive command this meant an agent (or a human) trusting the shell's own documented protocol would get a real side effect instead of a preview. Fixed by mirroring the existing `--dry-run` branch: `--confirm` now returns a preview (`mode: "confirm"`, `requiresConfirmation: true`) without running the handler; re-issuing the same command without `--confirm` executes it for real.
 - **2026-07 (`triggers.js` found while building `examples/trigger-hub`)**: 2 real bugs, both fixed with regression tests. `list()` never surfaced a poll trigger's circuit-breaker error state — only a **private** `_pollerErrors` map recorded it (confirmed by the module's own unit tests reaching into it directly), so a dead poller kept showing as an ordinary, still-running registration; `list()` now merges in `pollerStatus`/`pollerError` for poll rows. `_pollOnce` never checked `res.ok` — an HTTP error (503) with a valid JSON body parsed fine and fell into the "success" path, firing the trigger with the error body as its payload and **resetting** the consecutive-failure counter instead of incrementing it, so the circuit-breaker never tripped on real HTTP errors, only network-level failures. Both verified live over a real HTTP round trip, before and after. Also documented (not a bug): `register()` calls net-guard's `assertPublicUrl` unconditionally for poll triggers, no opt-out unlike `connector.js`'s `blockInternalHosts` — a poll trigger cannot target `localhost` at all, confirmed live.
+- **2026-07 (`workflow.js` found while building `examples/mcp-workflows`)**: `Collection.insert(doc)` clones the input and returns the clone with `_id` assigned — it does not mutate the object passed in. `WorkflowEngine.execute()` called `this._executions.insert(execution)` and discarded the return value, then returned the original `execution` local, which never got an `_id`. Any caller using `run()`'s return value to later fetch the same execution via `getExecution(id)` got `undefined` for the id — `getExecution()` only ever worked for executions already known through `getExecutions()`. `core/cms.js`'s `EntryService.create()` already captures `insert()`'s return value correctly; `workflow.js` just didn't follow its own codebase's existing pattern. Fixed with a 2-line change: capture `insert()`'s return value and assign `_id` onto `execution` before returning it. Verified live before/after through a real MCP server.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:

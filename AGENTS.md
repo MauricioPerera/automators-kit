@@ -378,6 +378,28 @@ gotcha: `parallelRace` doesn't cancel losing tasks — when two channels
 answer with similar latency, both actually deliver the message, not just
 the one whose result the job returns.
 
+`examples/mcp-workflows/` — `examples/shell-mcp` + `examples/workflow-engine`:
+`core/shell-mcp.js`'s 2-tool MCP gateway driving **real**
+`core/workflow.js` executions — an agent runs and inspects a real
+workflow (Ticket Triage) via `shell_exec`, something neither `mcp-cms`
+(CMS ops, not workflows) nor `workflow-engine` (HTTP/webhook-driven, no
+MCP) demonstrates. One small workflow is registered at setup time
+(`triage-workflow.js`); an agent only ever runs/inspects it via
+`workflows:*` shell commands (`registry.js`) — authoring the DAG stays a
+setup-time concern. Run with `bun examples/mcp-workflows/setup.js`;
+regression test in `tests/examples-mcp-workflows.test.js` (pure
+`handleShellMCPRequest` dispatcher, real `WorkflowEngine`). Found and
+fixed a real bug: `WorkflowEngine.execute()`/`run()` discarded the return
+value of `insert()` (which clones with `_id` assigned, doesn't mutate the
+input) and returned an execution with no `_id` at all — unlike
+`core/cms.js`'s `EntryService.create()`, which already captures it
+correctly. Verified live before/after: the same execution, fetched right
+after the fix by the id `run()` itself returned. Also documents a gotcha
+in this example's own workflow definition (not core): the
+`if`/`onFalse: 'skip'` barrier needs an explicit `{{ref}}` dependency to
+land a downstream node in a later DAG level, since `workflow.js` infers
+ordering only from literal `{{ref}}` occurrences in a node's inputs.
+
 ## MCP Server
 
 ```json
@@ -741,6 +763,17 @@ real HTTP errors, only network-level failures. Both verified live over a real HT
 before and after. Also documented (not a bug): `register()` calls net-guard's `assertPublicUrl`
 unconditionally for poll triggers, no opt-out unlike `connector.js`'s `blockInternalHosts` — a
 poll trigger cannot target `localhost` at all, confirmed live.
+
+**`core/workflow.js` (2026-07, found while building `examples/mcp-workflows`):** `Collection.insert(doc)`
+clones the input and returns the clone with `_id` assigned — it does not mutate the object passed
+in. `WorkflowEngine.execute()` called `this._executions.insert(execution)` and discarded the
+return value, then returned the original `execution` local, which never got an `_id`. Any caller
+using `run()`'s return value to later fetch the same execution via `getExecution(id)` got
+`undefined` for the id — `getExecution()` only ever worked for executions already known through
+`getExecutions()`. `core/cms.js`'s `EntryService.create()` already captures `insert()`'s return
+value correctly; `workflow.js` just didn't follow its own codebase's existing pattern. Fixed with
+a 2-line change: capture `insert()`'s return value and assign `_id` onto `execution` before
+returning it. Verified live before/after through a real MCP server.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
