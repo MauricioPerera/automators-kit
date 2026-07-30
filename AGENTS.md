@@ -125,7 +125,10 @@ regression test in `tests/examples-scheduled-sync.test.js` (also a real
 simulated mock failure gets silently absorbed by `core/connector.js`'s own
 retry logic before `tools.js`'s failure handling ever sees it — the mock
 must fail more times than `runSync`'s own retry budget to exercise that
-path for real.
+path for real. Also found (root-causing an intermittent test failure) that
+`runSync` relied on a client-side re-sort by `updatedAt` that silently
+no-oped whenever two entries' timestamps tied — see Security section
+below for the fix.
 
 `examples/provider-fanout/` — "ask 3 redundant suppliers for the same
 quote and take the best or fastest answer": `core/parallel.js`'s
@@ -659,6 +662,15 @@ real, easy-to-miss consequence confirmed live: `parallelRace` doesn't stop the "
 for anything with a side effect (an HTTP POST to a notification channel, not a read-only lookup), a
 losing task that finishes in time still fully executes — two channels with similar latency can
 **both** deliver the same message, not just the one whose result the caller sees.
+
+**`examples/scheduled-sync` flaky-test root cause (2026-07):** not a bug in `core/cms.js` —
+`EntryService.findAll()` defaulting to `createdAt` DESCENDING when no sort is specified is
+documented behavior — but a real ordering bug in the example's own `runSync()`: it called
+`findAll()` with no explicit sort, then re-sorted client-side by `updatedAt` ascending. That
+re-sort was a silent no-op whenever `updatedAt` ties between entries created in the same
+millisecond (~85% of the time at in-memory speed), leaving `findAll()`'s descending order in
+place uncorrected. Reproduced live end-to-end (~10% of runs synced entries out of order); fixed
+by requesting `sortBy`/`sortOrder` directly from `findAll()` instead of re-sorting after the fact.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
