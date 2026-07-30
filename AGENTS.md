@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 739 tests | 0 deps | 23 core modules
+By automators.work | 746 tests | 0 deps | 23 core modules
 
 ## Architecture
 
@@ -237,6 +237,22 @@ of bug, but `buildDAG` has no edge-modeling for `Loop.config.operations`
 the way it does for `Conditional` branches), and the workflow
 definition's `execute` field is a no-op — every declared operation always
 runs regardless of it.
+
+`examples/content-formats/` — "author once in Markdown, publish
+everywhere," using `core/portable-text.js` to store content as structured
+JSON blocks and render the same article to HTML, Markdown, and plain text
+for different channels, plus a custom `callout` block type via `toHTML`'s
+`customRenderers` hook. Run with `bun examples/content-formats/setup.js`;
+regression test in `tests/examples-content-formats.test.js` (pure
+in-process, no I/O in `portable-text.js`). No bug found, but 2 things
+confirmed live rather than assumed: the 2026-07 audit's stored-XSS fix in
+the built-in HTML renderers is still intact (`<script>` typed as plain
+text renders as `&lt;script&gt;`); and `customRenderers` itself does
+**not** auto-escape — an intentionally unsafe custom renderer let a
+`<script>` tag through raw, confirming that escaping a custom renderer's
+own interpolated values is the implementer's own responsibility. Also
+confirmed a custom block only renders where you gave it a renderer:
+`toMarkdown`/`toPlainText` have no equivalent hook and silently drop it.
 
 ## MCP Server
 
@@ -538,6 +554,14 @@ taken one running **twice** (`execute()`'s DAG-level loop blanket-dispatched eve
 operation regardless of which branch was chosen, on top of `Conditional`'s own dynamic dispatch of
 the taken one). For a branch with a real side effect (an API call, a payment) this meant unintended
 executions, not a cosmetic mismatch.
+
+**`core/portable-text.js` (2026-07, verified while building `examples/content-formats`):** no bug
+found, but confirmed *live* rather than assumed — the 2026-07 audit's stored-XSS fix in the
+built-in HTML renderers is still intact (`<script>` typed as plain text renders as
+`&lt;script&gt;`). Also documented a real API contract clarification: `toHTML`'s `customRenderers`
+escape hatch does **not** auto-escape — an intentionally unsafe custom renderer let a `<script>`
+tag through raw in testing, confirming that escaping a custom renderer's own interpolated values is
+the implementer's own responsibility, same as inside `core/portable-text.js` itself.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

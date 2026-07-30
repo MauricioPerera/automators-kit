@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-739 tests | 0 deps | 23 modules | Bun + Deno + Node.js
+746 tests | 0 deps | 23 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -228,19 +228,32 @@ regardless of which branch was chosen. For anything with a real side
 effect (an API call, a payment) both fixes matter for correctness, not
 just cosmetics. Run with `bun examples/a2e-pipeline/setup.js`.
 
+**[`examples/content-formats/`](examples/content-formats/)** — "author
+once in Markdown, publish everywhere," using `core/portable-text.js` to
+store content as structured JSON blocks and render the same article to
+HTML, Markdown, and plain text for different channels, plus a custom
+`callout` block type via `toHTML`'s `customRenderers` hook. Verified live:
+the 2026-07 audit's stored-XSS fix in the built-in renderers is still
+intact — but `customRenderers` itself does **not** auto-escape (an
+intentionally unsafe custom renderer let a `<script>` tag through raw;
+this example's own renderer escapes explicitly for that reason). Also
+confirmed: a custom block only renders where you gave it a renderer —
+`toMarkdown`/`toPlainText` have no equivalent hook and silently drop it.
+Run with `bun examples/content-formats/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 739 tests across 34 files, ~11 seconds
+bun test tests/    # 746 tests across 35 files, ~10 seconds
 ```
 
-34 test files covering all core modules plus the `examples/content-pipeline`,
+35 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
 `examples/job-queue`, `examples/plugin-system`, `examples/workflow-engine`,
-and `examples/a2e-pipeline` end-to-end scenarios (includes the regression tests
-added by the 2026-07 security audit
+`examples/a2e-pipeline`, and `examples/content-formats` end-to-end scenarios
+(includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
 `duration_ms > 0` on an operation that can legitimately finish in under
@@ -267,6 +280,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (follow-up)**: building [`examples/content-pipeline/`](examples/content-pipeline/) as a real end-to-end exercise surfaced 2 more gaps the audit's unit tests didn't catch, both fixed: the webhook secret from FIX-10 was enforced in `core/triggers.js` but never wired through `routes/workflows.js`/`WorkflowEngine.webhookTrigger`, so no webhook could actually authenticate over real HTTP; and `core/shell.js` exported `AGENT_PROFILES` but never consulted it — `new Shell({ profile: 'restricted' })` alone enforced nothing unless the caller *also* passed `permissions` explicitly. `permissions` now derives from `profile` when omitted, failing closed to `restricted` for unrecognized profiles.
 - **2026-07 (`shell.js` line-by-line audit)**: a manual read of the whole command-gateway module (parser, RBAC, batch/pipeline execution) found 2 real correctness bugs, both fixed with regression tests: `batch [...]` used `Promise.all` directly over each command, so one handler *throwing* (vs returning a normal error) silently discarded every sibling command's already-succeeded result instead of isolating the failure; and the `' | '`/`' >> '`/`','` split points used plain `indexOf`/`split` with **no** quote-awareness (despite one of them claiming otherwise in its own comment) — a quoted argument containing the literal delimiter (e.g. `--template "a | b"`) was silently mis-parsed into a broken command plus a garbage filter, succeeding with corrupted/`undefined` output instead of erroring.
 - **2026-07 (`a2e.js` found while building `examples/a2e-pipeline`)**: 2 real correctness bugs in `WorkflowExecutor`, both fixed with regression tests: `Loop` with sub-operations threw a `ReferenceError` on its very first item (a `depth` variable referenced outside its own scope — zero prior test coverage caught it); and `Conditional` always executed **both** branches, with the taken one running **twice** (`execute()`'s DAG-level loop blanket-dispatched every declared operation regardless of which branch was chosen, in addition to `Conditional`'s own dynamic dispatch of the taken one). For any branch with a real side effect (an API call, a payment) this meant unintended executions, not just a cosmetic mismatch.
+- **2026-07 (`portable-text.js` verified while building `examples/content-formats`)**: no bug found, but confirmed *live* rather than assumed — the 2026-07 audit's stored-XSS fix in `core/portable-text.js`'s built-in HTML renderers is still intact (a `<script>` tag typed as plain text renders as `&lt;script&gt;`). Also documented a real API contract clarification: `toHTML`'s `customRenderers` escape hatch does **not** auto-escape — an intentionally unsafe custom renderer let a `<script>` tag straight through in testing, confirming that escaping a custom renderer's own interpolated values is the implementer's responsibility, the same way it already is inside `core/portable-text.js` itself.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
