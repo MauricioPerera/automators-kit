@@ -34,7 +34,7 @@ net-guard.js       SSRF guard: blocks loopback/RFC1918/link-local/cloud-metadata
 ```
 
 **Similar-sounding modules, when to reach for which:**
-- `memory.js` (keyword/term recall, time decay, zero ML dependency — see `examples/agent-memory-backend/`) vs `vector.js` (real cosine-similarity over embeddings YOU provide, never calls an embedding API itself — see `examples/vector-memory/`). Default to `memory.js`; move to `vector.js` when word-overlap recall isn't good enough.
+- `memory.js` (keyword/term recall, time decay, zero ML dependency — see `examples/agent-memory-backend/`) vs `vector.js` (real cosine-similarity over embeddings YOU provide, never calls an embedding API itself — see `examples/vector-memory/`). Default to `memory.js`; move to `vector.js` when word-overlap recall isn't good enough. Combining them as keyword-first/vector-fallback is NOT a semantic upgrade with the zero-dependency offline embedding either ships with — see `examples/hybrid-recall/` for the verified, honest value the combination actually has (coverage, not paraphrase understanding).
 - `workflow.js` (n8n-style: named nodes wired by `{{ref}}` templates, webhook/cron/poll/manual triggers, DAG-parallel) vs `a2e.js` (smaller declarative multi-step executor: `SetData`/`FilterData`/`ApiCall`/`Conditional`/`Loop`/..., its own separate DAG + middleware). These are two independent engines, not layers. They now share the actual DAG level-scheduling algorithm (`dag.js`'s `buildLevels`, Kahn's algorithm) since it was byte-for-byte duplicated code, but each keeps its own dependency-detection convention (`{{ref}}` template scanning vs `/workflow/<opId>` + `onError` + `Conditional` branch edges) — an engine-specific improvement still doesn't automatically apply to the other.
 - `mcp.js` (one MCP tool per capability, real JSON schema per tool, `tools/list` gives full discovery — context cost grows with tool count; see `examples/mcp-cms/`) vs `shell-mcp.js` (`shell.js`'s entire command registry through exactly 2 fixed tools, `shell_help`/`shell_exec` — constant ~600-token cost no matter the registry size; discovery happens at runtime via `shell_exec("search ...")`/`("describe ...")` instead of `tools/list`; see `examples/shell-mcp/`). Port of [Agent-Shell](https://github.com/MauricioPerera/Agent-Shell)'s `McpServer`; verified end-to-end against a real external MCP client (poolside.ai's `pool exec`), which correctly called help, searched, described, then executed with no schema handed to it upfront.
 
@@ -419,6 +419,24 @@ in a unit test. Run with `bun examples/plugin-workflow-nodes/setup.js`;
 regression test in `tests/examples-plugin-workflow-nodes.test.js` (real
 `createApp()` + `loadPlugins()` boot path, real plugin files, not a
 hand-built API).
+
+`examples/hybrid-recall/` — `examples/agent-memory-backend` +
+`examples/vector-memory`: `core/memory.js`'s keyword recall tried first,
+falling back to `core/vector.js`'s cosine search only on a true empty.
+The original plan ("semantic fallback for paraphrases") was verified
+empirically before writing any code and doesn't hold — the shared
+offline hashing-trick embedding has no synonym understanding, and a
+genuine paraphrase can rank an unrelated stored doc above the real match
+(verified live). Built around what's actually true instead:
+`memory.recall()` hard-empties on zero shared vocabulary, `store.search()`
+never does — the fallback adds coverage, not intelligence, and results
+are honestly labeled `source: "keyword"`/`"vector"` plus a
+`lowConfidence` flag. That threshold was itself miscalibrated on the
+first pass (0.3 mislabeled a clearly unrelated query as confident at
+0.429, verified live) and corrected to 0.5 against a 10-query empirical
+sample. No core changes — entirely example-scoped. Run with
+`bun examples/hybrid-recall/setup.js`; regression test in
+`tests/examples-hybrid-recall.test.js`.
 
 ## MCP Server
 
@@ -805,6 +823,17 @@ node type — including `http.request`, replacing its net-guard SSRF check — f
 the system, not just the caller's own. The new capability's `api.nodes.register()` wrapper
 rejects overwriting an existing type (built-in or registered by another plugin); a second plugin
 in the example demonstrates the rejection live.
+
+**`examples/hybrid-recall` premise correction (2026-07):** not a core bug — a caught-before-
+shipping flaw in this example's own original design. The plan was "keyword recall first, vector
+search as a semantic fallback for paraphrases." Verified empirically before writing the example:
+the offline hashing-trick embedding shared with `examples/vector-memory` has no synonym
+understanding, and a genuine paraphrase query ranked an unrelated stored doc above the real
+match. Rebuilt around the honestly-verified value instead — `memory.recall()` hard-empties on
+zero shared vocabulary, `vector.search()` never does — coverage, not intelligence. A first-pass
+`lowConfidence` threshold (0.3) was also verified live to mislabel a clearly unrelated query as
+confident (score 0.429); corrected to 0.5 against a 10-query empirical sample and documented as
+approximate, not a statistical guarantee.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

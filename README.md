@@ -52,7 +52,7 @@ No `npm install`. Zero dependencies.
 | **net-guard.js** | SSRF guard: blocks fetches to loopback/RFC1918/link-local/cloud-metadata destinations |
 
 **Picking between similar-sounding modules:**
-- **`memory.js` vs `vector.js`** — `memory.js`'s `recall()` is keyword/term matching with time decay, zero ML dependency, works out of the box (see [`examples/agent-memory-backend`](examples/agent-memory-backend/)). `vector.js` does real cosine-similarity search over embeddings *you* provide — it never calls an embedding API itself (see [`examples/vector-memory`](examples/vector-memory/)). Reach for `memory.js` first; reach for `vector.js` when word-overlap isn't good enough and you're willing to bring an embedding function.
+- **`memory.js` vs `vector.js`** — `memory.js`'s `recall()` is keyword/term matching with time decay, zero ML dependency, works out of the box (see [`examples/agent-memory-backend`](examples/agent-memory-backend/)). `vector.js` does real cosine-similarity search over embeddings *you* provide — it never calls an embedding API itself (see [`examples/vector-memory`](examples/vector-memory/)). Reach for `memory.js` first; reach for `vector.js` when word-overlap isn't good enough and you're willing to bring an embedding function. Combining them as a keyword-first, vector-fallback strategy is **not** a semantic upgrade with the zero-dependency offline embedding either module ships with — see [`examples/hybrid-recall`](examples/hybrid-recall/) for what verified, honest value the combination actually has (coverage, not paraphrase understanding).
 - **`workflow.js` vs `a2e.js`** — two separate execution engines, not layers of one system. `workflow.js` is the n8n-style engine: named nodes wired by `{{ref}}` templates, triggered by webhook/cron/poll/manual, DAG-parallel. `a2e.js` is a smaller, declarative multi-step executor (`SetData`/`FilterData`/`ApiCall`/`Conditional`/`Loop`/...) with its own DAG and middleware, generally used standalone or from an `a2e.js`-authored node. They share the DAG level-scheduling algorithm itself (`dag.js`) since it was byte-for-byte duplicated code, but each keeps its own dependency-detection convention — an engine-specific improvement (e.g. how deps are inferred) still has to be ported to the other by hand.
 - **`mcp.js` vs `shell-mcp.js`** — two different answers to "how many MCP tools should this expose." `mcp.js` gives each capability its own tool with a real JSON schema (`list_entries`, `create_entry`...) — the client sees full discovery via `tools/list`, but context cost grows with every tool added (see [`examples/mcp-cms`](examples/mcp-cms/)). `shell-mcp.js` exposes `shell.js`'s entire command registry through exactly 2 fixed tools (`shell_help`/`shell_exec`); the agent discovers commands at runtime via `shell_exec("search ...")`/`("describe ...")` instead of `tools/list`, so the tool-list cost stays constant no matter how large the registry gets (see [`examples/shell-mcp`](examples/shell-mcp/)). Verified against a real external MCP client (poolside.ai's `pool exec`): given only `shell_help`/`shell_exec`, it correctly called help first, searched for the right commands, described their params, then executed them — no schema handed to it upfront.
 
@@ -376,13 +376,30 @@ capability's wrapper rejects overwriting an existing node type; a second
 plugin in this example demonstrates the rejection live, not just in a
 unit test. Run with `bun examples/plugin-workflow-nodes/setup.js`.
 
+**[`examples/hybrid-recall/`](examples/hybrid-recall/)** —
+`examples/agent-memory-backend` + `examples/vector-memory`:
+`core/memory.js`'s keyword recall tried first, falling back to
+`core/vector.js`'s cosine search only on a true empty. The original plan
+("semantic fallback for paraphrases") was verified empirically *before
+writing any code* and doesn't hold — the shared offline hashing-trick
+embedding has no synonym understanding, and a genuine paraphrase can
+rank an unrelated stored doc above the real match (verified live). Built
+around what's actually true instead: `memory.recall()` hard-empties on
+zero shared vocabulary, `store.search()` never does — the fallback adds
+coverage, not intelligence, and results are honestly labeled
+`source: "keyword"`/`"vector"` plus a `lowConfidence` flag. That
+threshold was itself miscalibrated on the first pass (0.3 mislabeled a
+clearly unrelated query as confident at 0.429, verified live) and
+corrected to 0.5 against a 10-query empirical sample. Run with
+`bun examples/hybrid-recall/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 814 tests across 44 files, ~17 seconds
+bun test tests/    # 820 tests across 45 files, ~17 seconds
 ```
 
-44 test files covering all core modules plus the `examples/content-pipeline`,
+45 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -391,7 +408,7 @@ bun test tests/    # 814 tests across 44 files, ~17 seconds
 `examples/doc-store-analytics`, `examples/api-validation`,
 `examples/mcp-cms`, `examples/api-gateway`, `examples/resilient-notify`,
 `examples/shell-mcp`, `examples/trigger-hub`, `examples/mcp-workflows`,
-and `examples/plugin-workflow-nodes`
+`examples/plugin-workflow-nodes`, and `examples/hybrid-recall`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -428,6 +445,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`triggers.js` found while building `examples/trigger-hub`)**: 2 real bugs, both fixed with regression tests. `list()` never surfaced a poll trigger's circuit-breaker error state — only a **private** `_pollerErrors` map recorded it (confirmed by the module's own unit tests reaching into it directly), so a dead poller kept showing as an ordinary, still-running registration; `list()` now merges in `pollerStatus`/`pollerError` for poll rows. `_pollOnce` never checked `res.ok` — an HTTP error (503) with a valid JSON body parsed fine and fell into the "success" path, firing the trigger with the error body as its payload and **resetting** the consecutive-failure counter instead of incrementing it, so the circuit-breaker never tripped on real HTTP errors, only network-level failures. Both verified live over a real HTTP round trip, before and after. Also documented (not a bug): `register()` calls net-guard's `assertPublicUrl` unconditionally for poll triggers, no opt-out unlike `connector.js`'s `blockInternalHosts` — a poll trigger cannot target `localhost` at all, confirmed live.
 - **2026-07 (`workflow.js` found while building `examples/mcp-workflows`)**: `Collection.insert(doc)` clones the input and returns the clone with `_id` assigned — it does not mutate the object passed in. `WorkflowEngine.execute()` called `this._executions.insert(execution)` and discarded the return value, then returned the original `execution` local, which never got an `_id`. Any caller using `run()`'s return value to later fetch the same execution via `getExecution(id)` got `undefined` for the id — `getExecution()` only ever worked for executions already known through `getExecutions()`. `core/cms.js`'s `EntryService.create()` already captures `insert()`'s return value correctly; `workflow.js` just didn't follow its own codebase's existing pattern. Fixed with a 2-line change: capture `insert()`'s return value and assign `_id` onto `execution` before returning it. Verified live before/after through a real MCP server.
 - **2026-07 (`plugins.js` extended while building `examples/plugin-workflow-nodes`)**: not a bug — `createPluginAPI` had no way at all for a plugin to reach `workflow.js`'s `NodeRegistry`, a missing capability, not broken behavior. Added a new `nodes:register` capability (gated exactly like the existing `database:write`; threaded through `loadPlugins()`/`createApp()` automatically) with your explicit approval. Designing it surfaced a real security gap, verified live before adding a guard: `NodeRegistry.add()` itself silently lets **any** caller overwrite an existing node type — including `http.request`, replacing its net-guard SSRF check — for every workflow in the system, not just the caller's own. The new capability's `api.nodes.register()` wrapper rejects overwriting an existing type (built-in or registered by another plugin); a second plugin in the example demonstrates the rejection live.
+- **2026-07 (`examples/hybrid-recall` premise correction)**: not a core bug — a caught-before-shipping flaw in this example's own original design. The plan was "keyword recall first, vector search as a semantic fallback for paraphrases." Verified empirically *before writing the example*: the offline hashing-trick embedding shared with `examples/vector-memory` has no synonym understanding, and a genuine paraphrase query ranked an unrelated stored doc above the real match. Rebuilt around the honestly-verified value instead — `memory.recall()` hard-empties on zero shared vocabulary, `vector.search()` never does — coverage, not intelligence. A first-pass `lowConfidence` threshold (0.3) was also verified live to mislabel a clearly unrelated query as confident (score 0.429); corrected to 0.5 against a 10-query empirical sample and documented as approximate, not a statistical guarantee.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
