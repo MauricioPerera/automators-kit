@@ -229,9 +229,11 @@ export class Router {
       }
     }
 
-    // Post-process: merge CORS headers (set by middleware on ctx.state) into the
-    // final response so ALL responses (not just OPTIONS preflight) carry them.
-    return this._applyCors(response, ctx);
+    // Post-process: merge CORS / rate-limit headers (set by middleware on
+    // ctx.state) into the final response.
+    response = this._applyCors(response, ctx);
+    response = this._applyRateLimit(response, ctx);
+    return response;
   }
 
   /**
@@ -243,6 +245,27 @@ export class Router {
     if (!corsHeaders || !response) return response;
     const headers = new Headers(response.headers);
     for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+
+  /**
+   * Merge ctx.state._rateLimitHeaders into the final response headers.
+   * rateLimit() computes X-RateLimit-Limit/Remaining/Reset for a request
+   * that's UNDER the limit and stashes them here (mirroring the CORS
+   * pattern above) — the 429-over-limit response already builds its own
+   * headers inline, so this only ever has something to merge on the
+   * allowed path.
+   * @private
+   */
+  _applyRateLimit(response, ctx) {
+    const rlHeaders = ctx && ctx.state && ctx.state._rateLimitHeaders;
+    if (!rlHeaders || !response) return response;
+    const headers = new Headers(response.headers);
+    for (const [k, v] of Object.entries(rlHeaders)) headers.set(k, v);
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,

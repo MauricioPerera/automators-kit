@@ -348,6 +348,28 @@ describe('Rate limiter', () => {
       mw.stop();
     }
   });
+
+  // Found while building examples/api-gateway: rateLimit() computed
+  // X-RateLimit-Limit/Remaining/Reset into ctx.state._rateLimitHeaders for
+  // an ALLOWED request, but nothing ever merged that state into the final
+  // response — unlike CORS, which has its own _applyCors merge step. Only
+  // the 429-blocked response (built inline) ever carried real headers.
+  it('a request under the limit carries real X-RateLimit-* headers, not just the 429 path', async () => {
+    const r = new Router();
+    const mw = rateLimit({ max: 3, windowMs: 60000 });
+    r.use(mw);
+    r.get('/x', () => json({ ok: true }));
+
+    try {
+      const res = await r.handle(req('GET', '/x'));
+      expect(res.status).toBe(200);
+      expect(res.headers.get('X-RateLimit-Limit')).toBe('3');
+      expect(res.headers.get('X-RateLimit-Remaining')).toBe('2');
+      expect(res.headers.get('X-RateLimit-Reset')).toBeTruthy();
+    } finally {
+      mw.stop();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
