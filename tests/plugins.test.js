@@ -221,6 +221,63 @@ describe('createPluginAPI — capability bypass fixes (FIX-12)', () => {
   });
 });
 
+describe('createPluginAPI — nodes:register capability', () => {
+  async function freshApiWithNodes(capabilities, nodeRegistry) {
+    const cms = new CMS(new MemoryStorageAdapter(), { secret: 'test' });
+    await cms.auth.init();
+    const hooks = new HookSystem();
+    const { RouteRegistry } = await import('../core/plugins.js');
+    const routeReg = new RouteRegistry();
+    return createPluginAPI(cms, 'plug', hooks, routeReg, {}, capabilities, nodeRegistry);
+  }
+
+  it('plugin without nodes:register has no api.nodes namespace', async () => {
+    const { NodeRegistry } = await import('../core/nodes.js');
+    const api = await freshApiWithNodes(['entries:read'], new NodeRegistry());
+    expect(api.nodes).toBeUndefined();
+  });
+
+  it('plugin with nodes:register but no nodeRegistry passed has no api.nodes namespace (backward compatible)', async () => {
+    const api = await freshApiWithNodes(['nodes:register']);
+    expect(api.nodes).toBeUndefined();
+  });
+
+  it('plugin with nodes:register can add a genuinely new node type', async () => {
+    const { NodeRegistry } = await import('../core/nodes.js');
+    const nodeRegistry = new NodeRegistry();
+    const api = await freshApiWithNodes(['nodes:register'], nodeRegistry);
+    api.nodes.register({ type: 'plug.custom', name: 'Custom', category: 'custom', handler: async () => 'ok' });
+    expect(nodeRegistry.has('plug.custom')).toBe(true);
+    expect(await nodeRegistry.execute('plug.custom', {}, {})).toBe('ok');
+  });
+
+  it('rejects overwriting an existing (built-in) node type — NodeRegistry.add() itself has no such guard', async () => {
+    const { NodeRegistry } = await import('../core/nodes.js');
+    const nodeRegistry = new NodeRegistry();
+    const api = await freshApiWithNodes(['nodes:register'], nodeRegistry);
+    expect(() => api.nodes.register({ type: 'http.request', name: 'Evil', handler: async () => 'HIJACKED' }))
+      .toThrow(/already exists/);
+    // The real built-in handler must still be the one registered.
+    expect(nodeRegistry.get('http.request').name).not.toBe('Evil');
+  });
+
+  it('rejects overwriting a node type another plugin already registered', async () => {
+    const { NodeRegistry } = await import('../core/nodes.js');
+    const nodeRegistry = new NodeRegistry();
+    const api1 = await freshApiWithNodes(['nodes:register'], nodeRegistry);
+    api1.nodes.register({ type: 'shared.type', name: 'First', handler: async () => 'first' });
+    const api2 = await freshApiWithNodes(['nodes:register'], nodeRegistry);
+    expect(() => api2.nodes.register({ type: 'shared.type', name: 'Second', handler: async () => 'second' }))
+      .toThrow(/already exists/);
+  });
+
+  it('requires a "type" field, same as NodeRegistry.add() itself', async () => {
+    const { NodeRegistry } = await import('../core/nodes.js');
+    const api = await freshApiWithNodes(['nodes:register'], new NodeRegistry());
+    expect(() => api.nodes.register({ name: 'No type' })).toThrow(/type/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // loadPlugins — local path traversal guard (FIX-05)
 // ---------------------------------------------------------------------------

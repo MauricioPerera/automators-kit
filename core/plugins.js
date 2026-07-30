@@ -214,7 +214,7 @@ function validatePluginColName(colName) {
   }
 }
 
-export function createPluginAPI(cms, pluginName, hooks, routeRegistry, settings = {}, capabilities = []) {
+export function createPluginAPI(cms, pluginName, hooks, routeRegistry, settings = {}, capabilities = [], nodeRegistry = null) {
   const hasAll = capabilities.length === 0; // no restrictions if empty (backward compatible)
   const can = (cap) => hasAll || capabilities.includes(cap) || capabilities.includes('*');
 
@@ -317,6 +317,28 @@ export function createPluginAPI(cms, pluginName, hooks, routeRegistry, settings 
     };
   }
 
+  // Node registration — gated behind 'nodes:register', mirrors the
+  // 'database:write'-gated api.database above: absent entirely (not a
+  // stub that throws) unless the plugin declared the capability. Rejects
+  // overwriting an EXISTING node type (built-in or otherwise) —
+  // NodeRegistry.add() itself has no such guard (confirmed live: it
+  // silently lets any caller replace e.g. 'http.request', including its
+  // net-guard SSRF check, for every workflow in the system, not just the
+  // plugin's own). A plugin may only add genuinely new node types.
+  if (can('nodes:register') && nodeRegistry) {
+    api.nodes = {
+      register: (nodeDefinition) => {
+        if (!nodeDefinition || !nodeDefinition.type) {
+          throw new Error('Node requires a "type" field');
+        }
+        if (nodeRegistry.has(nodeDefinition.type)) {
+          throw new Error(`Node type '${nodeDefinition.type}' already exists — plugins cannot overwrite existing node types (built-in or otherwise)`);
+        }
+        return nodeRegistry.add(nodeDefinition);
+      },
+    };
+  }
+
   return api;
 }
 
@@ -394,8 +416,11 @@ export function resolvePluginPath(pluginsDir, pluginPath) {
  * @param {RouteRegistry} routeRegistry
  * @param {string} [pluginsDir] - Optional base dir for local plugins; defaults
  *   to config.pluginsDir or `path.join(process.cwd(), 'plugins')`.
+ * @param {import('./nodes.js').NodeRegistry} [nodeRegistry] - Optional; when
+ *   provided, plugins with the 'nodes:register' capability can register new
+ *   workflow node types via `api.nodes.register(nodeDefinition)`.
  */
-export async function loadPlugins(cms, config, hooks, pluginRegistry, routeRegistry, pluginsDir) {
+export async function loadPlugins(cms, config, hooks, pluginRegistry, routeRegistry, pluginsDir, nodeRegistry) {
   const plugins = config?.plugins || [];
   const baseDir = pluginsDir || config?.pluginsDir || DEFAULT_PLUGINS_DIR;
 
@@ -423,7 +448,7 @@ export async function loadPlugins(cms, config, hooks, pluginRegistry, routeRegis
 
       // Create plugin API and call setup
       const capabilities = pluginConfig.capabilities || [];
-      const api = createPluginAPI(cms, definition.name || name, hooks, routeRegistry, settings, capabilities);
+      const api = createPluginAPI(cms, definition.name || name, hooks, routeRegistry, settings, capabilities, nodeRegistry);
 
       // Lifecycle: onLoad
       if (definition.lifecycle?.onLoad) {

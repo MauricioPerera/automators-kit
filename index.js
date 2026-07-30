@@ -94,7 +94,7 @@ export async function createApp(opts = {}) {
 
   // 5. Load plugins
   if (opts.plugins) {
-    await loadPlugins(cms, opts.plugins, hooks, pluginRegistry, routeRegistry);
+    await loadPlugins(cms, opts.plugins, hooks, pluginRegistry, routeRegistry, undefined, workflowEngine.nodes);
 
     // Mount plugin routes
     for (const [name, pluginRouter] of routeRegistry.getAll()) {
