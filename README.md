@@ -54,7 +54,7 @@ No `npm install`. Zero dependencies.
 **Picking between similar-sounding modules:**
 - **`memory.js` vs `vector.js`** — `memory.js`'s `recall()` is keyword/term matching with time decay, zero ML dependency, works out of the box (see [`examples/agent-memory-backend`](examples/agent-memory-backend/)). `vector.js` does real cosine-similarity search over embeddings *you* provide — it never calls an embedding API itself (see [`examples/vector-memory`](examples/vector-memory/)). Reach for `memory.js` first; reach for `vector.js` when word-overlap isn't good enough and you're willing to bring an embedding function.
 - **`workflow.js` vs `a2e.js`** — two separate execution engines, not layers of one system. `workflow.js` is the n8n-style engine: named nodes wired by `{{ref}}` templates, triggered by webhook/cron/poll/manual, DAG-parallel. `a2e.js` is a smaller, declarative multi-step executor (`SetData`/`FilterData`/`ApiCall`/`Conditional`/`Loop`/...) with its own DAG and middleware, generally used standalone or from an `a2e.js`-authored node. They share the DAG level-scheduling algorithm itself (`dag.js`) since it was byte-for-byte duplicated code, but each keeps its own dependency-detection convention — an engine-specific improvement (e.g. how deps are inferred) still has to be ported to the other by hand.
-- **`mcp.js` vs `shell-mcp.js`** — two different answers to "how many MCP tools should this expose." `mcp.js` gives each capability its own tool with a real JSON schema (`list_entries`, `create_entry`...) — the client sees full discovery via `tools/list`, but context cost grows with every tool added. `shell-mcp.js` exposes `shell.js`'s entire command registry through exactly 2 fixed tools (`shell_help`/`shell_exec`); the agent discovers commands at runtime via `shell_exec("search ...")`/`("describe ...")` instead of `tools/list`, so the tool-list cost stays constant no matter how large the registry gets. Verified against a real external MCP client (poolside.ai's `pool exec`): given only `shell_help`/`shell_exec`, it correctly called help first, searched for the right commands, described their params, then executed them — no schema handed to it upfront.
+- **`mcp.js` vs `shell-mcp.js`** — two different answers to "how many MCP tools should this expose." `mcp.js` gives each capability its own tool with a real JSON schema (`list_entries`, `create_entry`...) — the client sees full discovery via `tools/list`, but context cost grows with every tool added (see [`examples/mcp-cms`](examples/mcp-cms/)). `shell-mcp.js` exposes `shell.js`'s entire command registry through exactly 2 fixed tools (`shell_help`/`shell_exec`); the agent discovers commands at runtime via `shell_exec("search ...")`/`("describe ...")` instead of `tools/list`, so the tool-list cost stays constant no matter how large the registry gets (see [`examples/shell-mcp`](examples/shell-mcp/)). Verified against a real external MCP client (poolside.ai's `pool exec`): given only `shell_help`/`shell_exec`, it correctly called help first, searched for the right commands, described their params, then executed them — no schema handed to it upfront.
 
 ## Usage
 
@@ -280,6 +280,23 @@ and correctly reported the word count and excerpt it returned — no
 guessed field names, no `search`/`describe` round-trip needed first
 (unlike `shell-mcp.js`). Run with `bun examples/mcp-cms/setup.js`.
 
+**[`examples/shell-mcp/`](examples/shell-mcp/)** — `core/shell-mcp.js`'s
+2-tool MCP gateway (see the module comparison note above), wired to a real
+task-management command registry
+(`tasks:create`/`list`/`complete`/`delete`) — this module had unit tests
+but no worked example until now. JSON-RPC 2.0 over stdio, not HTTP:
+verified live by spawning the real `setup.js` process and piping actual
+JSON-RPC lines to its stdin, confirming `tools/list` stays at exactly 2
+regardless of registry size, and discovery via `shell_exec("search
+...")`/`("describe ...")` works with zero schema handed to the client
+upfront. Verifying it live found and fixed a real bug in `core/shell.js`
+itself: `--confirm` was advertised (in `help()` and `shell_exec`'s own
+tool description) as "Preview before execute," but the flag was parsed
+and never checked — a command carrying `--confirm` executed for real,
+immediately, same as not passing it at all. `--confirm` now previews
+(same shape as `--dry-run`) without running the handler; a follow-up call
+without it executes for real. Run with `bun examples/shell-mcp/setup.js`.
+
 **[`examples/api-gateway/`](examples/api-gateway/)** — `core/http.js`'s
 `Router` as the star: global middleware (`cors`, `logger`), per-route-group
 rate limiting via mounted sub-routers (`/api/public` vs `/api/admin` get
@@ -314,17 +331,18 @@ just the one whose result the job returns. Run with
 ## Testing
 
 ```bash
-bun test tests/    # 781 tests across 40 files, ~10 seconds
+bun test tests/    # 788 tests across 41 files, ~10 seconds
 ```
 
-40 test files covering all core modules plus the `examples/content-pipeline`,
+41 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
 `examples/job-queue`, `examples/plugin-system`, `examples/workflow-engine`,
 `examples/a2e-pipeline`, `examples/content-formats`,
 `examples/doc-store-analytics`, `examples/api-validation`,
-`examples/mcp-cms`, `examples/api-gateway`, and `examples/resilient-notify`
+`examples/mcp-cms`, `examples/api-gateway`, `examples/resilient-notify`,
+and `examples/shell-mcp`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -357,6 +375,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`http.js` found while building `examples/api-gateway`)**: `rateLimit()` computed `X-RateLimit-Limit`/`X-RateLimit-Remaining`/`X-RateLimit-Reset` for an **allowed** request, but `Router`'s post-processing only ever merged CORS headers (`_applyCors`) into the final response — nothing did the equivalent for rate-limit headers, so a successful request under the limit carried none; only the 429-blocked path (built separately, inline) ever had real ones. Fixed by adding `_applyRateLimit()`, mirroring the exact `_applyCors` pattern, verified live before and after (including through a mounted sub-router).
 - **2026-07 (`parallel.js` confirmed while building `examples/resilient-notify`)**: not a bug — `parallel.js`'s own doc comments already say JS cannot truly cancel an in-flight promise — but a real, easy-to-miss consequence confirmed live: `parallelRace` doesn't stop the "losing" tasks, so for anything with a side effect (an HTTP POST to a notification channel, not a read-only lookup), a losing task that finishes in time still fully executes — two channels with similar latency can **both** deliver the same message, not just the one whose result the caller sees. Fine for redundant alerting; worth knowing before reusing the pattern for anything where a duplicate side effect (e.g. a charge) would matter.
 - **2026-07 (`examples/scheduled-sync` flaky-test root cause)**: not a bug in `core/cms.js` — `EntryService.findAll()` defaulting to `createdAt` DESCENDING when no sort is specified is documented behavior — but a real ordering bug in the example's own `runSync()`: it called `findAll()` with no explicit sort, then re-sorted client-side by `updatedAt` ascending. That re-sort was a silent no-op whenever `updatedAt` ties between entries created in the same millisecond (~85% of the time at in-memory speed), leaving `findAll()`'s descending order in place uncorrected. Reproduced live end-to-end (~10% of runs synced entries out of order); fixed by requesting `sortBy`/`sortOrder` directly from `findAll()` instead of re-sorting after the fact.
+- **2026-07 (`shell.js` found while building `examples/shell-mcp`)**: `--confirm` was advertised by `help()` (and `shell_exec`'s own MCP tool description) as "Preview before execute," but the flag was parsed into `cmd.flags.confirm` and never checked anywhere in `_execSingle` — a command carrying `--confirm` executed for real, immediately, identical to not passing it. Verified live: deleting a record "with confirm" deleted it for real. For a destructive command this meant an agent (or a human) trusting the shell's own documented protocol would get a real side effect instead of a preview. Fixed by mirroring the existing `--dry-run` branch: `--confirm` now returns a preview (`mode: "confirm"`, `requiresConfirmation: true`) without running the handler; re-issuing the same command without `--confirm` executes it for real.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
