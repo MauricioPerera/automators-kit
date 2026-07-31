@@ -611,6 +611,24 @@ create/update/delete stay correctly reflected in search results, and
 after a restart. Run with `bun examples/cms-semantic-search/setup.js`;
 regression test in `tests/examples-cms-semantic-search.test.js`.
 
+`examples/validated-workflow-nodes/` — combines `core/validate.js` with
+`core/workflow.js`: a schema gates a node's handler so it only ever runs
+on data that already passed validation. `examples/api-validation`/
+`examples/validated-webhooks` only validate the request body at the HTTP
+boundary — the moment a workflow *starts*, never data a workflow
+produces for itself mid-pipeline; `core/nodes.js`'s own `inputs` array is
+documentation only, never enforced by `NodeRegistry.execute()`. No core
+changes needed — `validatedNode()` is a node-definition-level wrapper,
+the same extension point `examples/plugin-workflow-nodes`/
+`examples/content-render-workflow` already use. Verified live: a
+`discountPercent: 150` trigger payload is perfectly valid by itself, but
+silently produces a negative amount inside the pipeline; the validated
+`charge` node blocks it with `"Validation failed: amount must be >=
+0.01"`, while the identical unvalidated node succeeds while charging
+`-50` — an unnoticed refund, not a crash. Run with
+`bun examples/validated-workflow-nodes/setup.js`; regression test in
+`tests/examples-validated-workflow-nodes.test.js`.
+
 ## MCP Server
 
 ```json
@@ -1112,6 +1130,16 @@ actually been able to survive a real process restart — undetected because ever
 live-verification pass in this project wiped `data/` between runs instead of restarting against
 existing data. Fixed with a 7-line change mirroring the existing pattern, verified live
 before/after with a real restart.
+
+**`examples/validated-workflow-nodes` finding (2026-07):** not a core bug — `core/nodes.js`'s
+`inputs` array was never meant to be enforced, it's documentation for ARDF export, and
+`NodeRegistry.execute()` calling the handler directly with no check is existing, correct behavior.
+But a real, worth-knowing consequence, verified live: without a `core/validate.js` schema gating
+the node, a naive handler doesn't crash on bad data — it silently proceeds with it. A `>100%`
+discount (a perfectly valid trigger payload by itself) produced a negative charge amount that an
+unvalidated node "successfully" charged — an unnoticed refund, not a visible failure. The validated
+version of the same node blocked it with `"Validation failed: amount must be >= 0.01"` before any
+charge logic ran.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
