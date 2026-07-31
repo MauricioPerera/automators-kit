@@ -528,6 +528,79 @@ describe('Loop', () => {
     const r = await ex.execute();
     expect(r.errors.inner).toMatch(/Max recursion depth/);
   });
+
+  // Found while building examples/a2e-background (a real handler that
+  // throws on unexpected input, unlike every handler above which silently
+  // tolerates garbage): a Loop's sub-operations were dispatched TWICE —
+  // once spuriously at the top level (state.loop === {}, before the loop
+  // ever runs), once correctly per-iteration. Same bug class as the
+  // Conditional both-branches bug fixed earlier, now fixed the same way
+  // via loopSubOperationTargets().
+  it('does not spuriously dispatch a Loop sub-operation before the loop runs (real repro: throws on garbage input)', async () => {
+    const ex = new WorkflowExecutor();
+    ex.registerHandler('EnrichRecord', (config, state) => {
+      const record = getPath(state, config.inputPath); // '/loop/current'
+      if (!record) throw new Error('EnrichRecord: no record in scope');
+      return { id: record.id };
+    });
+    ex.load({
+      operations: [
+        { id: 'raw', op: 'SetData', value: [{ id: 1 }, { id: 2 }] },
+        { id: 'enrich', op: 'EnrichRecord', inputPath: '/loop/current' },
+        { id: 'processed', op: 'Loop', inputPath: '/workflow/raw', operations: ['enrich'] },
+      ],
+      execute: 'raw',
+    });
+    const r = await ex.execute();
+    expect(r.errors).toEqual({});
+    expect(r.results.processed).toEqual([{ enrich: { id: 1 } }, { enrich: { id: 2 } }]);
+  });
+
+  it('invokes a Loop sub-operation exactly once per item, not once extra at top level', async () => {
+    const ex = new WorkflowExecutor();
+    let calls = 0;
+    ex.registerHandler('Counted', (config, state) => {
+      const current = getPath(state, config.inputPath);
+      if (current === undefined) throw new Error('Counted: called outside loop scope');
+      calls++;
+      return current;
+    });
+    ex.load({
+      operations: [
+        { id: 'items', op: 'SetData', value: [1, 2, 3] },
+        { id: 'tick', op: 'Counted', inputPath: '/loop/current' },
+        { id: 'loop1', op: 'Loop', inputPath: '/workflow/items', operations: ['tick'] },
+      ],
+      execute: 'loop1',
+    });
+    const r = await ex.execute();
+    expect(r.errors).toEqual({});
+    expect(calls).toBe(3); // not 4 (3 real iterations + 1 spurious top-level)
+  });
+
+  it('a Loop nested inside a Loop dispatches sub-operations correctly, with no spurious top-level calls at either level', async () => {
+    const ex = new WorkflowExecutor();
+    ex.registerHandler('Strict', (config, state) => {
+      const current = getPath(state, config.inputPath);
+      if (current === undefined) throw new Error('Strict: called outside loop scope');
+      return current * 10;
+    });
+    ex.load({
+      operations: [
+        { id: 'outer', op: 'SetData', value: [[1, 2], [3]] },
+        { id: 'strict', op: 'Strict', inputPath: '/loop/current' },
+        { id: 'innerLoop', op: 'Loop', inputPath: '/loop/current', operations: ['strict'] },
+        { id: 'outerLoop', op: 'Loop', inputPath: '/workflow/outer', operations: ['innerLoop'] },
+      ],
+      execute: 'outer',
+    });
+    const r = await ex.execute();
+    expect(r.errors).toEqual({});
+    expect(r.results.outerLoop).toEqual([
+      { innerLoop: [{ strict: 10 }, { strict: 20 }] },
+      { innerLoop: [{ strict: 30 }] },
+    ]);
+  });
 });
 
 // ---------------------------------------------------------------------------

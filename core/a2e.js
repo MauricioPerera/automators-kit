@@ -155,6 +155,32 @@ function conditionalBranchTargets(operations) {
   return targets;
 }
 
+/**
+ * Ids referenced in the `config.operations` array of any `Loop` operation in
+ * `operations`, excluding self-references (same rationale as
+ * conditionalBranchTargets's self-reference exclusion).
+ *
+ * These ids are meant to run ONLY once per iteration, dispatched by
+ * `_executeLoop`'s own `_executeOp(subOpId, 'loop', depth + 1)` call. Unlike
+ * Conditional's branch targets, buildDAG models no dependency edge for these
+ * ids — a Loop's sub-op ids float free into whatever DAG level their own
+ * /workflow/ references put them in. Excluding them here is what stops them
+ * from ALSO being dispatched independently by execute()'s blanket per-level /
+ * sequential-fallback dispatch, in addition to their real per-iteration
+ * dispatch — the same bug class already fixed for Conditional branches, just
+ * for Loop.
+ */
+function loopSubOperationTargets(operations) {
+  const targets = new Set();
+  for (const op of operations) {
+    if (op.type !== 'Loop' || !op.config) continue;
+    for (const subOpId of op.config.operations || []) {
+      if (typeof subOpId === 'string' && subOpId !== op.id) targets.add(subOpId);
+    }
+  }
+  return targets;
+}
+
 // ---------------------------------------------------------------------------
 // COMPACT FORMAT PARSER
 // ---------------------------------------------------------------------------
@@ -627,21 +653,24 @@ export class WorkflowExecutor {
     try {
       // Try DAG parallel execution
       const levels = buildDAG(this.operations);
-      // Untaken/taken Conditional branch targets are dispatched dynamically
-      // by _executeOp's own Conditional case — never blanket-dispatch them
-      // here, or the untaken branch runs anyway and the taken one runs twice.
+      // Untaken/taken Conditional branch targets and Loop sub-operation ids
+      // are dispatched dynamically by _executeOp's own Conditional/Loop
+      // handling — never blanket-dispatch them here, or they run an extra,
+      // spurious time.
       const branchTargets = conditionalBranchTargets(this.operations);
+      const loopTargets = loopSubOperationTargets(this.operations);
+      const excludedTargets = new Set([...branchTargets, ...loopTargets]);
 
       if (levels) {
         // DAG mode: execute by levels
         for (const level of levels) {
-          const toRun = level.filter(opId => !branchTargets.has(opId));
+          const toRun = level.filter(opId => !excludedTargets.has(opId));
           await Promise.all(toRun.map(opId => this._executeOp(opId, executionId, 0)));
         }
       } else {
         // Fallback: sequential
         for (const op of this.operations) {
-          if (branchTargets.has(op.id)) continue;
+          if (excludedTargets.has(op.id)) continue;
           await this._executeOp(op.id, executionId, 0);
         }
       }
@@ -935,4 +964,4 @@ function round(n, precision) {
 }
 
 // Export helpers for testing
-export { getPath, setPath, resolvePath, buildDAG, evalCondition, HANDLERS, conditionalBranchTargets };
+export { getPath, setPath, resolvePath, buildDAG, evalCondition, HANDLERS, conditionalBranchTargets, loopSubOperationTargets };
