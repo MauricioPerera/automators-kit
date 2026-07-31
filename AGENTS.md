@@ -554,6 +554,23 @@ XSS surface the audit closed for `toHTML()`. Run with
 `bun examples/content-render-workflow/setup.js`; regression test in
 `tests/examples-content-render-workflow.test.js`.
 
+`examples/hybrid-catalog-search/` — combines `core/vector.js`'s
+cosine-similarity ranking with a REAL `core/db.js` `$lookup`/`$group`
+aggregation, scoped to exactly the semantic top-K via `$match: {$in}` —
+a query neither module can answer alone. `core/vector.js` has no notion
+of a database; `examples/doc-store-analytics`'s `topSellers()` joins
+sales data via a real `$lookup`, but as an unscoped `$group` over every
+order, no semantic ranking. Verified live: `hybridSearch()` returns the
+exact same ids/order/scores as ranking alone, proving the join never
+reorders results — it only adds `unitsSold`/`orderCount` on top,
+correctly `0`/`0` for products with no real order history rather than
+dropping them or leaving fields undefined. A real design detail handled
+correctly (not a bug): `$group`'s output order isn't guaranteed to match
+the vector search's ranking, so results are explicitly re-sorted back
+into the original semantic rank order after the join. Run with
+`bun examples/hybrid-catalog-search/setup.js`; regression test in
+`tests/examples-hybrid-catalog-search.test.js`.
+
 ## MCP Server
 
 ```json
@@ -1023,6 +1040,15 @@ plain text. But verified live through a real workflow: a downstream node that in
 completely unescaped — a real consequence worth knowing for this specific combination, since
 embedding that value into an HTML context downstream (an HTML email, a rendered page) without
 escaping it yourself would reopen the exact XSS surface the 2026-07 audit closed for `toHTML()`.
+
+**`examples/hybrid-catalog-search` design detail (2026-07):** not a bug — `core/db.js`'s `$group`
+stage never claimed to preserve input order, and it doesn't. Worth documenting because it matters
+specifically for this combination: after using a real `$lookup`/`$group` join to enrich
+vector-ranked results with relational sales data, the join's own output order does not match the
+vector search's ranking — verified live and handled correctly by explicitly re-sorting the joined
+results back into the original semantic rank order, since that ranking is the entire point of
+doing the hybrid search in the first place. `hybridSearch()`'s results verified to match
+`semanticSearch()`'s ids/order/scores exactly.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

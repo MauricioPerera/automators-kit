@@ -508,13 +508,30 @@ context without escaping it itself would reopen the exact XSS surface the
 audit closed for `toHTML()`. Run with
 `bun examples/content-render-workflow/setup.js`.
 
+**[`examples/hybrid-catalog-search/`](examples/hybrid-catalog-search/)**
+— combines `core/vector.js`'s cosine-similarity ranking with a **real**
+`core/db.js` `$lookup`/`$group` aggregation, scoped to exactly the
+semantic top-K via `$match: {$in}` — a query neither module can answer
+alone. `core/vector.js` has no notion of a database;
+`examples/doc-store-analytics`'s `topSellers()` joins sales data via a
+real `$lookup`, but as an unscoped `$group` over *every* order, no
+semantic ranking. Verified live: `hybridSearch()` returns the exact same
+ids/order/scores as ranking alone, proving the join never reorders
+results — it only adds `unitsSold`/`orderCount` on top, correctly `0`/`0`
+for products with no real order history rather than dropping them or
+leaving fields `undefined`. A real design detail handled correctly (not a
+bug): `$group`'s output order isn't guaranteed to match the vector
+search's ranking, so results are explicitly re-sorted back into the
+original semantic rank order after the join. Run with
+`bun examples/hybrid-catalog-search/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 848 tests across 51 files, ~28 seconds
+bun test tests/    # 852 tests across 52 files, ~28 seconds
 ```
 
-51 test files covering all core modules plus the `examples/content-pipeline`,
+52 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -526,7 +543,8 @@ bun test tests/    # 848 tests across 51 files, ~28 seconds
 `examples/plugin-workflow-nodes`, `examples/hybrid-recall`,
 `examples/poll-to-queue`, `examples/a2e-vault-api`,
 `examples/a2e-background`, `examples/agent-memory-hnsw`,
-`examples/validated-webhooks`, and `examples/content-render-workflow`
+`examples/validated-webhooks`, `examples/content-render-workflow`, and
+`examples/hybrid-catalog-search`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -570,6 +588,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`hnsw.js` found while building `examples/agent-memory-hnsw`)**: real, severe core bug. `_selectNeighbors`/`_pruneNeighbors` used the naive "M closest by raw distance" heuristic — a well-documented HNSW weak point: with many duplicate/near-duplicate vectors (common in real memory content), they monopolize every neighbor slot around them, fragmenting the graph. Verified live with a controlled A/B: recall vs. a brute-force exact scan collapsed from `1.0` (no duplication) to `0.0` with just 2x exact-duplicate vectors, and stayed at `0.0` at ~9x duplication (5000 entries) — a near-total collapse, not gradual degradation. `examples/large-catalog-search` never hit this because its synthetic catalog embeds a unique index number inside every product's text, avoiding exact duplicates by construction. Fixed with your explicit approval via Plan Mode (algorithmic change) implementing the original HNSW paper's diversity-aware neighbor selection (`SELECT-NEIGHBORS-HEURISTIC`) — a candidate is only kept if it's closer to the query than to every already-selected neighbor. Verified live: 2x duplication recovered to `0.8-1.0` recall, ~9x recovered to `0.6` with the top result now exactly matching the true best score (previously it found a measurably worse cluster entirely). The pre-existing `hnsw.test.js` recall test (threshold ≥0.7) improved to `1.000` with the fix — it only helps the non-duplicate case too.
 - **2026-07 (`examples/validated-webhooks` architectural finding)**: not a core bug — `createApp()`'s bundled `/api/workflows` webhook route working as designed, with no validation of its own, is documented, intentional behavior. But a real gotcha, verified live with a throwaway script: bolting a schema-validated route on top while still using `createApp()` leaves the original, unvalidated route fully reachable and bypasses validation entirely — a garbage payload the validated route rejects with `400` sailed through the built-in route with a real `200`, actually executing the workflow. Handled by not calling `createApp()` at all for this example (same à la carte spirit as `examples/doc-store-analytics`), so the validated route is the *only* webhook route that exists.
 - **2026-07 (`examples/content-render-workflow` caveat)**: not a bug — `toHTML()` still escapes correctly (confirmed intact), and `toPlainText()` correctly does **not** HTML-escape, since it's plain text. But verified live through a real workflow: a downstream node that interpolates `{{render.excerpt}}` (derived from `toPlainText()`) carries an inline `<script>` tag through completely unescaped — a real consequence worth knowing for this specific combination, since embedding that value into an HTML context downstream (an HTML email, a rendered page) without escaping it yourself would reopen the exact XSS surface the 2026-07 audit closed for `toHTML()`.
+- **2026-07 (`examples/hybrid-catalog-search` design detail)**: not a bug — `core/db.js`'s `$group` stage never claimed to preserve input order, and it doesn't. Worth documenting because it matters specifically for this combination: after using a real `$lookup`/`$group` join to enrich vector-ranked results with relational sales data, the join's own output order does not match the vector search's ranking — verified live and handled correctly by explicitly re-sorting the joined results back into the original semantic rank order, since that ranking is the entire point of doing the hybrid search in the first place. `hybridSearch()`'s results verified to match `semanticSearch()`'s ids/order/scores exactly.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
