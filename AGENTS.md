@@ -499,14 +499,17 @@ iteration. Every prior `Loop` test tolerated garbage input silently, so
 this was invisible until a realistic handler threw on it (verified live:
 called 3 times for a 2-item loop, not 2). Fixed via Plan Mode approval
 with `loopSubOperationTargets()`, mirroring `conditionalBranchTargets()`
-exactly. Also found and handled (at the example level, not core) that a
-single `WorkflowExecutor` instance is unsafe for concurrent `execute()`
+exactly. Also found (at the time, only handled at the example level): a
+single `WorkflowExecutor` instance was unsafe for concurrent `execute()`
 calls — verified live that two concurrent runs sharing one instance
-corrupt each other's results; fixed by constructing a fresh executor per
-job. Verified live: a single background run completes correctly, and 3
-concurrent jobs each land their own correct, isolated result. Run with
-`bun examples/a2e-background/setup.js`; regression test in
-`tests/examples-a2e-background.test.js`.
+corrupted each other's results; worked around here by constructing a
+fresh executor per job. **Fixed properly in `core/a2e.js` since** — see
+the [A2E Workflow Executor](#a2e-workflow-executor) section below — the
+workaround shown here is no longer required, though it remains valid.
+Verified live: a single background run completes
+correctly, and 3 concurrent jobs each land their own correct, isolated
+result. Run with `bun examples/a2e-background/setup.js`; regression test
+in `tests/examples-a2e-background.test.js`.
 
 `examples/agent-memory-hnsw/` — combines `core/memory.js`'s `AgentMemory`
 with `core/hnsw.js`'s standalone `HNSWIndex`: real memory content indexed
@@ -694,13 +697,14 @@ regression test in `tests/examples-vault-access-control.test.js`.
 `core/a2e.js`: a webhook fires a real `WorkflowExecutor` pipeline, not a
 `core/workflow.js` `WorkflowEngine`. `TriggerManager` is built directly
 into `WorkflowEngine`, but has zero wiring to `core/a2e.js` — every
-existing a2e.js example invokes pipelines manually. Works around two
-documented a2e.js constraints: `execute()` takes no per-call input (a
+existing a2e.js example invokes pipelines manually. Works around a
+documented a2e.js constraint: `execute()` takes no per-call input (a
 fresh definition is built per fire with the trigger data baked in, same
-pattern `examples/a2e-vault-api` used) and a single executor instance is
-unsafe for concurrent `execute()` calls (`examples/a2e-background`'s
-finding, so a fresh executor is constructed per fire). Building this
-reproduced the same `a2e-vault-api`-documented footgun — a failed op's
+pattern `examples/a2e-vault-api` used). Built before `execute()`'s
+per-call state was fixed to be concurrency-safe in core (see
+[A2E Workflow Executor](#a2e-workflow-executor)), so a fresh executor is
+also constructed per fire here — no longer required, but harmless.
+Building this reproduced the same `a2e-vault-api`-documented footgun — a failed op's
 downstream `Conditional` silently picking the same branch as a genuine
 negative result — fixed at the example level. Verified live: correct
 business/personal routing, a failed enrichment correctly stored as
@@ -911,6 +915,14 @@ const ex = new WorkflowExecutor();
 ex.load({ operations: [...], execute: 'first' });
 const result = await ex.execute();
 ```
+
+Concurrent `execute()` calls on the same instance are safe (fixed
+2026-07-31): `state`/`results`/`errors` live in a context local to each
+call, not on `this`. `executor.state`/`.results`/`.errors` still exist as
+an informational snapshot of the last completed run, but the return
+value of `execute()` is the authoritative result. `load()`/
+`registerHandler()` are not safe to call while an execution is still in
+flight on the same instance.
 
 ## HNSW Index
 
@@ -1303,6 +1315,19 @@ routed to "personal" with no visible sign anything failed except a buried `error
 entirely at the example level (not core), matching `a2e-vault-api`'s own precedent — the bridge now
 stores an explicit `decision: null` / `status: "failed"` instead of trusting a Conditional computed
 from a failed op's undefined output.
+
+**`a2e.js` concurrent `execute()` fixed properly in core (2026-07-31):** closes the gap first
+documented while building `examples/a2e-background` (above) — `WorkflowExecutor.state`/`.results`/
+`.errors` lived on `this`, so two `execute()` calls on the same instance running concurrently
+corrupted each other's results; the only fix at the time was a per-job workaround (construct a
+fresh executor). Moved `state`/`results`/`errors` into a context object local to each `execute()`
+call, threaded through `_executeOp`/`_executeLoop`; public API (`constructor`/`load`/`execute`/
+`registerHandler`) is unchanged, and `executor.state`/`.results`/`.errors` are preserved as an
+informational snapshot of the last completed run (needed by `examples/a2e-pipeline`), written once
+at the end, never during execution. 2 new regression tests verified against the old code (both fail
+with corrupted/cross-contaminated results) and the fix (both pass); full suite green twice after.
+The fresh-executor-per-job pattern in `a2e-background`/`trigger-driven-a2e` is no longer required,
+though it remains valid.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

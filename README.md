@@ -459,14 +459,16 @@ starts), once correctly per iteration. Every prior `Loop` test tolerated
 garbage input silently, so this was invisible until a realistic handler
 threw on it (verified live: called 3 times for a 2-item loop, not 2).
 Fixed via Plan Mode approval with `loopSubOperationTargets()`, mirroring
-the existing `conditionalBranchTargets()` exactly. Also found and handled
-(at the example level, not core) that a single `WorkflowExecutor`
-instance is unsafe for concurrent `execute()` calls — verified live that
-two concurrent runs sharing one instance corrupt each other's results;
-fixed by constructing a fresh executor per job. Verified live: a single
-background run completes correctly, and 3 **concurrent** jobs each land
-their own correct, isolated result. Run with
-`bun examples/a2e-background/setup.js`.
+the existing `conditionalBranchTargets()` exactly. Also found (at the
+time, only handled at the example level): a single `WorkflowExecutor`
+instance was unsafe for concurrent `execute()` calls — verified live
+that two concurrent runs sharing one instance corrupted each other's
+results; worked around here by constructing a fresh executor per job.
+**Fixed properly in `core/a2e.js` since** (see [Security](#security)
+below) — the constructor-per-job workaround shown here is no longer
+required, though it remains valid. Verified live: a single background
+run completes correctly, and 3 **concurrent** jobs each land their own
+correct, isolated result. Run with `bun examples/a2e-background/setup.js`.
 
 **[`examples/agent-memory-hnsw/`](examples/agent-memory-hnsw/)** —
 combines `core/memory.js`'s `AgentMemory` with `core/hnsw.js`'s
@@ -649,12 +651,13 @@ combines `core/triggers.js` with `core/a2e.js`: a webhook fires a real
 `WorkflowExecutor` pipeline, not a `core/workflow.js` `WorkflowEngine`.
 `TriggerManager` is built directly into `WorkflowEngine`, but has zero
 wiring to `core/a2e.js` — every existing a2e.js example invokes
-pipelines manually. Works around two documented a2e.js constraints:
+pipelines manually. Works around a documented a2e.js constraint:
 `execute()` takes no per-call input (a fresh definition is built per
 fire with the trigger data baked in, same pattern
-`examples/a2e-vault-api` used) and a single executor instance is unsafe
-for concurrent `execute()` calls (`examples/a2e-background`'s finding,
-so a fresh executor is constructed per fire). Building this reproduced
+`examples/a2e-vault-api` used). Built before `execute()`'s per-call
+state was fixed to be concurrency-safe in core (see
+[Security](#security)), so a fresh executor is also constructed per
+fire here — no longer required, but harmless. Building this reproduced
 the same `a2e-vault-api`-documented footgun — a failed op's downstream
 `Conditional` silently picking the same branch as a genuine negative
 result — fixed at the example level. Verified live: correct
@@ -771,6 +774,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`examples/vault-access-control` design detail)**: not a bug — `core/credentials.js` never claimed to enforce access control; `vault.get(name)` returning the fully decrypted secret to any code holding a reference is documented, intentional behavior, and `list()` withholding decrypted values is a return-shape choice, not access control. Worth documenting because it's genuinely security-relevant: every guarantee this example makes (an `integration-runner` role can *use* a secret via `vault:use` but never see it) is enforced entirely by which `Shell` instance a caller is routed to and which verbs its permission list happens to cover. Verified live: `vault:use`'s response never contains the raw secret string even though it decrypted the credential server-side to confirm it's usable; `vault:reveal` (admin-only by construction) is the only command that ever returns one.
 - **2026-07 (`db.js` found while building `examples/trigger-driven-a2e`)**: real core bug, low severity. `Auth.init()` already guards its 3 `createIndex()` calls with `try {} catch {}` (same pattern as `credentials.js`/`memory.js`/`workflow.js`), so a restart against already-persisted data never crashes — but it logged the **whole caught `Error` object**, not `err.message`, which Bun renders with a full stack trace and source-code snippet on stderr on every single normal restart, reading like a crash when it isn't. Fixed to log `err.message` only, verified live with a real `FileStorageAdapter` restart before/after.
 - **2026-07 (`examples/trigger-driven-a2e` finding)**: not a new core bug — the same DAG-dispatch-doesn't-stop-on-failure behavior already documented for `examples/a2e-vault-api`, reproduced in a different domain. A custom op throwing on bad data left its output undefined; the downstream `Conditional` read that as `false` and silently picked the exact same branch as a genuine negative classification. Verified live before the fix: a payload with no email came back routed to "personal" with no visible sign anything failed except a buried `errors` field. Fixed entirely at the example level (not core), matching `a2e-vault-api`'s own precedent — the bridge now stores an explicit `decision: null` / `status: "failed"` instead of trusting a Conditional computed from a failed op's undefined output.
+- **2026-07-31 (`a2e.js` concurrent `execute()` fixed properly in core)**: closes the gap first documented while building `examples/a2e-background` (2026-07, above) — `WorkflowExecutor.state`/`.results`/`.errors` lived on `this`, so two `execute()` calls on the same instance running concurrently corrupted each other's results; the only fix at the time was a per-job workaround (construct a fresh executor). Moved `state`/`results`/`errors` into a context object local to each `execute()` call, threaded through `_executeOp`/`_executeLoop`; public API (`constructor`/`load`/`execute`/`registerHandler`) is unchanged, and `executor.state`/`.results`/`.errors` are preserved as an informational snapshot of the last completed run (needed by `examples/a2e-pipeline`), written once at the end, never during execution. 2 new regression tests verified against the old code (both fail with corrupted/cross-contaminated results) and the fix (both pass); full suite green twice after. The fresh-executor-per-job pattern in `a2e-background`/`trigger-driven-a2e` is no longer required, though it remains valid.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
