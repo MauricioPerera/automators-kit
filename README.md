@@ -539,13 +539,34 @@ burst of 4 requests against `max: 3` returns 3× `202` (carrying real
 jobs completed — the 4th request never reached the queue. Run with
 `bun examples/rate-limited-queue/setup.js`.
 
+**[`examples/cms-semantic-search/`](examples/cms-semantic-search/)** —
+combines `core/cms.js`'s `entry:afterCreate`/`afterUpdate`/`afterDelete`
+hooks with `core/hnsw.js`'s `HNSWIndex`, kept in sync with a real content
+lifecycle. `examples/hybrid-catalog-search`/`examples/agent-memory-hnsw`
+index synthetic generated data — nothing gets created, edited, or
+deleted through them; `examples/mcp-cms` exposes real CMS entries but its
+only "search" is a title/slug substring filter, no ranking. Building
+this the honest way — restarting the server against its own persisted
+data, like a real deploy — found and fixed a real core bug (with your
+approval): `new CMS()` crashed on any restart against existing
+`FileStorageAdapter` data (`Index already exists on field: slug`) —
+`core/credentials.js`/`core/memory.js`/`core/workflow.js` already guard
+their constructor's `createIndex()` calls with `try/catch` for exactly
+this reason, `core/cms.js` never got the same treatment, meaning every
+example using `createApp()` + `FileStorageAdapter` had never actually
+survived a real process restart. Fixed with a 7-line change mirroring
+the existing pattern, verified live before/after. Also verified live:
+create/update/delete stay correctly reflected in search results, and
+`reindexAll()` catches the still-non-persistent `HNSWIndex` back up after
+a restart. Run with `bun examples/cms-semantic-search/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 856 tests across 53 files, ~27 seconds
+bun test tests/    # 862 tests across 54 files, ~28 seconds
 ```
 
-53 test files covering all core modules plus the `examples/content-pipeline`,
+54 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -558,7 +579,8 @@ bun test tests/    # 856 tests across 53 files, ~27 seconds
 `examples/poll-to-queue`, `examples/a2e-vault-api`,
 `examples/a2e-background`, `examples/agent-memory-hnsw`,
 `examples/validated-webhooks`, `examples/content-render-workflow`,
-`examples/hybrid-catalog-search`, and `examples/rate-limited-queue`
+`examples/hybrid-catalog-search`, `examples/rate-limited-queue`, and
+`examples/cms-semantic-search`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -604,6 +626,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`examples/content-render-workflow` caveat)**: not a bug — `toHTML()` still escapes correctly (confirmed intact), and `toPlainText()` correctly does **not** HTML-escape, since it's plain text. But verified live through a real workflow: a downstream node that interpolates `{{render.excerpt}}` (derived from `toPlainText()`) carries an inline `<script>` tag through completely unescaped — a real consequence worth knowing for this specific combination, since embedding that value into an HTML context downstream (an HTML email, a rendered page) without escaping it yourself would reopen the exact XSS surface the 2026-07 audit closed for `toHTML()`.
 - **2026-07 (`examples/hybrid-catalog-search` design detail)**: not a bug — `core/db.js`'s `$group` stage never claimed to preserve input order, and it doesn't. Worth documenting because it matters specifically for this combination: after using a real `$lookup`/`$group` join to enrich vector-ranked results with relational sales data, the join's own output order does not match the vector search's ranking — verified live and handled correctly by explicitly re-sorting the joined results back into the original semantic rank order, since that ranking is the entire point of doing the hybrid search in the first place. `hybridSearch()`'s results verified to match `semanticSearch()`'s ids/order/scores exactly.
 - **2026-07 (`examples/rate-limited-queue` design detail)**: not a bug — `rateLimit()` counts requests per key in a time window and has no notion of a queue; `JobQueue` has no notion of HTTP at all. Worth documenting because it matters specifically for this combination: intake protection is a property of *how the router is wired* (the limiter guards the one endpoint that calls `enqueue()`), not something either module enforces on its own — a second, unguarded endpoint calling `enqueue()` for the same job type would bypass it entirely, and nothing in `core/queue.js` would catch that. Verified live: a burst of 4 requests against `max: 3` returns 3× `202` + one `429`, with queue stats confirming exactly 3 jobs ever ran.
+- **2026-07 (`cms.js` found while building `examples/cms-semantic-search`)**: real core bug — `new CMS()` crashed on any restart against already-persisted `FileStorageAdapter` data, throwing `Index already exists on field: slug` before the server could even start. Root cause: `Collection._ensureLoaded()` restores persisted index definitions from disk *before* `CMS`'s constructor runs its own `createIndex()` calls for the same fields, so every restart against existing data collided with the index just restored. Not a novel flaw — `core/credentials.js`, `core/memory.js`, and `core/workflow.js` already guard their own constructor's `createIndex()` calls with `try {} catch {}` for exactly this reason; `core/cms.js` was the one module that never got the same treatment, meaning every example using `createApp()` + `FileStorageAdapter` had never actually been able to survive a real process restart — undetected because every prior live-verification pass in this project wiped `data/` between runs instead of restarting against existing data. Fixed with a 7-line change mirroring the existing pattern, verified live before/after with a real restart.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
