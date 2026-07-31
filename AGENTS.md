@@ -38,6 +38,17 @@ net-guard.js       SSRF guard: blocks loopback/RFC1918/link-local/cloud-metadata
 - `workflow.js` (n8n-style: named nodes wired by `{{ref}}` templates, webhook/cron/poll/manual triggers, DAG-parallel) vs `a2e.js` (smaller declarative multi-step executor: `SetData`/`FilterData`/`ApiCall`/`Conditional`/`Loop`/..., its own separate DAG + middleware). These are two independent engines, not layers. They now share the actual DAG level-scheduling algorithm (`dag.js`'s `buildLevels`, Kahn's algorithm) since it was byte-for-byte duplicated code, but each keeps its own dependency-detection convention (`{{ref}}` template scanning vs `/workflow/<opId>` + `onError` + `Conditional` branch edges) — an engine-specific improvement still doesn't automatically apply to the other. Two more real differences, verified while building `examples/a2e-vault-api/`: `WorkflowExecutor.execute()` takes no per-call input at all (unlike `workflow.js`'s `execute(id, triggerData)`) — reuse means reloading the pipeline definition, not injecting data into an already-loaded run; and `execute()`'s DAG-level dispatch does NOT stop on a failed op (`workflow.js`'s does, unless `continueOnError`), so a downstream `Conditional` reading a failed op's never-written output silently gets `undefined` unless an explicit `onError` fallback is used.
 - `mcp.js` (one MCP tool per capability, real JSON schema per tool, `tools/list` gives full discovery — context cost grows with tool count; see `examples/mcp-cms/`) vs `shell-mcp.js` (`shell.js`'s entire command registry through exactly 2 fixed tools, `shell_help`/`shell_exec` — constant ~600-token cost no matter the registry size; discovery happens at runtime via `shell_exec("search ...")`/`("describe ...")` instead of `tools/list`; see `examples/shell-mcp/`). Port of [Agent-Shell](https://github.com/MauricioPerera/Agent-Shell)'s `McpServer`; verified end-to-end against a real external MCP client (poolside.ai's `pool exec`), which correctly called help, searched, described, then executed with no schema handed to it upfront.
 
+**Known limit — `db.js` is single-process by design.** `Collection`
+loads the adapter's data into an in-memory `Map` once (`_ensureLoaded()`)
+and never re-reads it; `flush()` is the only path back to disk, with no
+invalidation/coherency protocol. Two processes sharing the same underlying
+data would silently diverge, not error. Applies to everything built on
+`DocStore` (`cms.js`, `credentials.js`, `memory.js`, `workflow.js`'s
+execution history). `integrations/postgres-queue.js` sidesteps this for
+job queueing by never caching state at all — that pattern doesn't
+generalize to `Collection` without redesigning its caching model, out of
+scope for now.
+
 ## Quick Start
 
 ```bash

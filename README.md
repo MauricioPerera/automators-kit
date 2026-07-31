@@ -56,6 +56,23 @@ No `npm install`. Zero dependencies.
 - **`workflow.js` vs `a2e.js`** — two separate execution engines, not layers of one system. `workflow.js` is the n8n-style engine: named nodes wired by `{{ref}}` templates, triggered by webhook/cron/poll/manual, DAG-parallel. `a2e.js` is a smaller, declarative multi-step executor (`SetData`/`FilterData`/`ApiCall`/`Conditional`/`Loop`/...) with its own DAG and middleware, generally used standalone or from an `a2e.js`-authored node. They share the DAG level-scheduling algorithm itself (`dag.js`) since it was byte-for-byte duplicated code, but each keeps its own dependency-detection convention — an engine-specific improvement (e.g. how deps are inferred) still has to be ported to the other by hand. Two more real differences, verified while building [`examples/a2e-vault-api`](examples/a2e-vault-api/): `WorkflowExecutor.execute()` takes no per-call input at all (unlike `workflow.js`'s `execute(id, triggerData)`) — reuse means reloading the pipeline definition, not injecting data into an already-loaded run; and `execute()`'s DAG-level dispatch does **not** stop on a failed op (`workflow.js`'s does, unless `continueOnError`), so a downstream `Conditional` reading a failed op's never-written output silently gets `undefined` unless an explicit `onError` fallback is used.
 - **`mcp.js` vs `shell-mcp.js`** — two different answers to "how many MCP tools should this expose." `mcp.js` gives each capability its own tool with a real JSON schema (`list_entries`, `create_entry`...) — the client sees full discovery via `tools/list`, but context cost grows with every tool added (see [`examples/mcp-cms`](examples/mcp-cms/)). `shell-mcp.js` exposes `shell.js`'s entire command registry through exactly 2 fixed tools (`shell_help`/`shell_exec`); the agent discovers commands at runtime via `shell_exec("search ...")`/`("describe ...")` instead of `tools/list`, so the tool-list cost stays constant no matter how large the registry gets (see [`examples/shell-mcp`](examples/shell-mcp/)). Verified against a real external MCP client (poolside.ai's `pool exec`): given only `shell_help`/`shell_exec`, it correctly called help first, searched for the right commands, described their params, then executed them — no schema handed to it upfront.
 
+**Known architectural limit — `db.js` is single-process by design.**
+`Collection._ensureLoaded()` loads the storage adapter's data into an
+in-memory `Map` once and never re-reads it — every subsequent read/write
+hits that `Map` directly, and `flush()` is the only path back to disk. This
+is why it's fast, and also why it can't be safely shared across multiple
+processes or machines: there's no cache invalidation or coherency protocol,
+so two processes each holding their own `Collection` over the same data
+would silently diverge instead of erroring. This applies to everything
+built on `DocStore` — `cms.js`, `credentials.js`, `memory.js`, and
+`workflow.js`'s execution history — not just one module.
+[`integrations/postgres-queue.js`](integrations/postgres-queue.js)'s
+`PostgresJobQueue` sidesteps this for job queueing specifically by never
+caching state at all (every claim is a fresh round trip) — that pattern
+doesn't generalize to `Collection` without redesigning its caching model
+from scratch, a project of a different scale than async-ifying method
+signatures alone.
+
 ## Usage
 
 ### As a CMS
