@@ -525,13 +525,27 @@ search's ranking, so results are explicitly re-sorted back into the
 original semantic rank order after the join. Run with
 `bun examples/hybrid-catalog-search/setup.js`.
 
+**[`examples/rate-limited-queue/`](examples/rate-limited-queue/)** —
+combines `core/http.js`'s `rateLimit()` with `core/queue.js`'s
+`JobQueue`, guarding intake instead of just the HTTP response.
+`examples/api-gateway`'s `rateLimit()` only ever protects fast inline
+handlers, never a queue; `examples/job-queue` has no limiter on
+`enqueue()` at all — any caller can flood it with unlimited jobs, and a
+failing job's own retries with backoff multiply that flood further. Here
+the limiter sits directly in front of `enqueue()`, so an over-limit
+client gets `429` **before** a job is ever created. Verified live: a
+burst of 4 requests against `max: 3` returns 3× `202` (carrying real
+`X-RateLimit-*` headers) then a `429`, and queue stats confirm exactly 3
+jobs completed — the 4th request never reached the queue. Run with
+`bun examples/rate-limited-queue/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 852 tests across 52 files, ~28 seconds
+bun test tests/    # 856 tests across 53 files, ~27 seconds
 ```
 
-52 test files covering all core modules plus the `examples/content-pipeline`,
+53 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -543,8 +557,8 @@ bun test tests/    # 852 tests across 52 files, ~28 seconds
 `examples/plugin-workflow-nodes`, `examples/hybrid-recall`,
 `examples/poll-to-queue`, `examples/a2e-vault-api`,
 `examples/a2e-background`, `examples/agent-memory-hnsw`,
-`examples/validated-webhooks`, `examples/content-render-workflow`, and
-`examples/hybrid-catalog-search`
+`examples/validated-webhooks`, `examples/content-render-workflow`,
+`examples/hybrid-catalog-search`, and `examples/rate-limited-queue`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -589,6 +603,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`examples/validated-webhooks` architectural finding)**: not a core bug — `createApp()`'s bundled `/api/workflows` webhook route working as designed, with no validation of its own, is documented, intentional behavior. But a real gotcha, verified live with a throwaway script: bolting a schema-validated route on top while still using `createApp()` leaves the original, unvalidated route fully reachable and bypasses validation entirely — a garbage payload the validated route rejects with `400` sailed through the built-in route with a real `200`, actually executing the workflow. Handled by not calling `createApp()` at all for this example (same à la carte spirit as `examples/doc-store-analytics`), so the validated route is the *only* webhook route that exists.
 - **2026-07 (`examples/content-render-workflow` caveat)**: not a bug — `toHTML()` still escapes correctly (confirmed intact), and `toPlainText()` correctly does **not** HTML-escape, since it's plain text. But verified live through a real workflow: a downstream node that interpolates `{{render.excerpt}}` (derived from `toPlainText()`) carries an inline `<script>` tag through completely unescaped — a real consequence worth knowing for this specific combination, since embedding that value into an HTML context downstream (an HTML email, a rendered page) without escaping it yourself would reopen the exact XSS surface the 2026-07 audit closed for `toHTML()`.
 - **2026-07 (`examples/hybrid-catalog-search` design detail)**: not a bug — `core/db.js`'s `$group` stage never claimed to preserve input order, and it doesn't. Worth documenting because it matters specifically for this combination: after using a real `$lookup`/`$group` join to enrich vector-ranked results with relational sales data, the join's own output order does not match the vector search's ranking — verified live and handled correctly by explicitly re-sorting the joined results back into the original semantic rank order, since that ranking is the entire point of doing the hybrid search in the first place. `hybridSearch()`'s results verified to match `semanticSearch()`'s ids/order/scores exactly.
+- **2026-07 (`examples/rate-limited-queue` design detail)**: not a bug — `rateLimit()` counts requests per key in a time window and has no notion of a queue; `JobQueue` has no notion of HTTP at all. Worth documenting because it matters specifically for this combination: intake protection is a property of *how the router is wired* (the limiter guards the one endpoint that calls `enqueue()`), not something either module enforces on its own — a second, unguarded endpoint calling `enqueue()` for the same job type would bypass it entirely, and nothing in `core/queue.js` would catch that. Verified live: a burst of 4 requests against `max: 3` returns 3× `202` + one `429`, with queue stats confirming exactly 3 jobs ever ran.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:

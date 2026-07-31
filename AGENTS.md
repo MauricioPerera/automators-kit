@@ -571,6 +571,24 @@ into the original semantic rank order after the join. Run with
 `bun examples/hybrid-catalog-search/setup.js`; regression test in
 `tests/examples-hybrid-catalog-search.test.js`.
 
+`examples/rate-limited-queue/` — combines `core/http.js`'s `rateLimit()`
+with `core/queue.js`'s `JobQueue`, guarding intake instead of just the
+HTTP response. `examples/api-gateway`'s `rateLimit()` only ever protects
+fast inline handlers, never a queue; `examples/job-queue` has no limiter
+on `enqueue()` at all — any caller can flood it with unlimited jobs, and
+a failing job's own retries with backoff multiply that flood further.
+Here the limiter sits directly in front of `enqueue()`, so an over-limit
+client gets 429 BEFORE a job is ever created. Verified live: a burst of
+4 requests against `max: 3` returns 3x 202 (carrying real
+`X-RateLimit-*` headers) then a 429, and queue stats confirm exactly 3
+jobs completed — the 4th request never reached the queue. Not a bug, but
+a design detail worth knowing: intake protection is a property of how
+the router is wired, not something either module enforces on its own — a
+second, unguarded endpoint calling `enqueue()` for the same job type
+would bypass it entirely. Run with
+`bun examples/rate-limited-queue/setup.js`; regression test in
+`tests/examples-rate-limited-queue.test.js`.
+
 ## MCP Server
 
 ```json
@@ -1049,6 +1067,15 @@ vector search's ranking — verified live and handled correctly by explicitly re
 results back into the original semantic rank order, since that ranking is the entire point of
 doing the hybrid search in the first place. `hybridSearch()`'s results verified to match
 `semanticSearch()`'s ids/order/scores exactly.
+
+**`examples/rate-limited-queue` design detail (2026-07):** not a bug — `rateLimit()` counts
+requests per key in a time window and has no notion of a queue; `JobQueue` has no notion of HTTP
+at all. Worth documenting because it matters specifically for this combination: intake protection
+is a property of how the router is wired (the limiter guards the one endpoint that calls
+`enqueue()`), not something either module enforces on its own — a second, unguarded endpoint
+calling `enqueue()` for the same job type would bypass it entirely, and nothing in `core/queue.js`
+would catch that. Verified live: a burst of 4 requests against `max: 3` returns 3x 202 + one 429,
+with queue stats confirming exactly 3 jobs ever ran.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
