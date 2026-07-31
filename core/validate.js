@@ -16,6 +16,16 @@ import { error } from './http.js';
 // FORMAT VALIDATORS
 // ---------------------------------------------------------------------------
 
+// Official semver 2.0.0 grammar (semver.org #regex): MAJOR.MINOR.PATCH,
+// each rejecting leading zeros, plus optional -prerelease and +build.
+const SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
+
+/** KDD pilot task contract: knowledge/contracts/is-valid-semver.md. */
+export function isValidSemver(value) {
+  if (typeof value !== 'string') return false;
+  return SEMVER_RE.test(value);
+}
+
 const FORMATS = {
   email: (v) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v),
   url: (v) => /^https?:\/\/.+/.test(v),
@@ -25,6 +35,7 @@ const FORMATS = {
   time: (v) => /^\d{2}:\d{2}(:\d{2})?$/.test(v),
   date: (v) => !isNaN(Date.parse(v)),
   uuid: (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v),
+  semver: (v) => isValidSemver(v),
 };
 
 // ---------------------------------------------------------------------------
