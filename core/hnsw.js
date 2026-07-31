@@ -396,28 +396,59 @@ export class HNSWIndex {
     return result.data;
   }
 
-  /** Select best neighbors (closest by distance) */
+  /**
+   * Diversity-aware neighbor selection (HNSW paper's SELECT-NEIGHBORS-HEURISTIC,
+   * simple variant + keepPrunedConnections). Replaces a naive "M closest by
+   * raw distance" selection, which let near/exact-duplicate candidates
+   * monopolize all M slots — fragmenting graph navigability whenever many
+   * vectors are identical or near-identical (verified live: recall
+   * collapsed from 1.0 to 0.0 with just 2x exact-duplicate vectors in the
+   * index, since every node's neighbors ended up pointing at the same
+   * cluster instead of spreading across the graph).
+   *
+   * A candidate is only accepted if it's closer to the query than to every
+   * already-selected neighbor — this is what forces neighbors to spread
+   * across different directions/regions instead of clustering in one.
+   * Rejected candidates that don't make the diversity cut are used to fill
+   * any remaining slots (closest-first) so a node's neighbor count doesn't
+   * shrink below `m` purely because of the stricter selection.
+   */
   _selectNeighbors(candidates, m) {
     const sorted = [...candidates].sort((a, b) => a.dist - b.dist);
-    return sorted.slice(0, m).map(c => c.idx);
+    const selected = [];
+    const discarded = [];
+    for (const cand of sorted) {
+      if (selected.length >= m) break;
+      const candVec = this.vectors[cand.idx];
+      let isDiverse = true;
+      for (const sel of selected) {
+        const selVec = this.vectors[sel.idx];
+        if (!candVec || !selVec) continue;
+        if (this.distFn(candVec, selVec) < cand.dist) { isDiverse = false; break; }
+      }
+      if (isDiverse) selected.push(cand); else discarded.push(cand);
+    }
+    for (const cand of discarded) {
+      if (selected.length >= m) break;
+      selected.push(cand);
+    }
+    return selected.map(c => c.idx);
   }
 
-  /** Prune neighbors to keep only closest m */
+  /** Prune neighbors to keep only a diverse `m`, reusing the same selection logic above. */
   _pruneNeighbors(nodeIdx, neighborSet, m) {
     const vec = this.vectors[nodeIdx];
     if (!vec) return;
 
-    const scored = [];
+    const candidates = [];
     for (const n of neighborSet) {
       const nVec = this.vectors[n];
       if (!nVec) continue;
-      scored.push({ idx: n, dist: this.distFn(vec, nVec) });
+      candidates.push({ idx: n, dist: this.distFn(vec, nVec) });
     }
 
-    scored.sort((a, b) => a.dist - b.dist);
+    const selected = this._selectNeighbors(candidates, m);
     neighborSet.clear();
-    for (let i = 0; i < Math.min(m, scored.length); i++) {
-      neighborSet.add(scored[i].idx);
-    }
+    for (const idx of selected) neighborSet.add(idx);
   }
 }

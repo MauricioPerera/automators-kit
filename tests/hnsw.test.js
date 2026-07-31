@@ -183,6 +183,43 @@ describe('HNSWIndex', () => {
     expect(recall).toBeGreaterThanOrEqual(0.7);
   });
 
+  // Found while building examples/agent-memory-hnsw: _selectNeighbors/
+  // _pruneNeighbors used to pick the M raw-closest candidates with no
+  // diversity check, so many exact-duplicate vectors could monopolize
+  // every neighbor slot around them, fragmenting the graph. Verified live:
+  // recall collapsed from 1.0 to 0.0 with just 2x exact duplication. Fixed
+  // with the HNSW paper's diversity heuristic (a candidate is only kept if
+  // it's closer to the query than to every already-selected neighbor).
+  it('diversity-aware neighbor selection keeps recall high even with many exact-duplicate vectors', () => {
+    const dim = 16;
+    const hnsw = new HNSWIndex({ m: 8, efConstruction: 50, efSearch: 30, metric: 'cosine' });
+    const vectors = [];
+
+    // 20 unique vectors, each inserted 5 times under different ids (exact
+    // duplicates) -- the degeneracy this fix targets.
+    for (let g = 0; g < 20; g++) {
+      const base = randomVec(dim);
+      for (let dup = 0; dup < 5; dup++) {
+        const id = `g${g}-d${dup}`;
+        vectors.push({ id, vec: base });
+        hnsw.add(id, base);
+      }
+    }
+
+    const query = vectors[0].vec;
+    const bruteForce = vectors.map(({ id, vec }) => {
+      let dot = 0, na = 0, nb = 0;
+      for (let j = 0; j < dim; j++) { dot += query[j] * vec[j]; na += query[j] * query[j]; nb += vec[j] * vec[j]; }
+      return { id, dist: 1 - dot / (Math.sqrt(na) * Math.sqrt(nb)) };
+    }).sort((a, b) => a.dist - b.dist);
+
+    const k = 10;
+    const trueTopK = new Set(bruteForce.slice(0, k).map((r) => r.id));
+    const hnswResults = hnsw.search(query, k);
+    const hits = hnswResults.filter((r) => trueTopK.has(r.id)).length;
+    expect(hits / k).toBeGreaterThanOrEqual(0.8);
+  });
+
   it('_randomLevel is finite and bounded when Math.random() returns 0', () => {
     const hnsw = new HNSWIndex({ m: 4, efConstruction: 20 });
     const originalRandom = Math.random;
