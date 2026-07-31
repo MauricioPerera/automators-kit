@@ -223,21 +223,27 @@ export class CMS {
       }, interval);
     }
 
-    // Core collections with indices
+    // Core collections with indices. createIndex() throws if the index
+    // already exists -- on a restart against an already-persisted
+    // FileStorageAdapter directory, _ensureLoaded() has already restored
+    // these same index definitions from disk before this constructor
+    // runs, so re-declaring them here would always throw. Guarded with
+    // try/catch, same pattern already used by credentials.js/memory.js/
+    // workflow.js for the exact same reason.
     this._contentTypes = this.db.collection('contentTypes');
-    this._contentTypes.createIndex('slug', { unique: true });
+    try { this._contentTypes.createIndex('slug', { unique: true }); } catch {}
 
     this._entries = this.db.collection('entries');
-    this._entries.createIndex('contentTypeSlug');
-    this._entries.createIndex('status');
-    this._entries.createIndex('authorId');
+    try { this._entries.createIndex('contentTypeSlug'); } catch {}
+    try { this._entries.createIndex('status'); } catch {}
+    try { this._entries.createIndex('authorId'); } catch {}
 
     this._taxonomies = this.db.collection('taxonomies');
-    this._taxonomies.createIndex('slug', { unique: true });
+    try { this._taxonomies.createIndex('slug', { unique: true }); } catch {}
 
     this._terms = this.db.collection('terms');
-    this._terms.createIndex('taxonomySlug');
-    this._terms.createIndex('slug');
+    try { this._terms.createIndex('taxonomySlug'); } catch {}
+    try { this._terms.createIndex('slug'); } catch {}
 
     // Hooks — initialize eagerly so hooks work before plugins load
     this._hooks = null; // set via setHooks() in createApp

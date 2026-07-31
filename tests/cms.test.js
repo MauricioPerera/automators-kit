@@ -248,6 +248,29 @@ describe('CMS lifecycle', () => {
     await cms2.shutdown();
     expect(cms2._autosaveTimer).toBeNull();
   });
+
+  it('a second CMS instance against already-persisted FileStorageAdapter data does not throw (restart survives)', async () => {
+    const { FileStorageAdapter } = await import('../adapters/fs.js');
+    const dir = './tmp-test-cms-restart-' + Date.now();
+    try {
+      const cms1 = new CMS(new FileStorageAdapter(dir), { secret: 'x' });
+      await cms1.contentTypes.create({ name: 'Article', slug: 'article', fields: [] });
+      await cms1.entries.create({ contentTypeSlug: 'article', title: 'Hello', content: {} }, 'author-1');
+      await cms1.shutdown();
+
+      // _ensureLoaded() restores persisted index defs before the constructor's
+      // own createIndex() calls run -- those used to throw "Index already
+      // exists on field: slug" on every second instantiation against the
+      // same directory. Constructing here must not throw.
+      let cms2;
+      expect(() => { cms2 = new CMS(new FileStorageAdapter(dir), { secret: 'x' }); }).not.toThrow();
+      expect(cms2.entries.col.find({}).toArray().length).toBe(1);
+      await cms2.shutdown();
+    } finally {
+      const { rmSync } = await import('node:fs');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
