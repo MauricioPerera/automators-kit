@@ -698,6 +698,37 @@ fires each getting their own uncorrupted decision. Run with
 `bun examples/trigger-driven-a2e/setup.js`; regression test in
 `tests/examples-trigger-driven-a2e.test.js`.
 
+## Optional Integrations
+
+Standalone modules living outside `core/`, gated behind `optionalDependencies`
+so the framework itself stays deps-free by default.
+
+`integrations/postgres-queue.js` — `PostgresJobQueue`, an async-native job
+queue mirroring `core/queue.js`'s `JobQueue` API/method names, built to close
+a real gap: `core/queue.js`'s concurrency control (`this._running`, a plain
+counter) only works within one process, and `core/db.js`'s storage-adapter
+interface is fully synchronous (confirmed by reading the module — zero
+`await` near any adapter call), so it can't back a Postgres-backed `DocStore`
+without a much larger rewrite. This module talks to Postgres directly via
+`pg` instead. The correctness-critical piece, `claimJobs(pool, opts)`'s
+atomic `WITH ... FOR UPDATE SKIP LOCKED ... UPDATE ... RETURNING` claim, was
+authored as a KDD task contract (methodology kept external — see
+[KDD](https://github.com/MauricioPerera/KDD), never vendored into this repo)
+and verified live against a real Postgres: two concurrent claimers racing 40
+pending jobs never claim the same one, together claim all 40 exactly once.
+Building it live found a real bug: Postgres's `UPDATE ... RETURNING` does not
+preserve a CTE's `ORDER BY` — `claimJobs`'s priority-then-FIFO ordering was
+silently lost until sorted client-side right after the atomic claim (see the
+function's own comment). Requires the optional `pg` dependency (`bun add
+pg`). Tests skip cleanly unless `POSTGRES_TEST_URL` is set:
+```bash
+POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-postgres-queue-claim.test.js tests/integrations-postgres-queue.test.js
+```
+`tests/integrations-postgres-queue-claim.test.js` is the KDD-contracted
+frozen oracle for `claimJobs` specifically; `tests/integrations-postgres-queue.test.js`
+covers the rest of the class (enqueue/stats/list/deadLetter/retry/purge)
+with the same rigor, no separate formal contract.
+
 ## MCP Server
 
 ```json
@@ -910,6 +941,9 @@ queue.register('send-email', async (data) => { /* ... */ });
 queue.enqueue('send-email', { to: 'a@b.com' });
 queue.start();
 ```
+In-process only. For multiple worker processes/machines sharing one queue,
+see `integrations/postgres-queue.js`'s `PostgresJobQueue` under
+[Optional Integrations](#optional-integrations).
 
 ### Cron Scheduler
 ```javascript
