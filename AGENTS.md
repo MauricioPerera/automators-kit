@@ -646,6 +646,22 @@ to data a handler deliberately returns). Run with
 `bun examples/mcp-job-queue/setup.js`; regression test in
 `tests/examples-mcp-job-queue.test.js`.
 
+`examples/queue-access-control/` — combines `core/shell.js`'s RBAC with
+`core/queue.js`: 3 agent sessions (admin / reader / a custom
+"queue-operator" permission set) share one `JobQueue`, gated
+differently. `core/queue.js` itself has no notion of a caller at all;
+`examples/job-queue` registers every queue command on `createApp()`'s
+default `admin` shell, no restriction ever demonstrated. The exact same
+commands are registered once on a shared `CommandRegistry`, and 3
+`Shell` instances decide for themselves what their caller may run.
+Verified live: reader can list/check status but is denied on
+enqueue/stats/purge; the custom operator set can enqueue and read stats
+but not retry/purge (no built-in profile fits "enqueue + monitor, no
+destructive ops"); admin's `purge` removes jobs enqueued by all three
+sessions, confirming RBAC lives in which `Shell` a caller is routed to,
+not in the data. Run with `bun examples/queue-access-control/setup.js`;
+regression test in `tests/examples-queue-access-control.test.js`.
+
 ## MCP Server
 
 ```json
@@ -1167,6 +1183,16 @@ of throwing — the agent gets a real, useful answer instead of an opaque failur
 missing required argument is a different path entirely (`tools/call`'s own `inputSchema`
 validation, checked before the handler runs) and does come back with the real, specific reason —
 verified live: `"Invalid arguments: jobId is required"`.
+
+**`examples/queue-access-control` design detail (2026-07):** not a bug — `core/queue.js` never
+claimed to have any notion of a caller, and `core/shell.js`'s built-in `AGENT_PROFILES` are generic
+on purpose. Worth documenting because it matters specifically for this combination:
+`AGENT_PROFILES.reader`'s wildcard verbs (`list`/`get`/`search`/`describe`/`count`/`status`) don't
+happen to include `stats` — verified live, even `reader` gets `Permission denied` for
+`queue:stats`, and `operator`'s wildcards (`list`/`get`/`create`/`update`/`delete`/`run`) don't
+cover it either. No built-in profile expresses "can enqueue and monitor this one namespace, but not
+its destructive ops" — this example builds an explicit custom `permissions` array for that role
+instead, exactly the override `core/shell.js` documents `profile` as losing to.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

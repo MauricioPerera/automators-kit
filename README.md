@@ -594,13 +594,29 @@ errors (a real, documented design detail: masking applies to thrown
 errors, not to data a handler deliberately returns). Run with
 `bun examples/mcp-job-queue/setup.js`.
 
+**[`examples/queue-access-control/`](examples/queue-access-control/)** —
+combines `core/shell.js`'s RBAC with `core/queue.js`: 3 agent sessions
+(admin / reader / a custom "queue-operator" permission set) share one
+`JobQueue`, gated differently. `core/queue.js` itself has no notion of a
+caller at all; `examples/job-queue` registers every queue command on
+`createApp()`'s default `admin` shell, no restriction ever demonstrated.
+The exact same commands are registered once on a shared
+`CommandRegistry`, and 3 `Shell` instances decide for themselves what
+their caller may run. Verified live: reader can list/check status but is
+denied on enqueue/stats/purge; the custom operator set can enqueue and
+read stats but not retry/purge (no built-in profile fits "enqueue +
+monitor, no destructive ops"); admin's `purge` removes jobs enqueued by
+*all three* sessions, confirming RBAC lives in which `Shell` a caller is
+routed to, not in the data. Run with
+`bun examples/queue-access-control/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 873 tests across 56 files, ~29 seconds
+bun test tests/    # 877 tests across 57 files, ~29 seconds
 ```
 
-56 test files covering all core modules plus the `examples/content-pipeline`,
+57 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -615,7 +631,7 @@ bun test tests/    # 873 tests across 56 files, ~29 seconds
 `examples/validated-webhooks`, `examples/content-render-workflow`,
 `examples/hybrid-catalog-search`, `examples/rate-limited-queue`, and
 `examples/cms-semantic-search`, `examples/validated-workflow-nodes`, and
-`examples/mcp-job-queue`
+`examples/mcp-job-queue`, and `examples/queue-access-control`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -664,6 +680,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`cms.js` found while building `examples/cms-semantic-search`)**: real core bug — `new CMS()` crashed on any restart against already-persisted `FileStorageAdapter` data, throwing `Index already exists on field: slug` before the server could even start. Root cause: `Collection._ensureLoaded()` restores persisted index definitions from disk *before* `CMS`'s constructor runs its own `createIndex()` calls for the same fields, so every restart against existing data collided with the index just restored. Not a novel flaw — `core/credentials.js`, `core/memory.js`, and `core/workflow.js` already guard their own constructor's `createIndex()` calls with `try {} catch {}` for exactly this reason; `core/cms.js` was the one module that never got the same treatment, meaning every example using `createApp()` + `FileStorageAdapter` had never actually been able to survive a real process restart — undetected because every prior live-verification pass in this project wiped `data/` between runs instead of restarting against existing data. Fixed with a 7-line change mirroring the existing pattern, verified live before/after with a real restart.
 - **2026-07 (`examples/validated-workflow-nodes` finding)**: not a core bug — `core/nodes.js`'s `inputs` array was never meant to be enforced, it's documentation for ARDF export, and `NodeRegistry.execute()` calling the handler directly with no check is existing, correct behavior. But a real, worth-knowing consequence, verified live: without a `core/validate.js` schema gating the node, a naive handler doesn't crash on bad data — it silently proceeds with it. A `>100%` discount (a perfectly valid trigger payload by itself) produced a negative charge amount that an unvalidated node "successfully" charged — an unnoticed refund, not a visible failure. The validated version of the same node blocked it with `"Validation failed: amount must be >= 0.01"` before any charge logic ran.
 - **2026-07 (`examples/mcp-job-queue` design detail)**: not a bug — `core/mcp.js`'s `tools/call` deliberately replaces any *thrown* tool-handler error with a generic, internals-hiding message, logging the real reason server-side only, confirmed by reading the code. Worth documenting because it shapes how a tool should be written: `job_status`'s "job not found" is an expected, actionable outcome, not a server fault, so it's designed to **return** `{ found: false }` as ordinary data instead of throwing — the agent gets a real, useful answer instead of an opaque failure. A genuinely missing required argument is a different path entirely (`tools/call`'s own `inputSchema` validation, checked before the handler runs) and does come back with the real, specific reason — verified live: `"Invalid arguments: jobId is required"`.
+- **2026-07 (`examples/queue-access-control` design detail)**: not a bug — `core/queue.js` never claimed to have any notion of a caller, and `core/shell.js`'s built-in `AGENT_PROFILES` are generic on purpose. Worth documenting because it matters specifically for this combination: `AGENT_PROFILES.reader`'s wildcard verbs (`list`/`get`/`search`/`describe`/`count`/`status`) don't happen to include `stats` — verified live, even `reader` gets `Permission denied` for `queue:stats`, and `operator`'s wildcards (`list`/`get`/`create`/`update`/`delete`/`run`) don't cover it either. No built-in profile expresses "can enqueue and monitor this one namespace, but not its destructive ops" — this example builds an explicit custom `permissions` array for that role instead, exactly the override `core/shell.js` documents `profile` as losing to.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
