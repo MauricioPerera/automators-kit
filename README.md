@@ -578,13 +578,29 @@ unvalidated node **succeeds** while charging `-50` — an unnoticed
 refund, not a crash. Run with
 `bun examples/validated-workflow-nodes/setup.js`.
 
+**[`examples/mcp-job-queue/`](examples/mcp-job-queue/)** — combines
+`core/mcp.js` with `core/queue.js`: an AI agent enqueues background work
+and polls for its result using only MCP tool calls, no HTTP/shell.
+`examples/job-queue` only ever exposes this over HTTP/shell — no MCP
+transport exists for it; `examples/mcp-cms`/`examples/agent-memory-backend`
+expose CMS entries and agent memory over MCP, never a `JobQueue`. Reuses
+`examples/job-queue`'s own `handlers.js`/`tools.js` directly — the only
+new code is the MCP tool shape (3 tools: `enqueue_report`, `job_status`,
+`queue_stats`). Verified live over a real spawned stdio process: a full
+enqueue → background-completion → status-poll round trip, plus an
+unknown job id returning `{ found: false }` as ordinary data instead of
+getting swallowed by `core/mcp.js`'s generic error-masking for thrown
+errors (a real, documented design detail: masking applies to thrown
+errors, not to data a handler deliberately returns). Run with
+`bun examples/mcp-job-queue/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 868 tests across 55 files, ~28 seconds
+bun test tests/    # 873 tests across 56 files, ~29 seconds
 ```
 
-55 test files covering all core modules plus the `examples/content-pipeline`,
+56 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -598,7 +614,8 @@ bun test tests/    # 868 tests across 55 files, ~28 seconds
 `examples/a2e-background`, `examples/agent-memory-hnsw`,
 `examples/validated-webhooks`, `examples/content-render-workflow`,
 `examples/hybrid-catalog-search`, `examples/rate-limited-queue`, and
-`examples/cms-semantic-search`, and `examples/validated-workflow-nodes`
+`examples/cms-semantic-search`, `examples/validated-workflow-nodes`, and
+`examples/mcp-job-queue`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -646,6 +663,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`examples/rate-limited-queue` design detail)**: not a bug — `rateLimit()` counts requests per key in a time window and has no notion of a queue; `JobQueue` has no notion of HTTP at all. Worth documenting because it matters specifically for this combination: intake protection is a property of *how the router is wired* (the limiter guards the one endpoint that calls `enqueue()`), not something either module enforces on its own — a second, unguarded endpoint calling `enqueue()` for the same job type would bypass it entirely, and nothing in `core/queue.js` would catch that. Verified live: a burst of 4 requests against `max: 3` returns 3× `202` + one `429`, with queue stats confirming exactly 3 jobs ever ran.
 - **2026-07 (`cms.js` found while building `examples/cms-semantic-search`)**: real core bug — `new CMS()` crashed on any restart against already-persisted `FileStorageAdapter` data, throwing `Index already exists on field: slug` before the server could even start. Root cause: `Collection._ensureLoaded()` restores persisted index definitions from disk *before* `CMS`'s constructor runs its own `createIndex()` calls for the same fields, so every restart against existing data collided with the index just restored. Not a novel flaw — `core/credentials.js`, `core/memory.js`, and `core/workflow.js` already guard their own constructor's `createIndex()` calls with `try {} catch {}` for exactly this reason; `core/cms.js` was the one module that never got the same treatment, meaning every example using `createApp()` + `FileStorageAdapter` had never actually been able to survive a real process restart — undetected because every prior live-verification pass in this project wiped `data/` between runs instead of restarting against existing data. Fixed with a 7-line change mirroring the existing pattern, verified live before/after with a real restart.
 - **2026-07 (`examples/validated-workflow-nodes` finding)**: not a core bug — `core/nodes.js`'s `inputs` array was never meant to be enforced, it's documentation for ARDF export, and `NodeRegistry.execute()` calling the handler directly with no check is existing, correct behavior. But a real, worth-knowing consequence, verified live: without a `core/validate.js` schema gating the node, a naive handler doesn't crash on bad data — it silently proceeds with it. A `>100%` discount (a perfectly valid trigger payload by itself) produced a negative charge amount that an unvalidated node "successfully" charged — an unnoticed refund, not a visible failure. The validated version of the same node blocked it with `"Validation failed: amount must be >= 0.01"` before any charge logic ran.
+- **2026-07 (`examples/mcp-job-queue` design detail)**: not a bug — `core/mcp.js`'s `tools/call` deliberately replaces any *thrown* tool-handler error with a generic, internals-hiding message, logging the real reason server-side only, confirmed by reading the code. Worth documenting because it shapes how a tool should be written: `job_status`'s "job not found" is an expected, actionable outcome, not a server fault, so it's designed to **return** `{ found: false }` as ordinary data instead of throwing — the agent gets a real, useful answer instead of an opaque failure. A genuinely missing required argument is a different path entirely (`tools/call`'s own `inputSchema` validation, checked before the handler runs) and does come back with the real, specific reason — verified live: `"Invalid arguments: jobId is required"`.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:

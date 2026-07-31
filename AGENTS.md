@@ -629,6 +629,23 @@ silently produces a negative amount inside the pipeline; the validated
 `bun examples/validated-workflow-nodes/setup.js`; regression test in
 `tests/examples-validated-workflow-nodes.test.js`.
 
+`examples/mcp-job-queue/` — combines `core/mcp.js` with `core/queue.js`:
+an AI agent enqueues background work and polls for its result using
+only MCP tool calls, no HTTP/shell. `examples/job-queue` only ever
+exposes this over HTTP/shell — no MCP transport exists for it;
+`examples/mcp-cms`/`examples/agent-memory-backend` expose CMS entries and
+agent memory over MCP, never a `JobQueue`. Reuses `examples/job-queue`'s
+own `handlers.js`/`tools.js` directly — the only new code is the MCP
+tool shape (3 tools: `enqueue_report`, `job_status`, `queue_stats`).
+Verified live over a real spawned stdio process: a full enqueue →
+background-completion → status-poll round trip, plus an unknown job id
+returning `{ found: false }` as ordinary data instead of getting
+swallowed by `core/mcp.js`'s generic error-masking for thrown errors (a
+real, documented design detail: masking applies to thrown errors, not
+to data a handler deliberately returns). Run with
+`bun examples/mcp-job-queue/setup.js`; regression test in
+`tests/examples-mcp-job-queue.test.js`.
+
 ## MCP Server
 
 ```json
@@ -1140,6 +1157,16 @@ discount (a perfectly valid trigger payload by itself) produced a negative charg
 unvalidated node "successfully" charged — an unnoticed refund, not a visible failure. The validated
 version of the same node blocked it with `"Validation failed: amount must be >= 0.01"` before any
 charge logic ran.
+
+**`examples/mcp-job-queue` design detail (2026-07):** not a bug — `core/mcp.js`'s `tools/call`
+deliberately replaces any *thrown* tool-handler error with a generic, internals-hiding message,
+logging the real reason server-side only, confirmed by reading the code. Worth documenting because
+it shapes how a tool should be written: `job_status`'s "job not found" is an expected, actionable
+outcome, not a server fault, so it's designed to return `{ found: false }` as ordinary data instead
+of throwing — the agent gets a real, useful answer instead of an opaque failure. A genuinely
+missing required argument is a different path entirely (`tools/call`'s own `inputSchema`
+validation, checked before the handler runs) and does come back with the real, specific reason —
+verified live: `"Invalid arguments: jobId is required"`.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
