@@ -497,6 +497,28 @@ concurrent jobs each land their own correct, isolated result. Run with
 `bun examples/a2e-background/setup.js`; regression test in
 `tests/examples-a2e-background.test.js`.
 
+`examples/agent-memory-hnsw/` — combines `core/memory.js`'s `AgentMemory`
+with `core/hnsw.js`'s standalone `HNSWIndex`: real memory content indexed
+into both, comparing 3 recall strategies as memory scales (keyword, HNSW
+approximate, brute-force exact) — same benchmark methodology as
+`examples/large-catalog-search`, applied to real agent memory instead of
+a synthetic catalog. Found and fixed a real, SEVERE core bug: HNSW's
+neighbor selection used the naive "M closest by raw distance" heuristic
+— with duplicate/near-duplicate vectors (common in real memory content,
+unlike `large-catalog-search`'s catalog which embeds a unique index
+number per product avoiding this), recall vs. a brute-force exact scan
+collapsed from 1.0 to 0.0 with just 2x exact duplication, verified live.
+Fixed via Plan Mode approval (algorithmic change) implementing the
+original HNSW paper's diversity-aware neighbor selection; verified live:
+2x duplication recovered to 0.8-1.0 recall, ~9x (the real 5000-entry demo
+scale) recovered to 0.6 with the top result now exactly matching the
+true best (previously it found a measurably worse cluster entirely). The
+pre-existing `hnsw.test.js` recall test improved to 1.000 with the fix.
+Measured: HNSW is ~7.4x faster than the brute-force exact scan and ~60x
+faster than `memory.js`'s own keyword recall over 5000 entries. Run with
+`bun examples/agent-memory-hnsw/setup.js`; regression test in
+`tests/examples-agent-memory-hnsw.test.js`.
+
 ## MCP Server
 
 ```json
@@ -931,6 +953,23 @@ regression tests using throwing handlers. Also found (not a core bug, handled at
 level): a single `WorkflowExecutor` instance is unsafe for concurrent `execute()` calls —
 verified live that two concurrent runs sharing one instance corrupt each other's results;
 fixed by constructing a fresh executor per job.
+
+**`core/hnsw.js` found while building `examples/agent-memory-hnsw` (2026-07):** real, severe
+core bug. `_selectNeighbors`/`_pruneNeighbors` used the naive "M closest by raw distance"
+heuristic — a well-documented HNSW weak point: with many duplicate/near-duplicate vectors
+(common in real memory content), they monopolize every neighbor slot around them, fragmenting
+the graph. Verified live with a controlled A/B: recall vs. a brute-force exact scan collapsed
+from `1.0` (no duplication) to `0.0` with just 2x exact-duplicate vectors, and stayed at `0.0`
+at ~9x duplication (5000 entries) — a near-total collapse, not gradual degradation.
+`examples/large-catalog-search` never hit this because its synthetic catalog embeds a unique
+index number inside every product's text, avoiding exact duplicates by construction. Fixed with
+explicit approval via Plan Mode (algorithmic change) implementing the original HNSW paper's
+diversity-aware neighbor selection (`SELECT-NEIGHBORS-HEURISTIC`) — a candidate is only kept if
+it's closer to the query than to every already-selected neighbor. Verified live: 2x duplication
+recovered to `0.8-1.0` recall, ~9x recovered to `0.6` with the top result now exactly matching
+the true best score (previously it found a measurably worse cluster entirely). The pre-existing
+`hnsw.test.js` recall test (threshold ≥0.7) improved to `1.000` with the fix — it only helps the
+non-duplicate case too.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

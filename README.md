@@ -29,7 +29,7 @@ No `npm install`. Zero dependencies.
 |--------|-------------|
 | **db.js** | Document DB: MongoDB queries, 26 operators, indices, JWT auth, AES-256-GCM encryption, proxy access, watch |
 | **vector.js** | Vector DB: Float32/Int8/Polar/Binary quantization, IVF, Matryoshka, BM25, hybrid search |
-| **hnsw.js** | HNSW index: O(log n) approximate nearest neighbor search |
+| **hnsw.js** | HNSW index: O(log n) approximate nearest neighbor search (see [`examples/large-catalog-search`](examples/large-catalog-search/), [`examples/agent-memory-hnsw`](examples/agent-memory-hnsw/)) |
 | **http.js** | HTTP router: Web Standard Request/Response, middleware chain, params, sub-routers, CORS |
 | **validate.js** | Schema validation: types, formats, defaults (replaces Zod) |
 | **cms.js** | CMS: content types, entries, taxonomies, terms, users, roles, autosave |
@@ -451,13 +451,35 @@ background run completes correctly, and 3 **concurrent** jobs each land
 their own correct, isolated result. Run with
 `bun examples/a2e-background/setup.js`.
 
+**[`examples/agent-memory-hnsw/`](examples/agent-memory-hnsw/)** —
+combines `core/memory.js`'s `AgentMemory` with `core/hnsw.js`'s
+standalone `HNSWIndex`: real memory content indexed into both, comparing
+3 recall strategies as memory scales (keyword, HNSW approximate,
+brute-force exact) — same benchmark methodology as
+`examples/large-catalog-search`, applied to real agent memory instead of
+a synthetic catalog. Found and fixed a real, **severe core bug**: HNSW's
+neighbor selection used the naive "M closest by raw distance" heuristic
+— with duplicate/near-duplicate vectors (common in real memory content,
+unlike `large-catalog-search`'s catalog which embeds a unique index
+number per product avoiding this), recall vs. a brute-force exact scan
+**collapsed from 1.0 to 0.0** with just 2x exact duplication, verified
+live. Fixed via Plan Mode approval (algorithmic change) implementing the
+original HNSW paper's diversity-aware neighbor selection; verified live:
+2x duplication recovered to 0.8-1.0 recall, ~9x (the real 5000-entry demo
+scale) recovered to 0.6 with the top result now exactly matching the
+true best (previously it found a measurably worse cluster entirely). The
+pre-existing `hnsw.test.js` recall test improved to 1.000 with the fix.
+Measured: HNSW is ~7.4x faster than the brute-force exact scan and ~60x
+faster than `memory.js`'s own keyword recall over 5000 entries. Run with
+`bun examples/agent-memory-hnsw/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 834 tests across 48 files, ~26 seconds
+bun test tests/    # 840 tests across 49 files, ~27 seconds
 ```
 
-48 test files covering all core modules plus the `examples/content-pipeline`,
+49 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -467,8 +489,8 @@ bun test tests/    # 834 tests across 48 files, ~26 seconds
 `examples/mcp-cms`, `examples/api-gateway`, `examples/resilient-notify`,
 `examples/shell-mcp`, `examples/trigger-hub`, `examples/mcp-workflows`,
 `examples/plugin-workflow-nodes`, `examples/hybrid-recall`,
-`examples/poll-to-queue`, `examples/a2e-vault-api`, and
-`examples/a2e-background`
+`examples/poll-to-queue`, `examples/a2e-vault-api`,
+`examples/a2e-background`, and `examples/agent-memory-hnsw`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -509,6 +531,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`examples/poll-to-queue` bridge-logic gotcha)**: not a core bug — `TriggerManager`'s poll never firing `onTrigger` on its first cycle (it only establishes the baseline hash) is documented, intentional behavior. But it's a real footgun for exactly the pattern this example builds: without an explicit baseline fetch before the poll trigger starts, the first real fire would hand the whole current item list to a fresh, empty `seenIds` set, making every pre-existing feed item look "new" and get (re)enqueued. Verified live, then fixed entirely in the example's own bridge logic (`hub.js`) by seeding `seenIds` from an initial fetch first — same cursor philosophy `examples/scheduled-sync` already uses for outbound sync, applied here to inbound polling.
 - **2026-07 (`a2e.js` found while building `examples/a2e-vault-api`)**: not a core bug — existing, documented behavior of `execute()`'s DAG-level dispatch. But a real, verified footgun: when a custom operation handler throws, `execute()` does **not** stop subsequent DAG levels (unlike `workflow.js`'s `execute()`, which does unless `continueOnError`). The failed op's default `outputPath` never gets written, so a downstream `Conditional` reading it silently resolves to `undefined` — which evaluated to `false` and routed a failed API lookup into the exact same branch as a genuine negative result, indistinguishable without inspecting `errors`. Verified live before and after; fixed entirely at the example level (not core) using `onError`, an existing `a2e.js` mechanism, to write an explicit failure marker instead of leaving the state undefined. Also documented: `WorkflowExecutor.execute()` takes no per-call input at all, unlike `workflow.js`'s `execute(id, triggerData)`.
 - **2026-07 (`a2e.js` found while building `examples/a2e-background`)**: real core bug, same class as the earlier `Conditional`-runs-both-branches fix (that fix's own plan explicitly flagged this Loop case as a known, deliberately-deferred limitation). A `Loop`'s sub-operations were dispatched **twice**: once spuriously at the top level (`state.loop === {}`, before the loop even starts — `buildDAG()` models no dependency edge for Loop sub-ops, unlike it does for `Conditional` branches), once correctly per iteration. Every prior `Loop` test used a handler that silently tolerates garbage input, so this went undetected — surfaced by a realistic handler that throws on unexpected input, verified live: called 3 times for a 2-item loop, not 2. Fixed with your explicit approval via Plan Mode (touches `execute()`'s core dispatch logic) with `loopSubOperationTargets()`, mirroring `conditionalBranchTargets()` exactly; hand-traced against all 4 pre-existing `Loop` tests (none broke) and covered by 3 new regression tests using throwing handlers. Also found (not a core bug, handled at the example level): a single `WorkflowExecutor` instance is unsafe for concurrent `execute()` calls — verified live that two concurrent runs sharing one instance corrupt each other's results; fixed by constructing a fresh executor per job.
+- **2026-07 (`hnsw.js` found while building `examples/agent-memory-hnsw`)**: real, severe core bug. `_selectNeighbors`/`_pruneNeighbors` used the naive "M closest by raw distance" heuristic — a well-documented HNSW weak point: with many duplicate/near-duplicate vectors (common in real memory content), they monopolize every neighbor slot around them, fragmenting the graph. Verified live with a controlled A/B: recall vs. a brute-force exact scan collapsed from `1.0` (no duplication) to `0.0` with just 2x exact-duplicate vectors, and stayed at `0.0` at ~9x duplication (5000 entries) — a near-total collapse, not gradual degradation. `examples/large-catalog-search` never hit this because its synthetic catalog embeds a unique index number inside every product's text, avoiding exact duplicates by construction. Fixed with your explicit approval via Plan Mode (algorithmic change) implementing the original HNSW paper's diversity-aware neighbor selection (`SELECT-NEIGHBORS-HEURISTIC`) — a candidate is only kept if it's closer to the query than to every already-selected neighbor. Verified live: 2x duplication recovered to `0.8-1.0` recall, ~9x recovered to `0.6` with the top result now exactly matching the true best score (previously it found a measurably worse cluster entirely). The pre-existing `hnsw.test.js` recall test (threshold ≥0.7) improved to `1.000` with the fix — it only helps the non-duplicate case too.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
