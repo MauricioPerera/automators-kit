@@ -475,6 +475,28 @@ the same path as a genuine standard-tier lead until an explicit
 before and after. Run with `bun examples/a2e-vault-api/setup.js`;
 regression test in `tests/examples-a2e-vault-api.test.js`.
 
+`examples/a2e-background/` — combines `core/queue.js`'s kick-off + poll
+pattern with `core/a2e.js`'s declarative executor: a batch enrichment
+pipeline runs as a durable background job instead of blocking the HTTP
+request — neither `examples/job-queue` nor `examples/a2e-pipeline`
+demonstrates this. Found and fixed a real, serious core bug, same class
+as the earlier `Conditional` both-branches bug (its own fix plan
+explicitly flagged this Loop case as deferred): a `Loop`'s
+sub-operations were dispatched TWICE — once spuriously at the top level
+(`state.loop === {}`, before the loop even starts), once correctly per
+iteration. Every prior `Loop` test tolerated garbage input silently, so
+this was invisible until a realistic handler threw on it (verified live:
+called 3 times for a 2-item loop, not 2). Fixed via Plan Mode approval
+with `loopSubOperationTargets()`, mirroring `conditionalBranchTargets()`
+exactly. Also found and handled (at the example level, not core) that a
+single `WorkflowExecutor` instance is unsafe for concurrent `execute()`
+calls — verified live that two concurrent runs sharing one instance
+corrupt each other's results; fixed by constructing a fresh executor per
+job. Verified live: a single background run completes correctly, and 3
+concurrent jobs each land their own correct, isolated result. Run with
+`bun examples/a2e-background/setup.js`; regression test in
+`tests/examples-a2e-background.test.js`.
+
 ## MCP Server
 
 ```json
@@ -893,6 +915,22 @@ before and after; fixed entirely at the example level (not core) using `onError`
 `a2e.js` mechanism, to write an explicit failure marker instead of leaving the state undefined.
 Also documented: `WorkflowExecutor.execute()` takes no per-call input at all, unlike
 `workflow.js`'s `execute(id, triggerData)`.
+
+**`core/a2e.js` found while building `examples/a2e-background` (2026-07):** real core bug, same
+class as the earlier `Conditional`-runs-both-branches fix (that fix's own plan explicitly
+flagged this Loop case as a known, deliberately-deferred limitation). A `Loop`'s
+sub-operations were dispatched TWICE: once spuriously at the top level (`state.loop === {}`,
+before the loop even starts — `buildDAG()` models no dependency edge for Loop sub-ops, unlike
+it does for `Conditional` branches), once correctly per iteration. Every prior `Loop` test used
+a handler that silently tolerates garbage input, so this went undetected — surfaced by a
+realistic handler that throws on unexpected input, verified live: called 3 times for a 2-item
+loop, not 2. Fixed with explicit approval via Plan Mode (touches `execute()`'s core dispatch
+logic) with `loopSubOperationTargets()`, mirroring `conditionalBranchTargets()` exactly;
+hand-traced against all 4 pre-existing `Loop` tests (none broke) and covered by 3 new
+regression tests using throwing handlers. Also found (not a core bug, handled at the example
+level): a single `WorkflowExecutor` instance is unsafe for concurrent `execute()` calls —
+verified live that two concurrent runs sharing one instance corrupt each other's results;
+fixed by constructing a fresh executor per job.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

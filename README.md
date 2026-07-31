@@ -429,13 +429,35 @@ into the same path as a genuine standard-tier lead until an explicit
 `onError` fallback made the failure state distinguishable, verified live
 before and after. Run with `bun examples/a2e-vault-api/setup.js`.
 
+**[`examples/a2e-background/`](examples/a2e-background/)** — combines
+`core/queue.js`'s kick-off + poll pattern with `core/a2e.js`'s declarative
+executor: a batch enrichment pipeline runs as a durable background job
+instead of blocking the HTTP request — neither `examples/job-queue` nor
+`examples/a2e-pipeline` demonstrates this. Found and fixed a real,
+serious **core bug**, same class as the earlier `Conditional`
+both-branches bug (its own fix plan had explicitly flagged this Loop case
+as deferred): a `Loop`'s sub-operations were dispatched **twice** — once
+spuriously at the top level (`state.loop === {}`, before the loop even
+starts), once correctly per iteration. Every prior `Loop` test tolerated
+garbage input silently, so this was invisible until a realistic handler
+threw on it (verified live: called 3 times for a 2-item loop, not 2).
+Fixed via Plan Mode approval with `loopSubOperationTargets()`, mirroring
+the existing `conditionalBranchTargets()` exactly. Also found and handled
+(at the example level, not core) that a single `WorkflowExecutor`
+instance is unsafe for concurrent `execute()` calls — verified live that
+two concurrent runs sharing one instance corrupt each other's results;
+fixed by constructing a fresh executor per job. Verified live: a single
+background run completes correctly, and 3 **concurrent** jobs each land
+their own correct, isolated result. Run with
+`bun examples/a2e-background/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 829 tests across 47 files, ~26 seconds
+bun test tests/    # 834 tests across 48 files, ~26 seconds
 ```
 
-47 test files covering all core modules plus the `examples/content-pipeline`,
+48 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -445,7 +467,8 @@ bun test tests/    # 829 tests across 47 files, ~26 seconds
 `examples/mcp-cms`, `examples/api-gateway`, `examples/resilient-notify`,
 `examples/shell-mcp`, `examples/trigger-hub`, `examples/mcp-workflows`,
 `examples/plugin-workflow-nodes`, `examples/hybrid-recall`,
-`examples/poll-to-queue`, and `examples/a2e-vault-api`
+`examples/poll-to-queue`, `examples/a2e-vault-api`, and
+`examples/a2e-background`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -485,6 +508,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`examples/hybrid-recall` premise correction)**: not a core bug — a caught-before-shipping flaw in this example's own original design. The plan was "keyword recall first, vector search as a semantic fallback for paraphrases." Verified empirically *before writing the example*: the offline hashing-trick embedding shared with `examples/vector-memory` has no synonym understanding, and a genuine paraphrase query ranked an unrelated stored doc above the real match. Rebuilt around the honestly-verified value instead — `memory.recall()` hard-empties on zero shared vocabulary, `vector.search()` never does — coverage, not intelligence. A first-pass `lowConfidence` threshold (0.3) was also verified live to mislabel a clearly unrelated query as confident (score 0.429); corrected to 0.5 against a 10-query empirical sample and documented as approximate, not a statistical guarantee.
 - **2026-07 (`examples/poll-to-queue` bridge-logic gotcha)**: not a core bug — `TriggerManager`'s poll never firing `onTrigger` on its first cycle (it only establishes the baseline hash) is documented, intentional behavior. But it's a real footgun for exactly the pattern this example builds: without an explicit baseline fetch before the poll trigger starts, the first real fire would hand the whole current item list to a fresh, empty `seenIds` set, making every pre-existing feed item look "new" and get (re)enqueued. Verified live, then fixed entirely in the example's own bridge logic (`hub.js`) by seeding `seenIds` from an initial fetch first — same cursor philosophy `examples/scheduled-sync` already uses for outbound sync, applied here to inbound polling.
 - **2026-07 (`a2e.js` found while building `examples/a2e-vault-api`)**: not a core bug — existing, documented behavior of `execute()`'s DAG-level dispatch. But a real, verified footgun: when a custom operation handler throws, `execute()` does **not** stop subsequent DAG levels (unlike `workflow.js`'s `execute()`, which does unless `continueOnError`). The failed op's default `outputPath` never gets written, so a downstream `Conditional` reading it silently resolves to `undefined` — which evaluated to `false` and routed a failed API lookup into the exact same branch as a genuine negative result, indistinguishable without inspecting `errors`. Verified live before and after; fixed entirely at the example level (not core) using `onError`, an existing `a2e.js` mechanism, to write an explicit failure marker instead of leaving the state undefined. Also documented: `WorkflowExecutor.execute()` takes no per-call input at all, unlike `workflow.js`'s `execute(id, triggerData)`.
+- **2026-07 (`a2e.js` found while building `examples/a2e-background`)**: real core bug, same class as the earlier `Conditional`-runs-both-branches fix (that fix's own plan explicitly flagged this Loop case as a known, deliberately-deferred limitation). A `Loop`'s sub-operations were dispatched **twice**: once spuriously at the top level (`state.loop === {}`, before the loop even starts — `buildDAG()` models no dependency edge for Loop sub-ops, unlike it does for `Conditional` branches), once correctly per iteration. Every prior `Loop` test used a handler that silently tolerates garbage input, so this went undetected — surfaced by a realistic handler that throws on unexpected input, verified live: called 3 times for a 2-item loop, not 2. Fixed with your explicit approval via Plan Mode (touches `execute()`'s core dispatch logic) with `loopSubOperationTargets()`, mirroring `conditionalBranchTargets()` exactly; hand-traced against all 4 pre-existing `Loop` tests (none broke) and covered by 3 new regression tests using throwing handlers. Also found (not a core bug, handled at the example level): a single `WorkflowExecutor` instance is unsafe for concurrent `execute()` calls — verified live that two concurrent runs sharing one instance corrupt each other's results; fixed by constructing a fresh executor per job.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
