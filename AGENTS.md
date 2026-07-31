@@ -662,6 +662,23 @@ sessions, confirming RBAC lives in which `Shell` a caller is routed to,
 not in the data. Run with `bun examples/queue-access-control/setup.js`;
 regression test in `tests/examples-queue-access-control.test.js`.
 
+`examples/vault-access-control/` — combines `core/shell.js`'s RBAC with
+`core/credentials.js`: 3 agent sessions (admin / reader / a custom
+"integration-runner" permission set) share one `CredentialVault`, gated
+differently — a more security-sensitive extension of
+`examples/queue-access-control`'s same pattern, applied to secrets
+instead of jobs. `core/credentials.js` has no notion of a caller at all;
+`vault.get(name)` returns the fully decrypted secret to any code holding
+a reference. `vault:reveal` (the only command that ever returns a
+decrypted value) is admin-only by construction — its verb matches no
+built-in profile's wildcard set. Verified live: `integration-runner` can
+`vault:use` a credential (decrypted server-side to confirm it's usable)
+with zero secret material in the response, while `reveal`/`store`/
+`remove` stay denied; `reader` sees safe metadata via `vault:list` with
+no custom grant needed, since `vault.list()` itself never includes
+decrypted values. Run with `bun examples/vault-access-control/setup.js`;
+regression test in `tests/examples-vault-access-control.test.js`.
+
 ## MCP Server
 
 ```json
@@ -1193,6 +1210,17 @@ happen to include `stats` — verified live, even `reader` gets `Permission deni
 cover it either. No built-in profile expresses "can enqueue and monitor this one namespace, but not
 its destructive ops" — this example builds an explicit custom `permissions` array for that role
 instead, exactly the override `core/shell.js` documents `profile` as losing to.
+
+**`examples/vault-access-control` design detail (2026-07):** not a bug — `core/credentials.js`
+never claimed to enforce access control; `vault.get(name)` returning the fully decrypted secret to
+any code holding a reference is documented, intentional behavior, and `list()` withholding
+decrypted values is a return-shape choice, not access control. Worth documenting because it's
+genuinely security-relevant: every guarantee this example makes (an `integration-runner` role can
+*use* a secret via `vault:use` but never see it) is enforced entirely by which `Shell` instance a
+caller is routed to and which verbs its permission list happens to cover. Verified live: `vault:use`'s
+response never contains the raw secret string even though it decrypted the credential server-side
+to confirm it's usable; `vault:reveal` (admin-only by construction) is the only command that ever
+returns one.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

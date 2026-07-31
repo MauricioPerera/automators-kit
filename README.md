@@ -610,13 +610,30 @@ monitor, no destructive ops"); admin's `purge` removes jobs enqueued by
 routed to, not in the data. Run with
 `bun examples/queue-access-control/setup.js`.
 
+**[`examples/vault-access-control/`](examples/vault-access-control/)** —
+combines `core/shell.js`'s RBAC with `core/credentials.js`: 3 agent
+sessions (admin / reader / a custom "integration-runner" permission set)
+share one `CredentialVault`, gated differently — a more
+security-sensitive extension of `examples/queue-access-control`'s same
+pattern, applied to secrets instead of jobs. `core/credentials.js` has
+no notion of a caller at all; `vault.get(name)` returns the fully
+decrypted secret to any code holding a reference. `vault:reveal` (the
+only command that ever returns a decrypted value) is admin-only *by
+construction* — its verb matches no built-in profile's wildcard set.
+Verified live: `integration-runner` can `vault:use` a credential
+(decrypted server-side to confirm it's usable) with **zero secret
+material** in the response, while `reveal`/`store`/`remove` stay denied;
+`reader` sees safe metadata via `vault:list` with no custom grant
+needed, since `vault.list()` itself never includes decrypted values. Run
+with `bun examples/vault-access-control/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 877 tests across 57 files, ~29 seconds
+bun test tests/    # 881 tests across 58 files, ~29 seconds
 ```
 
-57 test files covering all core modules plus the `examples/content-pipeline`,
+58 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -631,7 +648,8 @@ bun test tests/    # 877 tests across 57 files, ~29 seconds
 `examples/validated-webhooks`, `examples/content-render-workflow`,
 `examples/hybrid-catalog-search`, `examples/rate-limited-queue`, and
 `examples/cms-semantic-search`, `examples/validated-workflow-nodes`, and
-`examples/mcp-job-queue`, and `examples/queue-access-control`
+`examples/mcp-job-queue`, `examples/queue-access-control`, and
+`examples/vault-access-control`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -681,6 +699,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`examples/validated-workflow-nodes` finding)**: not a core bug — `core/nodes.js`'s `inputs` array was never meant to be enforced, it's documentation for ARDF export, and `NodeRegistry.execute()` calling the handler directly with no check is existing, correct behavior. But a real, worth-knowing consequence, verified live: without a `core/validate.js` schema gating the node, a naive handler doesn't crash on bad data — it silently proceeds with it. A `>100%` discount (a perfectly valid trigger payload by itself) produced a negative charge amount that an unvalidated node "successfully" charged — an unnoticed refund, not a visible failure. The validated version of the same node blocked it with `"Validation failed: amount must be >= 0.01"` before any charge logic ran.
 - **2026-07 (`examples/mcp-job-queue` design detail)**: not a bug — `core/mcp.js`'s `tools/call` deliberately replaces any *thrown* tool-handler error with a generic, internals-hiding message, logging the real reason server-side only, confirmed by reading the code. Worth documenting because it shapes how a tool should be written: `job_status`'s "job not found" is an expected, actionable outcome, not a server fault, so it's designed to **return** `{ found: false }` as ordinary data instead of throwing — the agent gets a real, useful answer instead of an opaque failure. A genuinely missing required argument is a different path entirely (`tools/call`'s own `inputSchema` validation, checked before the handler runs) and does come back with the real, specific reason — verified live: `"Invalid arguments: jobId is required"`.
 - **2026-07 (`examples/queue-access-control` design detail)**: not a bug — `core/queue.js` never claimed to have any notion of a caller, and `core/shell.js`'s built-in `AGENT_PROFILES` are generic on purpose. Worth documenting because it matters specifically for this combination: `AGENT_PROFILES.reader`'s wildcard verbs (`list`/`get`/`search`/`describe`/`count`/`status`) don't happen to include `stats` — verified live, even `reader` gets `Permission denied` for `queue:stats`, and `operator`'s wildcards (`list`/`get`/`create`/`update`/`delete`/`run`) don't cover it either. No built-in profile expresses "can enqueue and monitor this one namespace, but not its destructive ops" — this example builds an explicit custom `permissions` array for that role instead, exactly the override `core/shell.js` documents `profile` as losing to.
+- **2026-07 (`examples/vault-access-control` design detail)**: not a bug — `core/credentials.js` never claimed to enforce access control; `vault.get(name)` returning the fully decrypted secret to any code holding a reference is documented, intentional behavior, and `list()` withholding decrypted values is a return-shape choice, not access control. Worth documenting because it's genuinely security-relevant: every guarantee this example makes (an `integration-runner` role can *use* a secret via `vault:use` but never see it) is enforced entirely by which `Shell` instance a caller is routed to and which verbs its permission list happens to cover. Verified live: `vault:use`'s response never contains the raw secret string even though it decrypted the credential server-side to confirm it's usable; `vault:reveal` (admin-only by construction) is the only command that ever returns one.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
