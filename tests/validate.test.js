@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { validate, createValidator } from '../core/validate.js';
+import { validate, createValidator, isValidSemver } from '../core/validate.js';
 
 describe('validate', () => {
   it('validates required string', () => {
@@ -36,6 +36,14 @@ describe('validate', () => {
     const schema = { slug: { type: 'string', format: 'slug' } };
     expect(validate(schema, { slug: 'hello-world' }).valid).toBe(true);
     expect(validate(schema, { slug: 'Hello World!' }).valid).toBe(false);
+  });
+
+  it('validates semver format', () => {
+    const schema = { version: { type: 'string', format: 'semver' } };
+    expect(validate(schema, { version: '1.2.3' }).valid).toBe(true);
+    expect(validate(schema, { version: '1.0.0-beta+exp.sha.5114f85' }).valid).toBe(true);
+    expect(validate(schema, { version: '1.2' }).valid).toBe(false);
+    expect(validate(schema, { version: 'v1.2.3' }).valid).toBe(false);
   });
 
   it('validates enum', () => {
@@ -155,5 +163,26 @@ describe('validate', () => {
     expect(Object.prototype.polluted).toBeUndefined();
     // declared field still works
     expect(result.data.name).toBe('Alice');
+  });
+});
+
+describe('isValidSemver', () => {
+  it('accepts major.minor.patch, with optional prerelease/build metadata', () => {
+    expect(isValidSemver('1.2.3')).toBe(true);
+    expect(isValidSemver('0.0.0')).toBe(true);
+    expect(isValidSemver('1.0.0-alpha.1')).toBe(true);
+    expect(isValidSemver('1.0.0+20130313144700')).toBe(true);
+  });
+
+  it('rejects a missing component or a leading zero', () => {
+    expect(isValidSemver('1.2')).toBe(false);
+    expect(isValidSemver('01.2.3')).toBe(false);
+    expect(isValidSemver('1.02.3')).toBe(false);
+  });
+
+  it('rejects non-string input without throwing', () => {
+    expect(isValidSemver(123)).toBe(false);
+    expect(isValidSemver(null)).toBe(false);
+    expect(isValidSemver(undefined)).toBe(false);
   });
 });
