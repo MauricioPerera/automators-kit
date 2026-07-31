@@ -6,8 +6,3 @@ data/
 .DS_Store
 .claude/
 coverage/
-
-# KDD (Knowledge-Driven Development) tooling
-*.gate.md
-.agents/logs/
-scripts/__pycache__/
