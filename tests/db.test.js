@@ -461,6 +461,40 @@ describe('Auth', () => {
     auth.removeRole(user._id, 'admin');
     expect(auth.hasRole(user._id, 'admin')).toBe(false);
   });
+
+  it('a second Auth.init() against already-persisted data does not throw, and logs only the message (not the whole Error) when an index already exists', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'auth-restart-'));
+    try {
+      const db1 = new DocStore(new FileStorageAdapter(dir));
+      const auth1 = new Auth(db1, { secret: 'test-secret-key-32chars!!!!!!!!!' });
+      await auth1.init();
+      await auth1.register('restart@test.com', 'pass1234567');
+      db1.flush();
+
+      const errors = [];
+      const originalError = console.error;
+      console.error = (...args) => errors.push(args);
+      try {
+        const db2 = new DocStore(new FileStorageAdapter(dir));
+        const auth2 = new Auth(db2, { secret: 'test-secret-key-32chars!!!!!!!!!' });
+        await expect(auth2.init()).resolves.toBeUndefined();
+      } finally {
+        console.error = originalError;
+      }
+
+      // _ensureLoaded() already restored the persisted indexes, so all 3
+      // createIndex() calls throw "already exists" and get caught -- each
+      // logged call's error argument must be the message string, not the
+      // raw Error object (which Bun renders with a full stack trace).
+      expect(errors.length).toBe(3);
+      for (const [, errArg] of errors) {
+        expect(typeof errArg).toBe('string');
+        expect(errArg).toContain('Index already exists');
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

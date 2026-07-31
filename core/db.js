@@ -2065,13 +2065,18 @@ class Auth {
     this._users = this.db.collection(this.usersCol);
     this._sessions = this.db.collection(this.sessionsCol);
 
-    // Indices
+    // Indices. createIndex() throws "Index already exists" on a restart
+    // against already-persisted data (the index was already restored from
+    // disk by _ensureLoaded() before this runs) -- an expected, harmless
+    // case, not a real failure, so only the message is logged, not the
+    // whole Error (which on Bun prints a full stack trace + source
+    // snippet, reading like a crash on every normal restart).
     try { this._users.createIndex('email', { unique: true }); }
-    catch (err) { console.error('Auth.init: email index failed:', err); }
+    catch (err) { console.error('Auth.init: email index failed:', err.message); }
     try { this._sessions.createIndex('token'); }
-    catch (err) { console.error('Auth.init: token index failed:', err); }
+    catch (err) { console.error('Auth.init: token index failed:', err.message); }
     try { this._sessions.createIndex('userId'); }
-    catch (err) { console.error('Auth.init: userId index failed:', err); }
+    catch (err) { console.error('Auth.init: userId index failed:', err.message); }
 
     // Auto-cleanup expired sessions every hour
     this.cleanExpiredSessions();
