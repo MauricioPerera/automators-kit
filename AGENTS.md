@@ -519,6 +519,41 @@ faster than `memory.js`'s own keyword recall over 5000 entries. Run with
 `bun examples/agent-memory-hnsw/setup.js`; regression test in
 `tests/examples-agent-memory-hnsw.test.js`.
 
+`examples/validated-webhooks/` — combines `core/validate.js`'s real
+schema engine with `core/workflow.js`'s webhook trigger: a malformed
+payload is rejected with a clear 400 BEFORE the workflow ever runs,
+instead of a partial/garbage execution. Found a real architectural
+gotcha, verified live: `createApp()` always mounts its own bundled
+`/api/workflows` router with an UNVALIDATED webhook route at
+`/api/workflows/webhook/:path`, unconditionally — bolting a validated
+route on top while using `createApp()` would leave that route reachable,
+bypassing validation entirely. Confirmed with a throwaway script: a
+garbage payload the validated route rejects with 400 sailed through the
+built-in route with a real 200, actually executing the workflow. This
+example does NOT call `createApp()` at all (same à la carte spirit as
+`examples/doc-store-analytics`) specifically so the validated route is
+the only webhook route that exists. Run with
+`bun examples/validated-webhooks/setup.js`; regression test in
+`tests/examples-validated-webhooks.test.js`.
+
+`examples/content-render-workflow/` — combines `core/portable-text.js`
+with `core/workflow.js`: "author in markdown, a webhook-triggered
+workflow renders and distributes it." A real custom node
+(`content.render`, registered via `WorkflowEngine.nodes.add()` — the same
+extension point `examples/plugin-workflow-nodes` already uses, no core
+changes needed) parses markdown once and derives HTML, plain text, and
+word count from the same parsed blocks; a downstream built-in
+`set.value` node correctly interpolates the custom node's outputs via
+`workflow.js`'s own `{{ref}}` templating. Found and documented a real,
+honest caveat, verified live end-to-end: `toHTML()` escapes an inline
+`<script>` tag (the 2026-07 audit's XSS fix, confirmed still intact), but
+`toPlainText()`/`excerpt` correctly does NOT — a real consequence for
+this specific combination: a future step embedding `{{render.excerpt}}`
+into an HTML context without escaping it itself would reopen the exact
+XSS surface the audit closed for `toHTML()`. Run with
+`bun examples/content-render-workflow/setup.js`; regression test in
+`tests/examples-content-render-workflow.test.js`.
+
 ## MCP Server
 
 ```json
@@ -970,6 +1005,24 @@ recovered to `0.8-1.0` recall, ~9x recovered to `0.6` with the top result now ex
 the true best score (previously it found a measurably worse cluster entirely). The pre-existing
 `hnsw.test.js` recall test (threshold ≥0.7) improved to `1.000` with the fix — it only helps the
 non-duplicate case too.
+
+**`examples/validated-webhooks` architectural finding (2026-07):** not a core bug —
+`createApp()`'s bundled `/api/workflows` webhook route working as designed, with no validation
+of its own, is documented, intentional behavior. But a real gotcha, verified live with a
+throwaway script: bolting a schema-validated route on top while still using `createApp()` leaves
+the original, unvalidated route fully reachable and bypasses validation entirely — a garbage
+payload the validated route rejects with `400` sailed through the built-in route with a real
+`200`, actually executing the workflow. Handled by not calling `createApp()` at all for this
+example (same à la carte spirit as `examples/doc-store-analytics`), so the validated route is the
+only webhook route that exists.
+
+**`examples/content-render-workflow` caveat (2026-07):** not a bug — `toHTML()` still escapes
+correctly (confirmed intact), and `toPlainText()` correctly does NOT HTML-escape, since it's
+plain text. But verified live through a real workflow: a downstream node that interpolates
+`{{render.excerpt}}` (derived from `toPlainText()`) carries an inline `<script>` tag through
+completely unescaped — a real consequence worth knowing for this specific combination, since
+embedding that value into an HTML context downstream (an HTML email, a rendered page) without
+escaping it yourself would reopen the exact XSS surface the 2026-07 audit closed for `toHTML()`.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
