@@ -104,3 +104,28 @@ describe('Scheduled sync: failure stops the cursor, does not skip', () => {
     expect(received.at(-1).title).toBe('Record D');
   });
 });
+
+describe('Scheduled sync: cursor ties on updatedAt do not silently drop an entry', () => {
+  // Root cause of a real, previously-undetected flake (found while running
+  // the suite far more times than the standard "twice" check, hunting a
+  // different issue): the cursor used to be a bare updatedAt timestamp,
+  // compared with `>`. A newly-published entry that happens to land in the
+  // SAME millisecond as the cursor's own value (common at in-memory test
+  // speed, and possible in production under real load) tied the comparison
+  // and was silently treated as "already synced" -- never sent, no error.
+  // This test forces that exact tie deterministically (not timing-dependent)
+  // by writing the persisted cursor directly, instead of hoping two real
+  // Date.now() calls collide.
+  it('an entry whose updatedAt exactly equals the persisted cursor is still synced', async () => {
+    const entry = await publishEntry('Record E (tie test)');
+    const stateCol = app.cms.db.collection('_sync_state');
+    const doc = stateCol.findOne({ key: 'sync_cursor' });
+    // Force the persisted cursor to tie Record E's own updatedAt, with a
+    // seq below its real one -- exactly the scenario that used to drop it.
+    stateCol.update({ _id: doc._id }, { $set: { value: entry.updatedAt, seq: 0 } });
+
+    const res = await exec('sync:run-now');
+    expect(res.data.synced).toBe(1);
+    expect(received.at(-1).title).toBe('Record E (tie test)');
+  });
+});

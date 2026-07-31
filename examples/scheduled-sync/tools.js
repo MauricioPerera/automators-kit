@@ -24,14 +24,35 @@ const CREDENTIAL_NAME = 'sync-target';
  * @param {import('../../core/db.js').Collection} stateCol - e.g. cms.db.collection('_sync_state')
  */
 export function buildSyncTools(cms, vault, stateCol) {
+  // core/db.js's generateId() is `${timestamp36}-${random6}-${seq36}` --
+  // the trailing segment is a process-wide, strictly-monotonic counter
+  // (see generateId's own `_idCounter`), unlike the timestamp or the
+  // random middle segment. Parsing it gives a real tie-breaker for
+  // same-millisecond entries; a non-standard/custom _id just degrades to
+  // 0 (never crashes, worst case that one entry can't win a tie).
+  function _seqOf(id) {
+    const n = parseInt(String(id).split('-').pop(), 36);
+    return Number.isNaN(n) ? 0 : n;
+  }
+
+  // Not yet synced past `cursor` -- newer timestamp, OR same millisecond
+  // but a higher sequence number. A scalar `updatedAt > cursor` alone
+  // silently drops an entry whenever it ties the cursor's own timestamp
+  // (common at in-memory test speed, and possible in production under
+  // real load): the entry looks "already synced" and is never sent.
+  function _isPending(entry, cursor) {
+    if (entry.updatedAt !== cursor.updatedAt) return entry.updatedAt > cursor.updatedAt;
+    return _seqOf(entry._id) > cursor.seq;
+  }
+
   function getCursor() {
     const doc = stateCol.findOne({ key: STATE_KEY });
-    return doc ? doc.value : 0;
+    return doc ? { updatedAt: doc.value, seq: doc.seq || 0 } : { updatedAt: 0, seq: 0 };
   }
-  function setCursor(value) {
+  function setCursor(updatedAt, seq) {
     const existing = stateCol.findOne({ key: STATE_KEY });
-    if (existing) stateCol.update({ _id: existing._id }, { $set: { value } });
-    else stateCol.insert({ key: STATE_KEY, value });
+    if (existing) stateCol.update({ _id: existing._id }, { $set: { value: updatedAt, seq } });
+    else stateCol.insert({ key: STATE_KEY, value: updatedAt, seq });
   }
 
   return {
@@ -60,10 +81,11 @@ export function buildSyncTools(cms, vault, stateCol) {
       // footgun (verified live: ~10% of runs synced entries out of order
       // before this fix).
       const { entries } = cms.entries.findAll({ status: 'published', limit: 100, sortBy: 'updatedAt', sortOrder: 'asc' });
-      const pending = entries.filter((e) => e.updatedAt > cursor);
+      const pending = entries.filter((e) => _isPending(e, cursor));
 
       let synced = 0;
-      let cursorAfter = cursor;
+      let cursorAfter = cursor.updatedAt;
+      let cursorSeqAfter = cursor.seq;
 
       for (const entry of pending) {
         try {
@@ -71,8 +93,9 @@ export function buildSyncTools(cms, vault, stateCol) {
           if (!res.ok) throw new Error(`sync target responded ${res.status}`);
           synced++;
           cursorAfter = entry.updatedAt;
+          cursorSeqAfter = _seqOf(entry._id);
         } catch (err) {
-          setCursor(cursorAfter);
+          setCursor(cursorAfter, cursorSeqAfter);
           return {
             synced,
             failedEntryId: entry._id,
@@ -83,15 +106,15 @@ export function buildSyncTools(cms, vault, stateCol) {
         }
       }
 
-      setCursor(cursorAfter);
+      setCursor(cursorAfter, cursorSeqAfter);
       return { synced, failedEntryId: null, remaining: 0, cursor: cursorAfter };
     },
 
     status: async () => {
       const cursor = getCursor();
       const { entries } = cms.entries.findAll({ status: 'published', limit: 100 });
-      const pending = entries.filter((e) => e.updatedAt > cursor).length;
-      return { cursor, pendingCount: pending };
+      const pending = entries.filter((e) => _isPending(e, cursor)).length;
+      return { cursor: cursor.updatedAt, pendingCount: pending };
     },
   };
 }
