@@ -960,44 +960,6 @@ system:{ready|shutdown}
 Restrict plugin access: { "capabilities": ["entries:read", "entries:write"] }
 Empty = unrestricted.
 
-## Development Methodology (KDD)
-
-As of 2026-07 this project adopted **Knowledge-Driven Development**
-(github.com/MauricioPerera/KDD) for new work going forward — the 23 existing
-`core/` modules and 37 `examples/` are NOT retrofitted with contracts; they
-stay governed by this repo's own established discipline (live-verify before
-documenting, explicit approval before touching core code). An agent adding
-NEW capability to this repo should read `.agents/AGENTS.md` (KDD's own
-agent-rules file, distinct from this file) and `knowledge/OKF-SPEC.md` before
-writing code.
-
-Vendored, verbatim: `scripts/*.py` (Python validator tooling, dev-only,
-never a runtime dependency of the shipped library — the "zero dependencies"
-identity is about the shipped `core/`, not the dev tooling), `.agents/skills/
-kdd-okf-ccdd-hybrid/`, and 4 reference OKF nodes under `knowledge/`
-(`OKF-SPEC.md`, `validacion.md`, `metodologia-ejecucion.md`,
-`rule-contract-spec.md`). Authored fresh for this project: `knowledge/index.md`
-and `knowledge/architecture/overview.md`.
-
-**The 3 layers, all verified for real before adoption** (not assumed):
-Nivel 1's 18 gates all green, including the 12 that are "capa opcional" and
-confirmed to degrade cleanly to `INFO`/exit 0 with nothing configured
-(rules, skills, changelog, UX pages, diagrams, and all 7 Capa 3 domains).
-Nivel 2 (the real CCDD gate, via the `ccdd-complexity` MCP server) verified
-on the pilot contract: `lint_task_contract` caught 3 real issues first
-(multi-verb `intent`, missing `language: javascript`, tests not passed to
-the linter), then `run_integration_gate` PASS with real measured JS
-complexity. Capa 3 stays honestly empty — no `findings.json` fabricated;
-this session's own `specs/AUDIT-01..04-*.md` manual security audits are a
-real candidate for a first `security/scan/findings.json`, not done yet.
-`.github/workflows/kdd-validate.yml` runs Nivel 1 + `bun test` on every
-push — Nivel 2 has no CI equivalent (GitHub Actions has no MCP session),
-so it stays a manual, local check per contract.
-
-Pilot task contract: [`knowledge/contracts/is-valid-semver.md`](knowledge/contracts/is-valid-semver.md)
-adds `isValidSemver()` to `core/validate.js`'s `FORMATS` registry, oracle in
-`tests/kdd-is-valid-semver.test.js`.
-
 ## Security
 
 3 full security audits to date, all findings remediated. Latest (2026-07): full-repo audit of
