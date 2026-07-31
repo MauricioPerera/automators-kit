@@ -593,16 +593,22 @@ export class WorkflowExecutor {
    * @param {Array} opts.middleware - Array of middleware objects
    */
   constructor(opts = {}) {
-    this.state = { workflow: {}, store: {}, loop: {} };
     this.operations = [];
     this.execute_root = null;
     this.middleware = opts.middleware || [];
-    this.results = {};
-    this.errors = {};
     this._customHandlers = {};
     // Max recursion depth for _executeOp (guards against cyclic Conditional /
     // onError / Loop definitions that would otherwise hang or overflow the stack).
     this.maxDepth = opts.maxDepth ?? 50;
+    // Informational snapshot of the last COMPLETED execute() call, written
+    // once at the end of execute() from its local ctx — never read or
+    // written mid-execution, so concurrent execute() calls on this instance
+    // don't race on it. Convenience for inspecting a finished run later
+    // (e.g. from a separate command); the authoritative result is always
+    // execute()'s own return value.
+    this.state = { workflow: {}, store: {}, loop: {} };
+    this.results = {};
+    this.errors = {};
   }
 
   /** Register a custom operation handler */
@@ -632,18 +638,23 @@ export class WorkflowExecutor {
 
     this.operations = parsed.operations;
     this.execute_root = parsed.execute;
-    this.state = { workflow: {}, store: {}, loop: {} };
-    this.results = {};
-    this.errors = {};
     return this;
   }
 
   /**
    * Execute the loaded workflow.
+   *
+   * State/results/errors live in a context object local to this call (not on
+   * `this`), so multiple `execute()` calls on the same instance can safely
+   * run concurrently — they no longer share mutable state. Only `load()`/
+   * `registerHandler()` mutate instance fields, and neither is safe to call
+   * while an execution is still in flight on the same instance.
+   *
    * @returns {Promise<{ state: object, results: object, errors: object }>}
    */
   async execute() {
     const executionId = Date.now().toString(36);
+    const ctx = { state: { workflow: {}, store: {}, loop: {} }, results: {}, errors: {} };
 
     // Middleware: on_execution_start
     for (const mw of this.middleware) {
@@ -665,38 +676,44 @@ export class WorkflowExecutor {
         // DAG mode: execute by levels
         for (const level of levels) {
           const toRun = level.filter(opId => !excludedTargets.has(opId));
-          await Promise.all(toRun.map(opId => this._executeOp(opId, executionId, 0)));
+          await Promise.all(toRun.map(opId => this._executeOp(opId, executionId, 0, ctx)));
         }
       } else {
         // Fallback: sequential
         for (const op of this.operations) {
           if (excludedTargets.has(op.id)) continue;
-          await this._executeOp(op.id, executionId, 0);
+          await this._executeOp(op.id, executionId, 0, ctx);
         }
       }
     } catch (err) {
-      this.errors._executor = err.message;
+      ctx.errors._executor = err.message;
     }
 
     // Middleware: on_execution_complete
     for (const mw of this.middleware) {
-      if (mw.onExecutionComplete) await mw.onExecutionComplete(executionId, this.results, this.errors);
+      if (mw.onExecutionComplete) await mw.onExecutionComplete(executionId, ctx.results, ctx.errors);
     }
 
+    // Snapshot for later inspection (see constructor comment) — written once,
+    // after this execution's own work is entirely done.
+    this.state = ctx.state;
+    this.results = ctx.results;
+    this.errors = ctx.errors;
+
     return {
-      state: this.state,
-      results: this.results,
-      errors: this.errors,
+      state: ctx.state,
+      results: ctx.results,
+      errors: ctx.errors,
     };
   }
 
   /** @private */
-  async _executeOp(opId, executionId, depth = 0) {
+  async _executeOp(opId, executionId, depth = 0, ctx) {
     // Recursion depth guard — prevents hangs / stack overflow from cyclic
     // Conditional branches, self-referencing onError, or Loops that list
     // their own opId as a sub-operation. Same error pattern as `!handler`.
     if (depth > this.maxDepth) {
-      this.errors[opId] = `Max recursion depth (${this.maxDepth}) exceeded — possible cyclic operation reference`;
+      ctx.errors[opId] = `Max recursion depth (${this.maxDepth}) exceeded — possible cyclic operation reference`;
       return;
     }
 
@@ -705,7 +722,7 @@ export class WorkflowExecutor {
 
     const handler = this._customHandlers[op.type] || HANDLERS[op.type];
     if (!handler && op.type !== 'Loop') {
-      this.errors[opId] = `Unknown operation: ${op.type}`;
+      ctx.errors[opId] = `Unknown operation: ${op.type}`;
       return;
     }
 
@@ -731,20 +748,20 @@ export class WorkflowExecutor {
         // effects (branch execution / iteration) that must not be skipped.
         result = config._cached;
       } else if (op.type === 'Loop') {
-        result = await this._executeLoop(config, depth);
+        result = await this._executeLoop(config, depth, ctx);
       } else if (op.type === 'Conditional') {
-        result = handler(config, this.state);
+        result = handler(config, ctx.state);
         // Execute branch if specified
         if (result?.executeOperationId) {
-          await this._executeOp(result.executeOperationId, executionId, depth + 1);
+          await this._executeOp(result.executeOperationId, executionId, depth + 1, ctx);
         }
       } else {
-        result = await handler(config, this.state);
+        result = await handler(config, ctx.state);
       }
 
       // Store result
-      if (config.outputPath) setPath(this.state, config.outputPath, result);
-      this.results[opId] = result;
+      if (config.outputPath) setPath(ctx.state, config.outputPath, result);
+      ctx.results[opId] = result;
 
       // Middleware: process_result + on_operation_complete
       const duration = performance.now() - startTime;
@@ -754,7 +771,7 @@ export class WorkflowExecutor {
       }
 
     } catch (err) {
-      this.errors[opId] = err.message;
+      ctx.errors[opId] = err.message;
 
       // Middleware: on_operation_error
       for (const mw of this.middleware) {
@@ -764,41 +781,41 @@ export class WorkflowExecutor {
       // onError fallback
       if (op.onError) {
         try {
-          await this._executeOp(op.onError, executionId, depth + 1);
+          await this._executeOp(op.onError, executionId, depth + 1, ctx);
           // Copy fallback result to original outputPath
           const fallbackOp = this.operations.find(o => o.id === op.onError);
-          if (fallbackOp && this.results[op.onError] !== undefined) {
-            setPath(this.state, config.outputPath, this.results[op.onError]);
-            this.results[opId] = { _fallback: true, result: this.results[op.onError] };
+          if (fallbackOp && ctx.results[op.onError] !== undefined) {
+            setPath(ctx.state, config.outputPath, ctx.results[op.onError]);
+            ctx.results[opId] = { _fallback: true, result: ctx.results[op.onError] };
           }
         } catch (fallbackErr) {
-          this.errors[`${opId}_fallback`] = fallbackErr.message;
+          ctx.errors[`${opId}_fallback`] = fallbackErr.message;
         }
       }
     }
   }
 
   /** @private */
-  async _executeLoop(config, depth) {
-    const data = getPath(this.state, config.inputPath);
+  async _executeLoop(config, depth, ctx) {
+    const data = getPath(ctx.state, config.inputPath);
     if (!Array.isArray(data)) throw new Error('Loop: input must be an array');
 
     const results = [];
     const subOps = config.operations || [];
 
     for (let i = 0; i < data.length; i++) {
-      this.state.loop = { current: data[i], index: i };
+      ctx.state.loop = { current: data[i], index: i };
       const iterResult = {};
 
       for (const subOpId of subOps) {
-        await this._executeOp(subOpId, 'loop', depth + 1);
-        iterResult[subOpId] = this.results[subOpId];
+        await this._executeOp(subOpId, 'loop', depth + 1, ctx);
+        iterResult[subOpId] = ctx.results[subOpId];
       }
 
       results.push(iterResult);
     }
 
-    this.state.loop = {};
+    ctx.state.loop = {};
     return results;
   }
 }

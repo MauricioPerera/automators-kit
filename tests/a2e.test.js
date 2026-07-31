@@ -1053,3 +1053,72 @@ describe('DAG dynamic dependencies (FIX-24: no race on Conditional/onError)', ()
     expect(passFirst).toBeGreaterThan(checkN);     // branch runs after the Conditional
   }, 2000);
 });
+
+// ---------------------------------------------------------------------------
+// Concurrent execute() on a shared instance
+// ---------------------------------------------------------------------------
+
+describe('Concurrent execute() on a shared instance', () => {
+  it('two concurrent execute() calls on one instance keep Loop iteration state isolated', async () => {
+    const ex = new WorkflowExecutor();
+    // Yields on every iteration so the OTHER concurrently-running execute()
+    // call's Loop has a real chance to advance and mutate shared state in
+    // between, if state weren't properly isolated per call.
+    ex.registerHandler('RecordCurrent', async (config, state) => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return getPath(state, '/loop/current');
+    });
+    ex.load({
+      operations: [
+        { id: 'items', op: 'SetData', value: ['a', 'b', 'c'] },
+        { id: 'record', op: 'RecordCurrent' },
+        { id: 'looped', op: 'Loop', inputPath: '/workflow/items', operations: ['record'] },
+      ],
+      execute: 'items',
+    });
+
+    // Same loaded workflow run twice, concurrently, on the SAME instance —
+    // execute() takes no per-call input, so both runs process the identical
+    // ['a','b','c'] list. If per-call state isolation works, each run's Loop
+    // must record exactly its own items in its own order regardless of how
+    // the other run's iterations interleave with it.
+    const [r1, r2] = await Promise.all([ex.execute(), ex.execute()]);
+
+    const expected = [{ record: 'a' }, { record: 'b' }, { record: 'c' }];
+    expect(r1.errors).toEqual({});
+    expect(r2.errors).toEqual({});
+    expect(r1.results.looped).toEqual(expected);
+    expect(r2.results.looped).toEqual(expected);
+  });
+
+  it('two concurrent execute() calls on one instance keep results/errors isolated', async () => {
+    const ex = new WorkflowExecutor();
+    let calls = 0;
+    ex.registerHandler('TagWriter', async () => {
+      const n = ++calls;
+      // Stagger completion so the two runs' writes to shared state (if any)
+      // would overlap mid-flight.
+      await new Promise((resolve) => setTimeout(resolve, n === 1 ? 20 : 0));
+      return `run-${n}`;
+    });
+    ex.registerHandler('TagReader', async (config, state) => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      return getPath(state, config.inputPath);
+    });
+    ex.load({
+      operations: [
+        { id: 'tag', op: 'TagWriter' },
+        { id: 'echo', op: 'TagReader', inputPath: '/workflow/tag' },
+      ],
+      execute: 'tag',
+    });
+
+    const [r1, r2] = await Promise.all([ex.execute(), ex.execute()]);
+
+    // Each run's 'echo' must match that SAME run's own 'tag' — never the
+    // concurrently-running other call's value.
+    expect(r1.results.echo).toBe(r1.results.tag);
+    expect(r2.results.echo).toBe(r2.results.tag);
+    expect(r1.results.tag).not.toBe(r2.results.tag);
+  });
+});
