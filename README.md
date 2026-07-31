@@ -646,13 +646,43 @@ business/personal routing, a failed enrichment correctly stored as
 fires each getting their own uncorrupted decision. Run with
 `bun examples/trigger-driven-a2e/setup.js`.
 
+## Optional integrations
+
+Standalone modules that trade the zero-dependency guarantee for one specific,
+justified capability, kept out of `core/` and gated behind
+`optionalDependencies` so the framework itself stays deps-free by default.
+
+**[`integrations/postgres-queue.js`](integrations/postgres-queue.js)** —
+`PostgresJobQueue`, an async-native job queue mirroring `core/queue.js`'s
+`JobQueue` API, built to answer a real gap: `core/queue.js`'s concurrency
+control is an in-process counter, so nothing lets multiple worker
+processes/machines safely share one queue. `core/db.js`'s storage-adapter
+interface (`readJson`/`writeJson`/...) is fully synchronous — confirmed by
+reading the module, zero `await` near any adapter call — so this is a
+standalone module speaking directly to Postgres via `pg`, not a `DocStore`
+adapter. The correctness-critical piece, `claimJobs()`'s atomic
+`FOR UPDATE SKIP LOCKED` multi-worker claim, was authored as a KDD task
+contract (kept external — see [KDD](https://github.com/MauricioPerera/KDD),
+used as a companion methodology, never vendored into this repo) and verified
+live against a real Postgres: two concurrent claimers racing 40 pending jobs
+never claim the same one, and together claim all 40 exactly once. Building
+it live also found a real bug: Postgres's `UPDATE ... RETURNING` does not
+preserve a CTE's `ORDER BY` — the claim's priority-then-FIFO ordering was
+silently lost until sorted client-side right after the atomic claim.
+Requires the optional `pg` dependency (`bun add pg`, or it installs
+automatically if your package manager honors `optionalDependencies`). Tests
+skip cleanly unless `POSTGRES_TEST_URL` is set:
+```bash
+POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-postgres-queue-claim.test.js tests/integrations-postgres-queue.test.js
+```
+
 ## Testing
 
 ```bash
-bun test tests/    # 887 tests across 59 files, ~29 seconds
+bun test tests/    # 892 tests across 61 files, ~29 seconds
 ```
 
-59 test files covering all core modules plus the `examples/content-pipeline`,
+61 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -670,8 +700,11 @@ bun test tests/    # 887 tests across 59 files, ~29 seconds
 `examples/mcp-job-queue`, `examples/queue-access-control`, and
 `examples/vault-access-control`, and `examples/trigger-driven-a2e`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
-— see [Security](#security) below). Fully deterministic — no known-flaky
-tests: `memory.test.js`'s dream-heuristic test used to assert
+— see [Security](#security) below), plus 2 opt-in files for
+`integrations/postgres-queue.js` (`tests/integrations-postgres-queue-claim.test.js`,
+`tests/integrations-postgres-queue.test.js`) that skip cleanly and count as
+0 tests unless `POSTGRES_TEST_URL` is set — the 892/61 numbers above are the
+default, fully offline run. Fully deterministic — no known-flaky tests: `memory.test.js`'s dream-heuristic test used to assert
 `duration_ms > 0` on an operation that can legitimately finish in under
 0.5ms (rounds to exactly 0), now asserts the type/shape instead; and
 `vector.test.js`'s `QuantizedStore` test used to assert the quantized
