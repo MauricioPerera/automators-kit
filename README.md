@@ -649,10 +649,10 @@ fires each getting their own uncorrupted decision. Run with
 ## Testing
 
 ```bash
-bun test tests/    # 887 tests across 59 files, ~29 seconds
+bun test tests/    # 895 tests across 60 files, ~29 seconds
 ```
 
-59 test files covering all core modules plus the `examples/content-pipeline`,
+60 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -667,9 +667,10 @@ bun test tests/    # 887 tests across 59 files, ~29 seconds
 `examples/validated-webhooks`, `examples/content-render-workflow`,
 `examples/hybrid-catalog-search`, `examples/rate-limited-queue`, and
 `examples/cms-semantic-search`, `examples/validated-workflow-nodes`, and
-`examples/mcp-job-queue`, `examples/queue-access-control`, and
+`examples/mcp-job-queue`, `examples/queue-access-control`,
 `examples/vault-access-control`, and `examples/trigger-driven-a2e`
-end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
+end-to-end scenarios, plus `tests/kdd-is-valid-semver.test.js` (see
+[Development methodology](#development-methodology-kdd) below). Includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
 `duration_ms > 0` on an operation that can legitimately finish in under
@@ -679,6 +680,49 @@ top-1 result always exactly matches the float32 top-1 — INT8 quantization
 is lossy by design, so that held only 498/500 over random trials. Now
 asserts the real guarantee (float32's top-1 shows up within the quantized
 top-3, which held 500/500).
+
+## Development methodology (KDD)
+
+This project adopted **Knowledge-Driven Development**
+([KDD](https://github.com/MauricioPerera/KDD)) as of 2026-07 for new work
+going forward — not a retrofit of the 23 existing `core/` modules or 37
+`examples/`, which stay governed by this repo's own established discipline
+(live-verify before documenting, explicit approval before touching core
+code, honest READMEs). KDD unifies three layers, all verified for real
+against this repo before adoption:
+
+- **Nivel 1** (18 mandatory structural gates, vendored as `scripts/*.py` —
+  Python tooling, dev-only, never enters the shipped library) — validates
+  `knowledge/` (OKF knowledge nodes), `knowledge/contracts/` (task
+  contracts: frontmatter + a hash-sealed frozen test oracle + a declared
+  `touch_only` perimeter), ASCII-only vendored scripts, and runs each
+  contract's real `test_command` (`bun test <path>`). The optional gates
+  (rule contracts, agent skills, changelog coherence, UX pages, Mermaid
+  diagrams, and all 7 Capa 3 domains below) degrade cleanly to `INFO`/exit
+  0 with nothing configured — confirmed by running every one of them.
+- **Nivel 2** (the real CCDD complexity/integration gate, via the
+  `ccdd-complexity` MCP server) — applies per contract, not repo-wide.
+  Verified for real on the first contract below: `lint_task_contract`
+  caught 3 genuine issues (a multi-verb `intent`, a missing
+  `language: javascript` frontmatter key, tests not passed to the linter)
+  before passing; `run_integration_gate` returned real measured JS
+  complexity (cyclomatic 2, nesting 1, params 1) against the actual
+  function. CI (`.github/workflows/kdd-validate.yml`) runs Nivel 1 only —
+  GitHub Actions has no MCP session, so Nivel 2 is a manual, local check
+  for now, not automatic on every push.
+- **Capa 3** (7 domains — security/compliance/privacy/accessibility/
+  dependency-eol/observability/test-coverage — one shared declarative rule
+  engine over sealed `findings.json` artifacts) — the mechanism is proven
+  (all 7 validators pass clean with nothing configured), but stays
+  honestly empty this pass: no findings were fabricated just to have
+  something to seal. This session's own 4 prior manual security audits
+  (`specs/AUDIT-01..04-*.md`) are a real, non-fabricated candidate for a
+  first `security/scan/findings.json` — not done yet.
+
+The pilot contract, [`knowledge/contracts/is-valid-semver.md`](knowledge/contracts/is-valid-semver.md),
+adds `isValidSemver()` to `core/validate.js`'s `FORMATS` registry —
+genuinely new, useful code, proving the full pipeline end-to-end rather
+than a throwaway. Frozen oracle: `tests/kdd-is-valid-semver.test.js`.
 
 ## Multi-runtime
 
