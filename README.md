@@ -627,13 +627,32 @@ material** in the response, while `reveal`/`store`/`remove` stay denied;
 needed, since `vault.list()` itself never includes decrypted values. Run
 with `bun examples/vault-access-control/setup.js`.
 
+**[`examples/trigger-driven-a2e/`](examples/trigger-driven-a2e/)** —
+combines `core/triggers.js` with `core/a2e.js`: a webhook fires a real
+`WorkflowExecutor` pipeline, not a `core/workflow.js` `WorkflowEngine`.
+`TriggerManager` is built directly into `WorkflowEngine`, but has zero
+wiring to `core/a2e.js` — every existing a2e.js example invokes
+pipelines manually. Works around two documented a2e.js constraints:
+`execute()` takes no per-call input (a fresh definition is built per
+fire with the trigger data baked in, same pattern
+`examples/a2e-vault-api` used) and a single executor instance is unsafe
+for concurrent `execute()` calls (`examples/a2e-background`'s finding,
+so a fresh executor is constructed per fire). Building this reproduced
+the same `a2e-vault-api`-documented footgun — a failed op's downstream
+`Conditional` silently picking the same branch as a genuine negative
+result — fixed at the example level. Verified live: correct
+business/personal routing, a failed enrichment correctly stored as
+`decision: null` instead of a misleading fallback, and two concurrent
+fires each getting their own uncorrupted decision. Run with
+`bun examples/trigger-driven-a2e/setup.js`.
+
 ## Testing
 
 ```bash
-bun test tests/    # 881 tests across 58 files, ~29 seconds
+bun test tests/    # 887 tests across 59 files, ~29 seconds
 ```
 
-58 test files covering all core modules plus the `examples/content-pipeline`,
+59 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -649,7 +668,7 @@ bun test tests/    # 881 tests across 58 files, ~29 seconds
 `examples/hybrid-catalog-search`, `examples/rate-limited-queue`, and
 `examples/cms-semantic-search`, `examples/validated-workflow-nodes`, and
 `examples/mcp-job-queue`, `examples/queue-access-control`, and
-`examples/vault-access-control`
+`examples/vault-access-control`, and `examples/trigger-driven-a2e`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below). Fully deterministic — no known-flaky
 tests: `memory.test.js`'s dream-heuristic test used to assert
@@ -700,6 +719,8 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`examples/mcp-job-queue` design detail)**: not a bug — `core/mcp.js`'s `tools/call` deliberately replaces any *thrown* tool-handler error with a generic, internals-hiding message, logging the real reason server-side only, confirmed by reading the code. Worth documenting because it shapes how a tool should be written: `job_status`'s "job not found" is an expected, actionable outcome, not a server fault, so it's designed to **return** `{ found: false }` as ordinary data instead of throwing — the agent gets a real, useful answer instead of an opaque failure. A genuinely missing required argument is a different path entirely (`tools/call`'s own `inputSchema` validation, checked before the handler runs) and does come back with the real, specific reason — verified live: `"Invalid arguments: jobId is required"`.
 - **2026-07 (`examples/queue-access-control` design detail)**: not a bug — `core/queue.js` never claimed to have any notion of a caller, and `core/shell.js`'s built-in `AGENT_PROFILES` are generic on purpose. Worth documenting because it matters specifically for this combination: `AGENT_PROFILES.reader`'s wildcard verbs (`list`/`get`/`search`/`describe`/`count`/`status`) don't happen to include `stats` — verified live, even `reader` gets `Permission denied` for `queue:stats`, and `operator`'s wildcards (`list`/`get`/`create`/`update`/`delete`/`run`) don't cover it either. No built-in profile expresses "can enqueue and monitor this one namespace, but not its destructive ops" — this example builds an explicit custom `permissions` array for that role instead, exactly the override `core/shell.js` documents `profile` as losing to.
 - **2026-07 (`examples/vault-access-control` design detail)**: not a bug — `core/credentials.js` never claimed to enforce access control; `vault.get(name)` returning the fully decrypted secret to any code holding a reference is documented, intentional behavior, and `list()` withholding decrypted values is a return-shape choice, not access control. Worth documenting because it's genuinely security-relevant: every guarantee this example makes (an `integration-runner` role can *use* a secret via `vault:use` but never see it) is enforced entirely by which `Shell` instance a caller is routed to and which verbs its permission list happens to cover. Verified live: `vault:use`'s response never contains the raw secret string even though it decrypted the credential server-side to confirm it's usable; `vault:reveal` (admin-only by construction) is the only command that ever returns one.
+- **2026-07 (`db.js` found while building `examples/trigger-driven-a2e`)**: real core bug, low severity. `Auth.init()` already guards its 3 `createIndex()` calls with `try {} catch {}` (same pattern as `credentials.js`/`memory.js`/`workflow.js`), so a restart against already-persisted data never crashes — but it logged the **whole caught `Error` object**, not `err.message`, which Bun renders with a full stack trace and source-code snippet on stderr on every single normal restart, reading like a crash when it isn't. Fixed to log `err.message` only, verified live with a real `FileStorageAdapter` restart before/after.
+- **2026-07 (`examples/trigger-driven-a2e` finding)**: not a new core bug — the same DAG-dispatch-doesn't-stop-on-failure behavior already documented for `examples/a2e-vault-api`, reproduced in a different domain. A custom op throwing on bad data left its output undefined; the downstream `Conditional` read that as `false` and silently picked the exact same branch as a genuine negative classification. Verified live before the fix: a payload with no email came back routed to "personal" with no visible sign anything failed except a buried `errors` field. Fixed entirely at the example level (not core), matching `a2e-vault-api`'s own precedent — the bridge now stores an explicit `decision: null` / `status: "failed"` instead of trusting a Conditional computed from a failed op's undefined output.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:

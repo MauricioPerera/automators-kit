@@ -679,6 +679,25 @@ no custom grant needed, since `vault.list()` itself never includes
 decrypted values. Run with `bun examples/vault-access-control/setup.js`;
 regression test in `tests/examples-vault-access-control.test.js`.
 
+`examples/trigger-driven-a2e/` — combines `core/triggers.js` with
+`core/a2e.js`: a webhook fires a real `WorkflowExecutor` pipeline, not a
+`core/workflow.js` `WorkflowEngine`. `TriggerManager` is built directly
+into `WorkflowEngine`, but has zero wiring to `core/a2e.js` — every
+existing a2e.js example invokes pipelines manually. Works around two
+documented a2e.js constraints: `execute()` takes no per-call input (a
+fresh definition is built per fire with the trigger data baked in, same
+pattern `examples/a2e-vault-api` used) and a single executor instance is
+unsafe for concurrent `execute()` calls (`examples/a2e-background`'s
+finding, so a fresh executor is constructed per fire). Building this
+reproduced the same `a2e-vault-api`-documented footgun — a failed op's
+downstream `Conditional` silently picking the same branch as a genuine
+negative result — fixed at the example level. Verified live: correct
+business/personal routing, a failed enrichment correctly stored as
+`decision: null` instead of a misleading fallback, and two concurrent
+fires each getting their own uncorrupted decision. Run with
+`bun examples/trigger-driven-a2e/setup.js`; regression test in
+`tests/examples-trigger-driven-a2e.test.js`.
+
 ## MCP Server
 
 ```json
@@ -1221,6 +1240,24 @@ caller is routed to and which verbs its permission list happens to cover. Verifi
 response never contains the raw secret string even though it decrypted the credential server-side
 to confirm it's usable; `vault:reveal` (admin-only by construction) is the only command that ever
 returns one.
+
+**`db.js` found while building `examples/trigger-driven-a2e` (2026-07):** real core bug, low
+severity. `Auth.init()` already guards its 3 `createIndex()` calls with `try {} catch {}` (same
+pattern as `credentials.js`/`memory.js`/`workflow.js`), so a restart against already-persisted data
+never crashes — but it logged the whole caught `Error` object, not `err.message`, which Bun renders
+with a full stack trace and source-code snippet on stderr on every single normal restart, reading
+like a crash when it isn't. Fixed to log `err.message` only, verified live with a real
+`FileStorageAdapter` restart before/after.
+
+**`examples/trigger-driven-a2e` finding (2026-07):** not a new core bug — the same
+DAG-dispatch-doesn't-stop-on-failure behavior already documented for `examples/a2e-vault-api`,
+reproduced in a different domain. A custom op throwing on bad data left its output undefined; the
+downstream `Conditional` read that as `false` and silently picked the exact same branch as a
+genuine negative classification. Verified live before the fix: a payload with no email came back
+routed to "personal" with no visible sign anything failed except a buried `errors` field. Fixed
+entirely at the example level (not core), matching `a2e-vault-api`'s own precedent — the bridge now
+stores an explicit `decision: null` / `status: "failed"` instead of trusting a Conditional computed
+from a failed op's undefined output.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
