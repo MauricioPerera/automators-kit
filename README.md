@@ -867,6 +867,43 @@ drove the actual process with real JSON-RPC lines over stdin, and
 confirmed the raw secret string is absent from the full response
 transcript. Run with `bun examples/mcp-vault/mcp-server.js`.
 
+**[`examples/parallel-workflow-race/`](examples/parallel-workflow-race/)**
+— combines `core/parallel.js` with `core/workflow.js`: 3 concurrent
+executions of the **same** workflow definition (one per scoring
+"model"), raced via `parallelMerge`'s `highest-confidence` strategy.
+Distinct from `examples/provider-fanout` (races raw `core/connector.js`
+calls, not real workflow executions) and every other `workflow.js`
+example (each fires exactly one execution per trigger, never concurrent
+runs of the same definition). Relies on `WorkflowEngine.execute()`
+having no shared mutable state across concurrent calls on one engine
+instance — verified true earlier this session (unlike `core/a2e.js`'s
+`WorkflowExecutor`, which needed a real fix for exactly this). Verified
+live: 3 executions share the same (or 1ms-apart) `startedAt` timestamp
+— genuinely concurrent, not sequential — and model C's fixed 0.85
+confidence deterministically wins every time; a regression test also
+confirms two concurrent races for different leads never cross-
+contaminate each other's scores. Run with
+`bun examples/parallel-workflow-race/setup.js`.
+
+**[`examples/memory-consolidation-queue/`](examples/memory-consolidation-queue/)**
+— combines `core/memory.js` with `core/queue.js`: `memory.dream()` (the
+heuristic near-duplicate consolidation cycle, documented as O(n²)
+comparisons over stored memories) runs as a background job instead of
+blocking the caller. `examples/agent-memory-backend` already exposes
+`dream` two ways (a direct call, an hourly `core/cron.js` job), but
+neither is durable/retryable/off-the-request-path the way a queued job
+is — a manual "consolidate now" trigger here returns immediately with a
+job id, and a failed LLM-powered consolidation call would get the
+queue's own retry/backoff for free, unlike a bare cron handler. Reuses
+`examples/agent-memory-backend`'s own `buildMemoryHandlers` directly for
+everything except `dream`. `concurrency: 1` on the queue is deliberate:
+`dream()` reads and rewrites the whole memory collection, and two
+consolidation passes racing each other is a correctness risk
+`memory.js` was never designed to guard against. Verified live:
+`memory:consolidate` returns instantly with a pending job id, the real
+`dream()` report arrives later via polling. Run with
+`bun examples/memory-consolidation-queue/setup.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -927,10 +964,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 968 tests across 74 files, ~32 seconds
+bun test tests/    # 975 tests across 76 files, ~32 seconds
 ```
 
-74 test files covering all core modules (including `log.js`/`metrics.js`/
+76 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -951,8 +988,9 @@ bun test tests/    # 968 tests across 74 files, ~32 seconds
 `examples/agent-authored-node`, `examples/workflow-observability`,
 `examples/scheduled-report-queue`, `examples/csv-bulk-import`,
 `examples/async-vector-index`, `examples/queue-observability`,
-`examples/mcp-vector-search`, `examples/validated-job-queue`, and
-`examples/mcp-vault`
+`examples/mcp-vector-search`, `examples/validated-job-queue`,
+`examples/mcp-vault`, `examples/parallel-workflow-race`, and
+`examples/memory-consolidation-queue`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,

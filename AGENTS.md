@@ -898,6 +898,38 @@ absent from the full response transcript. Run with
 `bun examples/mcp-vault/mcp-server.js`; regression test in
 `tests/examples-mcp-vault.test.js`.
 
+`examples/parallel-workflow-race/` — combines `core/parallel.js` with
+`core/workflow.js`: 3 concurrent executions of the same workflow
+definition (one per scoring "model"), raced via `parallelMerge`'s
+`highest-confidence` strategy. Distinct from `examples/provider-fanout`
+(races raw `core/connector.js` calls, not real workflow executions) and
+every other `workflow.js` example (each fires exactly one execution per
+trigger, never concurrent runs of the same definition). Relies on
+`WorkflowEngine.execute()` having no shared mutable state across
+concurrent calls on one engine instance — verified true earlier this
+session (unlike `core/a2e.js`'s `WorkflowExecutor`, which needed a real
+fix for exactly this). Verified live: 3 executions share the same (or
+1ms-apart) `startedAt` timestamp, genuinely concurrent, not sequential;
+model C's fixed 0.85 confidence deterministically wins every time. Run
+with `bun examples/parallel-workflow-race/setup.js`; regression test in
+`tests/examples-parallel-workflow-race.test.js`.
+
+`examples/memory-consolidation-queue/` — combines `core/memory.js` with
+`core/queue.js`: `memory.dream()` (the heuristic near-duplicate
+consolidation cycle, documented O(n²) comparisons) runs as a background
+job instead of blocking the caller. `examples/agent-memory-backend`
+already exposes `dream` two ways (a direct call, an hourly
+`core/cron.js` job), but neither is durable/retryable/off-the-request-
+path the way a queued job is. Reuses `examples/agent-memory-backend`'s
+own `buildMemoryHandlers` directly for everything except `dream`.
+`concurrency: 1` on the queue is deliberate: `dream()` reads/rewrites
+the whole memory collection, and two concurrent passes racing each
+other is a correctness risk `memory.js` was never designed to guard
+against. Verified live: `memory:consolidate` returns immediately with a
+pending job id, the real `dream()` report arrives later via polling.
+Run with `bun examples/memory-consolidation-queue/setup.js`; regression
+test in `tests/examples-memory-consolidation-queue.test.js`.
+
 ## Optional Integrations
 
 Standalone modules living outside `core/`, gated behind `optionalDependencies`
