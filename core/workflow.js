@@ -19,6 +19,15 @@
  * N-way routing: `runIf: { equals: ['{{switchId}}', 'caseA'] }` on each
  * branch's nodes.
  *
+ * Error workflow: a workflow can declare `errorWorkflow: <id>` (or the
+ * engine constructor can set `opts.defaultErrorWorkflow` as a fallback for
+ * workflows with none of their own). When an execution ends with
+ * `status: 'failed'`, that workflow id is executed fire-and-forget with
+ * error context as its trigger data (`{{_trigger.workflow.name}}`,
+ * `{{_trigger.error.message}}`, `{{_trigger.execution.id}}`,
+ * `{{_trigger.trigger}}` for the original trigger data) — see
+ * `_maybeTriggerErrorWorkflow`.
+ *
  * Workflow definition:
  * {
  *   name: "My Workflow",
@@ -75,6 +84,9 @@ export class WorkflowEngine {
    * @param {object} opts
    * @param {string} opts.masterKey - For credential vault
    * @param {NodeRegistry} opts.nodeRegistry - Custom node registry
+   * @param {string} [opts.defaultErrorWorkflow] - Workflow id run when any
+   *   workflow's execution fails and that workflow has no `errorWorkflow`
+   *   of its own set (see `create()`/`update()`'s `errorWorkflow` field).
    */
   constructor(db, opts = {}) {
     this.db = db;
@@ -82,6 +94,7 @@ export class WorkflowEngine {
     this._executions = db.collection('_executions');
     this._nodeRegistry = opts.nodeRegistry || new NodeRegistry();
     this._vault = new CredentialVault(db, opts.masterKey || _generateMasterKey());
+    this._defaultErrorWorkflow = opts.defaultErrorWorkflow || null;
 
     try { this._workflows.createIndex('name'); } catch {}
     try { this._workflows.createIndex('active'); } catch {}
@@ -127,6 +140,10 @@ export class WorkflowEngine {
       nodes: definition.nodes || [],
       active: definition.active !== false,
       settings: definition.settings || {},
+      // Workflow id to run (with error context as trigger data) when THIS
+      // workflow's execution ends with status 'failed'. Falls back to the
+      // engine's opts.defaultErrorWorkflow when unset -- see execute().
+      errorWorkflow: definition.errorWorkflow || null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -163,7 +180,7 @@ export class WorkflowEngine {
     this._triggers.unregister(id);
 
     const updates = {};
-    for (const k of ['name', 'description', 'trigger', 'nodes', 'active', 'settings']) {
+    for (const k of ['name', 'description', 'trigger', 'nodes', 'active', 'settings', 'errorWorkflow']) {
       if (changes[k] !== undefined) updates[k] = changes[k];
     }
     updates.updatedAt = Date.now();
@@ -316,7 +333,50 @@ export class WorkflowEngine {
     execution._id = this._executions.insert(execution)._id;
     this.db.flush();
 
+    this._maybeTriggerErrorWorkflow(wf, execution, triggerData);
+
     return execution;
+  }
+
+  /**
+   * Fires the failed workflow's `errorWorkflow` (or the engine's
+   * `defaultErrorWorkflow` if it has none) -- fire-and-forget, the same
+   * way webhook/cron/poll triggers themselves fire `execute()` without the
+   * original caller awaiting it (see the trigger manager's `onTrigger`
+   * above). Whoever called THIS `execute()` still gets its own execution
+   * result back immediately; the error workflow runs independently after.
+   *
+   * The error workflow receives its error context as `{{_trigger...}}`:
+   * `{{_trigger.workflow.name}}`, `{{_trigger.error.message}}`,
+   * `{{_trigger.execution.id}}`, `{{_trigger.trigger}}` (the ORIGINAL
+   * trigger data that started the failed run).
+   */
+  _maybeTriggerErrorWorkflow(wf, execution, triggerData) {
+    if (execution.status !== 'failed') return;
+    const errorWorkflowId = wf.errorWorkflow || this._defaultErrorWorkflow;
+    if (!errorWorkflowId) return;
+    if (errorWorkflowId === wf._id) return; // refuse the trivial direct self-loop
+
+    // Bounds an A -> B -> A -> ... runaway chain (misconfigured error
+    // workflows pointing at each other) without tracking full visited-set
+    // history -- a depth cap is enough for a "chico, acotado" feature.
+    const depth = (triggerData && typeof triggerData === 'object' && triggerData._errorDepth) || 0;
+    if (depth >= 5) return;
+
+    const errorContext = {
+      _errorDepth: depth + 1,
+      workflow: { id: wf._id, name: wf.name },
+      execution: { id: execution._id, status: execution.status },
+      error: {
+        message: Object.values(execution.errors)[0] || 'Workflow execution failed',
+        nodeErrors: execution.errors,
+      },
+      trigger: triggerData,
+    };
+
+    this.execute(errorWorkflowId, errorContext).catch((err) => {
+      console.error(`[Workflow] Error workflow '${errorWorkflowId}' (for failed workflow '${wf._id}') itself failed:`, err.message);
+    });
   }
 
   /** Manual trigger */

@@ -692,3 +692,129 @@ describe('Parallel DAG execution', () => {
     expect(exec.nodeResults.onMatch.data).toBe('matched');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Error Workflow
+// ---------------------------------------------------------------------------
+
+describe('Error Workflow', () => {
+  // The error workflow fires fire-and-forget (same pattern webhook/cron/poll
+  // triggers already use) -- the caller of the FAILED execute() gets its own
+  // result back immediately, so tests here poll for the error workflow's own
+  // execution to show up instead of awaiting it directly.
+  async function waitForExecutions(workflowId, count, timeoutMs = 2000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const list = engine.getExecutions(workflowId, 20);
+      if (list.length >= count) return list;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`waitForExecutions('${workflowId}', ${count}) timed out`);
+  }
+
+  beforeEach(() => {
+    engine.nodes.add({
+      type: 'test.boom',
+      name: 'Boom',
+      category: 'test',
+      handler: async () => { throw new Error('kaboom'); },
+    });
+  });
+
+  it("a failing workflow's errorWorkflow runs with the right error context, fire-and-forget", async () => {
+    const handler = engine.create({
+      name: 'ErrorHandler',
+      nodes: [{ id: 'log', type: 'set.value', inputs: { value: '{{_trigger.error.message}}' } }],
+    });
+    const main = engine.create({
+      name: 'MainFlow',
+      errorWorkflow: handler._id,
+      nodes: [{ id: 'fails', type: 'test.boom', inputs: {} }],
+    });
+
+    const exec = await engine.run(main._id, { orderId: 42 });
+    expect(exec.status).toBe('failed');
+    // execute() returned before the error workflow necessarily finished --
+    // this is the actual point of "fire-and-forget".
+
+    const [handlerExec] = await waitForExecutions(handler._id, 1);
+    expect(handlerExec.status).toBe('success');
+    expect(handlerExec.nodeResults.log.data).toBe('kaboom');
+    expect(handlerExec.trigger.workflow.id).toBe(main._id);
+    expect(handlerExec.trigger.workflow.name).toBe('MainFlow');
+    expect(handlerExec.trigger.execution.id).toBe(exec._id);
+    expect(handlerExec.trigger.error.message).toBe('kaboom');
+    expect(handlerExec.trigger.trigger.data.orderId).toBe(42); // original trigger data preserved
+  });
+
+  it("falls back to the engine's defaultErrorWorkflow when the failing workflow has none of its own", async () => {
+    const fallback = engine.create({
+      name: 'GlobalFallback',
+      nodes: [{ id: 'noted', type: 'set.value', inputs: { value: 'handled' } }],
+    });
+
+    // Real public API: opts.defaultErrorWorkflow at construction, not a
+    // private-field poke. Reuses the outer engine's registry/db/vault so
+    // `test.boom` (registered in this describe's beforeEach) and `fallback`
+    // (just created above) are both visible to it.
+    const engine2 = new WorkflowEngine(db, {
+      masterKey: 'test-master-key!!!',
+      nodeRegistry: engine.nodes,
+      defaultErrorWorkflow: fallback._id,
+    });
+    await engine2.init();
+
+    const main = engine2.create({
+      name: 'NoOwnHandler',
+      nodes: [{ id: 'fails', type: 'test.boom', inputs: {} }],
+    });
+    await engine2.run(main._id);
+
+    const [fallbackExec] = await waitForExecutions(fallback._id, 1);
+    expect(fallbackExec.nodeResults.noted.data).toBe('handled');
+    expect(fallbackExec.trigger.workflow.id).toBe(main._id);
+  });
+
+  it('a successful workflow never triggers its errorWorkflow', async () => {
+    const handler = engine.create({ name: 'NeverCalled', nodes: [{ id: 'x', type: 'set.value', inputs: { value: 1 } }] });
+    const main = engine.create({
+      name: 'AlwaysSucceeds',
+      errorWorkflow: handler._id,
+      nodes: [{ id: 'ok', type: 'set.value', inputs: { value: 'fine' } }],
+    });
+    const exec = await engine.run(main._id);
+    expect(exec.status).toBe('success');
+
+    await new Promise((r) => setTimeout(r, 100)); // give a wrongly-firing trigger a chance to show up
+    expect(engine.getExecutions(handler._id, 5).length).toBe(0);
+  });
+
+  it('a workflow set as its own errorWorkflow does not self-trigger infinitely', async () => {
+    const main = engine.create({
+      name: 'SelfReferential',
+      nodes: [{ id: 'fails', type: 'test.boom', inputs: {} }],
+    });
+    engine.update(main._id, { errorWorkflow: main._id });
+
+    await engine.run(main._id);
+    await new Promise((r) => setTimeout(r, 100)); // give a self-loop a chance to run away
+
+    // Exactly the one original failed execution -- the trivial direct
+    // self-loop is refused outright, never even attempted once more.
+    expect(engine.getExecutions(main._id, 20).length).toBe(1);
+  });
+
+  it('an A -> B -> A error-workflow cycle is bounded by the depth cap, not an infinite loop', async () => {
+    const a = engine.create({ name: 'CycleA', nodes: [{ id: 'fails', type: 'test.boom', inputs: {} }] });
+    const b = engine.create({ name: 'CycleB', errorWorkflow: a._id, nodes: [{ id: 'fails', type: 'test.boom', inputs: {} }] });
+    engine.update(a._id, { errorWorkflow: b._id });
+
+    await engine.run(a._id);
+    // Let the chain fully unwind (bounded to depth 5, generously time-boxed).
+    await new Promise((r) => setTimeout(r, 500));
+
+    const total = engine.getExecutions(a._id, 50).length + engine.getExecutions(b._id, 50).length;
+    expect(total).toBeGreaterThan(1); // the chain did propagate at least once
+    expect(total).toBeLessThan(10); // but it's bounded, not a runaway loop
+  });
+});
