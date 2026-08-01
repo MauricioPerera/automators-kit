@@ -969,6 +969,24 @@ structurally stable — re-rendering its output produces byte-identical
 HTML to the original. Run with `bun examples/mcp-content-render/mcp-server.js`;
 regression test in `tests/examples-mcp-content-render.test.js`.
 
+`examples/csv-report-queue/` — combines `core/csv.js` with
+`core/queue.js`: a sales CSV is aggregated into a summary report
+(total, per-category breakdown, top category) inside a background job
+— `reports:submit` returns a job id immediately instead of blocking the
+request while a (potentially large) CSV is parsed and aggregated. The
+"kick off + poll" pattern (`examples/job-queue`) applied to CSV
+analytics/ETL specifically, distinct from `examples/csv-bulk-import`'s
+synchronous CSV-to-CMS-entries import: that example persists every row
+as a real entry and blocks the request until all of them are created;
+this one only cares about a summary — a separate real-world use case
+(bulk analytics, not bulk import) where a large file makes the
+synchronous approach genuinely painful. Verified live: `submit` returns
+instantly, the real aggregate arrives via polling; rows with an
+unparseable `amount` are skipped and counted in `rowsSkipped`, not
+silently included or crashing the job. Run with
+`bun examples/csv-report-queue/setup.js`; regression test in
+`tests/examples-csv-report-queue.test.js`.
+
 ## Optional Integrations
 
 Standalone modules living outside `core/`, gated behind `optionalDependencies`

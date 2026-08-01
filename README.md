@@ -945,6 +945,24 @@ its output produces byte-identical HTML to the original, even though
 the markdown text itself isn't guaranteed to match verbatim. Run with
 `bun examples/mcp-content-render/mcp-server.js`.
 
+**[`examples/csv-report-queue/`](examples/csv-report-queue/)** —
+combines `core/csv.js` with `core/queue.js`: a sales CSV is aggregated
+into a summary report (total, per-category breakdown, top category)
+inside a background job — `reports:submit` returns a job id immediately
+instead of blocking the request while a (potentially large) CSV is
+parsed and aggregated. The "kick off + poll" pattern
+(`examples/job-queue`) applied to CSV analytics/ETL specifically,
+distinct from `examples/csv-bulk-import`'s **synchronous**
+CSV-to-CMS-entries import: that example persists every row as a real
+entry and blocks the request until all of them are created; this one
+only cares about a summary — a separate real-world use case (bulk
+analytics, not bulk import) where a large file makes the synchronous
+approach genuinely painful. Verified live: `submit` returns instantly,
+the real aggregate arrives via polling; rows with an unparseable
+`amount` are skipped and counted in `rowsSkipped`, not silently
+included or crashing the job. Run with
+`bun examples/csv-report-queue/setup.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -1005,10 +1023,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 988 tests across 78 files, ~32 seconds
+bun test tests/    # 992 tests across 79 files, ~31 seconds
 ```
 
-78 test files covering all core modules (including `log.js`/`metrics.js`/
+79 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -1031,8 +1049,8 @@ bun test tests/    # 988 tests across 78 files, ~32 seconds
 `examples/async-vector-index`, `examples/queue-observability`,
 `examples/mcp-vector-search`, `examples/validated-job-queue`,
 `examples/mcp-vault`, `examples/parallel-workflow-race`,
-`examples/memory-consolidation-queue`, `examples/shell-a2e-runner`, and
-`examples/mcp-content-render`
+`examples/memory-consolidation-queue`, `examples/shell-a2e-runner`,
+`examples/mcp-content-render`, and `examples/csv-report-queue`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
