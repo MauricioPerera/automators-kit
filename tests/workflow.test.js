@@ -619,4 +619,76 @@ describe('Parallel DAG execution', () => {
     expect(exec.status).toBe('success');
     expect(exec.finishedAt).not.toBeNull();
   });
+
+  it('switch + runIf: only the matching branch\'s node runs, the other branch is skipped (not an error), an unrelated node runs regardless', async () => {
+    const calls = [];
+    engine.nodes.add({
+      type: 'test.branch',
+      name: 'Branch',
+      category: 'test',
+      handler: async (inputs) => { calls.push(inputs.label); return inputs.label; },
+    });
+    const wf = engine.create({
+      name: 'SwitchRouting',
+      nodes: [
+        {
+          id: 'route', type: 'switch',
+          inputs: { value: 'gold', cases: [{ when: 'gold', label: 'goldPath' }, { when: 'silver', label: 'silverPath' }], default: 'other' },
+        },
+        { id: 'onGold', type: 'test.branch', inputs: { label: 'gold-ran' }, runIf: { equals: ['{{route}}', 'goldPath'] } },
+        { id: 'onSilver', type: 'test.branch', inputs: { label: 'silver-ran' }, runIf: { equals: ['{{route}}', 'silverPath'] } },
+        { id: 'unrelated', type: 'set.value', inputs: { value: 'always-runs' } },
+      ],
+    });
+    const exec = await engine.run(wf._id);
+
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.route.data).toBe('goldPath');
+    expect(exec.nodeResults.onGold.status).toBe('success');
+    expect(exec.nodeResults.onGold.data).toBe('gold-ran');
+    expect(exec.nodeResults.onSilver.status).toBe('skipped');
+    expect(exec.nodeResults.onSilver.data).toBeUndefined();
+    expect(exec.nodeResults.unrelated.data).toBe('always-runs');
+    expect(calls).toEqual(['gold-ran']); // the silver branch's handler never executed at all
+  });
+
+  it('switch falls back to `default` when no case matches, correctly skipping every branch', async () => {
+    const wf = engine.create({
+      name: 'SwitchDefault',
+      nodes: [
+        {
+          id: 'route', type: 'switch',
+          inputs: { value: 'bronze', cases: [{ when: 'gold', label: 'goldPath' }, { when: 'silver', label: 'silverPath' }], default: 'otherPath' },
+        },
+        { id: 'onGold', type: 'set.value', inputs: { value: 'x' }, runIf: { equals: ['{{route}}', 'goldPath'] } },
+        { id: 'onOther', type: 'set.value', inputs: { value: 'y' }, runIf: { equals: ['{{route}}', 'otherPath'] } },
+      ],
+    });
+    const exec = await engine.run(wf._id);
+
+    expect(exec.nodeResults.route.data).toBe('otherPath');
+    expect(exec.nodeResults.onGold.status).toBe('skipped');
+    expect(exec.nodeResults.onOther.status).toBe('success');
+  });
+
+  it('a runIf referencing a switch node is scheduled in a LATER DAG level, never evaluated before the switch has run', async () => {
+    // 'route' itself depends on 'source' (an earlier level) via {{ref}} in
+    // its own inputs -- 3 real levels: source -> route -> onMatch. If
+    // _buildWorkflowDAG failed to scan `runIf` for refs, 'onMatch' could
+    // land in the SAME level as 'route' (or even earlier) and race it.
+    const wf = engine.create({
+      name: 'SwitchDagOrdering',
+      nodes: [
+        { id: 'onMatch', type: 'set.value', inputs: { value: 'matched' }, runIf: { equals: ['{{route}}', 'hit'] } },
+        { id: 'route', type: 'switch', inputs: { value: '{{source}}', cases: [{ when: 'go', label: 'hit' }] } },
+        { id: 'source', type: 'set.value', inputs: { value: 'go' } },
+      ],
+    });
+    const exec = await engine.run(wf._id);
+
+    expect(exec.nodeResults.source.data).toBe('go');
+    expect(exec.nodeResults.route.data).toBe('hit');
+    expect(exec.nodeResults.onMatch.status).toBe('success');
+    expect(exec.nodeResults.onMatch.data).toBe('matched');
+  });
 });

@@ -325,6 +325,28 @@ const BUILTIN_NODES = [
       }
     },
   },
+  {
+    type: 'switch',
+    name: 'Switch',
+    category: 'core',
+    description: 'N-way branch: matches value against an ordered list of cases',
+    inputs: [
+      { name: 'value', type: 'any', required: true },
+      // [{ when: <value>, label: <string> }, ...] -- first case where
+      // value == when (loose equality, same as the `if` node's default
+      // operator) wins. `label` defaults to `when` if omitted.
+      { name: 'cases', type: 'array', required: true },
+      { name: 'default', type: 'string' }, // returned when no case matches
+    ],
+    outputs: [{ name: 'matched', type: 'string' }],
+    handler: async (inputs) => {
+      const { value, cases, default: defaultLabel } = inputs;
+      for (const c of cases || []) {
+        if (value == c.when) return c.label ?? String(c.when);
+      }
+      return defaultLabel ?? null;
+    },
+  },
 
   // ─── Communication ─────────────────────────────────────────
   {

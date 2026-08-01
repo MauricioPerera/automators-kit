@@ -9,6 +9,16 @@
  * `_buildWorkflowDAG` / `execute()`). Dependencies are inferred from
  * `{{nodeId.field}}` references in `inputs` — no explicit edges to declare.
  *
+ * N-way branching: a node can carry `runIf: { equals: [a, b] }` (each side
+ * resolved the same way `inputs` values are, so `a`/`b` can be `{{ref}}`
+ * template strings or literals). When it evaluates false the node is
+ * skipped — not run, not an error, `nodeResults[id].status === 'skipped'`
+ * — without aborting the rest of the workflow, unlike the `if` node's
+ * `onFalse: 'skip'` global barrier. Paired with the built-in `switch` node
+ * (`core/nodes.js`, outputs the matched case's `label`), this gives real
+ * N-way routing: `runIf: { equals: ['{{switchId}}', 'caseA'] }` on each
+ * branch's nodes.
+ *
  * Workflow definition:
  * {
  *   name: "My Workflow",
@@ -26,6 +36,11 @@ import { TriggerManager, TriggerType } from './triggers.js';
 import { CredentialVault } from './credentials.js';
 import { generateId } from './db.js';
 import { buildLevels } from './dag.js';
+
+// Sentinel returned internally when a node's `runIf` guard evaluates false —
+// distinguishes "deliberately skipped" from any real handler result
+// (including `undefined`/`null`, which a handler can legitimately return).
+const SKIPPED = Symbol('workflow-node-skipped');
 
 // ---------------------------------------------------------------------------
 // WORKFLOW ENGINE
@@ -231,6 +246,7 @@ export class WorkflowEngine {
 
         const settled = await Promise.allSettled(level.map(async (nodeId) => {
           const node = nodeMap.get(nodeId);
+          if (node.runIf && !this._evalRunIf(node.runIf, context)) return SKIPPED;
           const resolvedInputs = this._resolveInputs(node.inputs || {}, context);
           let creds = {};
           if (node.credentials) {
@@ -247,7 +263,13 @@ export class WorkflowEngine {
           const node = nodeMap.get(nodeId);
           const outcome = settled[i];
 
-          if (outcome.status === 'fulfilled') {
+          if (outcome.status === 'fulfilled' && outcome.value === SKIPPED) {
+            // runIf evaluated false -- deliberately not run, not an error.
+            // context[nodeId] is intentionally left unset: any downstream
+            // node referencing {{nodeId...}} resolves to undefined, same as
+            // referencing a node that never ran for any other reason.
+            execution.nodeResults[nodeId] = { status: 'skipped' };
+          } else if (outcome.status === 'fulfilled') {
             const result = outcome.value;
             const nodeResult = (result != null && result.data !== undefined) ? result.data : result;
             context[nodeId] = nodeResult;
@@ -365,6 +387,23 @@ export class WorkflowEngine {
   }
 
   /**
+   * Evaluate a node's `runIf` guard against the current context. Only
+   * `{ equals: [a, b] }` is supported (a/b each resolved the same way
+   * `inputs` values are -- can be a `{{ref}}` or a literal) -- enough to
+   * drive N-way branching off a `switch` node's `matched` output without
+   * growing this into a general expression language. Missing/malformed
+   * `runIf` shapes default to true (run the node) rather than silently
+   * skipping it.
+   */
+  _evalRunIf(runIf, context) {
+    if (runIf.equals !== undefined) {
+      const [a, b] = runIf.equals;
+      return this._resolveValue(a, context) === this._resolveValue(b, context);
+    }
+    return true;
+  }
+
+  /**
    * Resolve {{nodeId.field}} and {{_trigger.field}} references in inputs.
    */
   _resolveInputs(inputs, context) {
@@ -423,14 +462,17 @@ export class WorkflowEngine {
 /**
  * Groups a workflow's nodes into levels that can each run in parallel: a
  * node depends on every other node id referenced via `{{nodeId...}}` in its
- * `inputs` (a `{{_trigger...}}` reference is not a dependency — trigger data
- * is available from the start). The dependency detection here is
- * workflow.js-specific (its `{{ref}}` template convention); the actual
- * level-scheduling algorithm (Kahn's) is shared with core/a2e.js's DAG via
- * `./dag.js` — see that module's doc comment for why only THAT part is
- * shared and not the dependency detection itself.
+ * `inputs` OR its `runIf` guard (a `{{_trigger...}}` reference is not a
+ * dependency — trigger data is available from the start). A `switch` node
+ * feeding a downstream node's `runIf: { equals: ['{{switchId}}', ...] }`
+ * must be scheduled into an earlier level the same way an `inputs` reference
+ * would, or the guard could evaluate before the switch has run. The
+ * dependency detection here is workflow.js-specific (its `{{ref}}` template
+ * convention); the actual level-scheduling algorithm (Kahn's) is shared with
+ * core/a2e.js's DAG via `./dag.js` — see that module's doc comment for why
+ * only THAT part is shared and not the dependency detection itself.
  *
- * @param {Array<{id: string, inputs?: object}>} nodes
+ * @param {Array<{id: string, inputs?: object, runIf?: object}>} nodes
  * @returns {string[][]|null} Array of levels (each an array of node ids), or
  *   `null` if the inputs describe a cycle (caller falls back to sequential).
  */
@@ -440,7 +482,7 @@ function _buildWorkflowDAG(nodes) {
   const deps = new Map(ids.map((id) => [id, new Set()]));
 
   for (const node of nodes) {
-    const str = JSON.stringify(node.inputs || {});
+    const str = JSON.stringify({ inputs: node.inputs || {}, runIf: node.runIf || null });
     const refs = str.match(/\{\{([^}]+)\}\}/g) || [];
     for (const ref of refs) {
       const depId = ref.slice(2, -2).split('.')[0];
