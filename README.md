@@ -848,6 +848,25 @@ tool errors. Verified live: an invalid payload creates exactly zero new
 jobs in `queue.stats()`. Run with
 `bun examples/validated-job-queue/setup.js`.
 
+**[`examples/mcp-vault/`](examples/mcp-vault/)** — combines `core/mcp.js`
+with `core/credentials.js`: a stored credential can be *used* by an AI
+client without ever being *revealed* to it — the same pattern
+`examples/vault-access-control` already established at the shell layer
+(`vault:use` grantable without `vault:reveal`), applied to MCP instead.
+Documents a real structural difference from the shell layer, not just a
+cautious choice: `core/shell.js` gates commands **per `Shell` instance**
+(RBAC), but `createMCPServer(cms, extraTools)` has no equivalent — every
+tool in `extraTools` is available to any connected client, with no
+per-caller scoping at the MCP transport level at all. So the safe
+design isn't "expose reveal but gate it somehow" — there is no
+"somehow" here — it's to never build a tool capable of returning a raw
+secret in the first place; `store_credential` is left out for the same
+reason. Verified live over a **real spawned stdio process** (not just
+`handleMCPRequest()`): stored a credential with a real-looking token,
+drove the actual process with real JSON-RPC lines over stdin, and
+confirmed the raw secret string is absent from the full response
+transcript. Run with `bun examples/mcp-vault/mcp-server.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -908,10 +927,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 962 tests across 73 files, ~32 seconds
+bun test tests/    # 968 tests across 74 files, ~32 seconds
 ```
 
-73 test files covering all core modules (including `log.js`/`metrics.js`/
+74 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -932,7 +951,8 @@ bun test tests/    # 962 tests across 73 files, ~32 seconds
 `examples/agent-authored-node`, `examples/workflow-observability`,
 `examples/scheduled-report-queue`, `examples/csv-bulk-import`,
 `examples/async-vector-index`, `examples/queue-observability`,
-`examples/mcp-vector-search`, and `examples/validated-job-queue`
+`examples/mcp-vector-search`, `examples/validated-job-queue`, and
+`examples/mcp-vault`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
