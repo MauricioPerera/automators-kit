@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute)
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 20 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -1317,6 +1317,39 @@ is intentionally simple: a workflow set as its own `errorWorkflow` is
 refused outright, and any longer chain (`A -> B -> A -> ...`) is bounded
 by a depth counter smuggled through the error trigger data, capped at 5.
 
+### Sub-workflows
+
+`workflow.execute` — registered per-instance in `WorkflowEngine`'s
+constructor, NOT one of the 19 engine-agnostic `core/nodes.js`
+`BUILTIN_NODES` (it needs a live engine to call back into) — runs another
+workflow by id and returns its result:
+
+```javascript
+const child = engine.create({ name: 'Send Receipt', nodes: [...] });
+engine.create({
+  name: 'Checkout',
+  nodes: [
+    { id: 'receipt', type: 'workflow.execute',
+      inputs: { workflowId: child._id, data: { orderId: '{{_trigger.orderId}}' } } },
+  ],
+});
+```
+
+`data` becomes the sub-workflow's `{{_trigger...}}`. The node returns
+`{ executionId, status, nodeResults }` — `nodeResults` gives the caller
+every sub-workflow node's output directly (e.g.
+`{{receipt.nodeResults.someNode.data}}`), since there's no separate
+"workflow output" concept. A failed sub-workflow (`status === 'failed'`)
+throws, failing the calling node the same way any other node error
+does — composes for free with `continueOnError` and `errorWorkflow`, no
+special-casing needed. Cycle detection is automatic and requires no
+wiring from the workflow author: `execute()` threads a call chain through
+`triggerData._subWorkflowChain`, local to each call's own closure (not
+instance state, so concurrent unrelated executions never share or
+corrupt it) — re-entering a workflow id already in the chain throws
+`Circular sub-workflow reference` instead of recursing forever, catching
+both direct self-calls and indirect cycles (`A -> B -> A`).
+
 ### Triggers
 - manual: `engine.run(id, data)`
 - webhook: `POST /api/workflows/webhook/:path`
@@ -1833,6 +1866,22 @@ through the error trigger data, capped at 5. 5 new regression tests in `tests/wo
 sharing the same db/registry, success never triggers it, self-reference doesn't self-trigger, an
 A↔B cycle stays bounded). Verified: 20 isolated runs of `workflow.test.js` and 4 full-suite runs,
 all clean.
+
+**`workflow.js` sub-workflow support added (2026-08-01):** closes another gap from this session's n8n
+comparison — no way to compose workflows by calling one from another. New `workflow.execute` node,
+registered per-instance in `WorkflowEngine`'s constructor (not `core/nodes.js`'s engine-agnostic
+`BUILTIN_NODES`, since it needs a live engine to call back into): runs another workflow by id, passes
+`data` as the sub-workflow's `{{_trigger...}}`, returns `{ executionId, status, nodeResults }`. A
+failed sub-workflow throws, failing the calling node the same way any other node error does —
+composes for free with `continueOnError` and `errorWorkflow`, no special-casing needed. Cycle
+detection required no new plumbing beyond one small, generic extension: `NodeRegistry.execute()` now
+accepts an optional 4th `ctx` argument passed through as the handler's 3rd parameter (existing 2-arg
+handlers are unaffected), used to thread a call chain through `triggerData._subWorkflowChain` — local
+to each `execute()` call's own closure, not instance state, so concurrent unrelated executions never
+share or corrupt it. Re-entering a workflow id already in the chain throws `Circular sub-workflow
+reference` instead of recursing forever, catching both direct self-calls and indirect cycles
+(`A -> B -> A`). 5 new regression tests in `tests/workflow.test.js`. Verified: 20 isolated runs of
+`workflow.test.js`/`nodes.test.js` and 3 full-suite runs, all clean.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
