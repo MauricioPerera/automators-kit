@@ -2,13 +2,13 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-781 tests | 0 deps | 23 modules | Bun + Deno + Node.js
+1023 tests | 0 deps | 26 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
 ## What it is
 
-A full-stack automation toolkit in vanilla JavaScript with zero npm dependencies. 23 core modules covering: document database, vector search (HNSW), HTTP router, CMS, n8n-style workflow engine, A2E executor, agent shell (command gateway), job queue, cron scheduler, agent memory, and more.
+A full-stack automation toolkit in vanilla JavaScript with zero npm dependencies. 26 core modules covering: document database, vector search (HNSW), HTTP router, CMS, n8n-style workflow engine, A2E executor, agent shell (command gateway), job queue, cron scheduler, agent memory, and more.
 
 Born from merging and distilling ideas from 10+ repos (lokiCMS, js-doc-store, js-vector-store, a2e, minimemory, Agent-Shell, php-agent-memory, EasyDB, RepoMemory, EmDash, ATDF) into a single portable project.
 

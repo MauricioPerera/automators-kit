@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 781 tests | 0 deps | 23 core modules
+By automators.work | 1023 tests | 0 deps | 26 core modules
 
 ## Architecture
 
