@@ -102,6 +102,19 @@ export function workflowRoutes(cms, engine) {
     return json({ triggered: workflowId });
   });
 
+  // Resumes an execution paused at a `wait.forWebhook` node -- the
+  // counterpart to the trigger webhook above, but for an already-running
+  // execution instead of starting a new one. Same secret convention: read
+  // from a header, generic 404 whether the execution isn't waiting on a
+  // webhook or the secret is wrong.
+  r.post('/resume/:execId', async (ctx) => {
+    const body = await ctx.json();
+    const secret = ctx.req.headers.get('X-Resume-Secret');
+    const workflowId = engine.resumeWebhook(ctx.params.execId, body, secret);
+    if (!workflowId) return error('No waiting execution for this id', 404);
+    return json({ resumed: ctx.params.execId, workflowId });
+  });
+
   // ─── NODES ────────────────────────────────────────────────
 
   r.get('/nodes/list', async (ctx) => {

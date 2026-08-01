@@ -276,6 +276,74 @@ describe('Webhook trigger', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Webhook resume (wait.forWebhook -- the counterpart to the trigger webhook
+// above, resuming an already-running execution instead of starting one)
+// ---------------------------------------------------------------------------
+
+describe('Webhook resume', () => {
+  it('rejects a resume call with the wrong or missing secret, accepts it with the right header, and threads resume data through', async () => {
+    const createRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'Approval Gate',
+      nodes: [
+        { id: 'pause', type: 'wait.forWebhook', inputs: { secret: 'resume-secret' } },
+        { id: 'after', type: 'set.value', inputs: { value: 'approved-by-{{pause.resumeData.approver}}' } },
+      ],
+      active: true,
+    }, adminToken));
+    expect(createRes.status).toBe(201);
+    const wfId = (await json(createRes)).workflow._id;
+
+    const runRes = await app.handle(req('POST', `/api/workflows/${wfId}/run`, {}, adminToken));
+    expect(runRes.status).toBe(200);
+    const runBody = await json(runRes);
+    expect(runBody.execution.status).toBe('waiting');
+    const execId = runBody.execution._id;
+
+    // No secret header at all → same generic 404 as an unregistered/unknown
+    // execution id — proves the secret is enforced over real HTTP.
+    const noSecretRes = await app.handle(req('POST', `/api/workflows/resume/${execId}`, { approver: 'alice' }));
+    expect(noSecretRes.status).toBe(404);
+
+    // Wrong secret → same 404.
+    const wrongReq = new Request(`http://localhost/api/workflows/resume/${execId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Resume-Secret': 'nope' },
+      body: JSON.stringify({ approver: 'alice' }),
+    });
+    const wrongRes = await app.handle(wrongReq);
+    expect(wrongRes.status).toBe(404);
+
+    // Correct secret → resumes.
+    const rightReq = new Request(`http://localhost/api/workflows/resume/${execId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Resume-Secret': 'resume-secret' },
+      body: JSON.stringify({ approver: 'alice' }),
+    });
+    const okRes = await app.handle(rightReq);
+    expect(okRes.status).toBe(200);
+    expect((await json(okRes)).resumed).toBe(execId);
+
+    // resumeWebhook() is fire-and-forget -- poll the execution until it
+    // actually finishes running the rest of the DAG.
+    let final;
+    const start = Date.now();
+    while (Date.now() - start < 2000) {
+      const getRes = await app.handle(req('GET', `/api/workflows/executions/${execId}`, null, adminToken));
+      final = (await json(getRes)).execution;
+      if (final.status !== 'waiting' && final.status !== 'resuming') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(final.status).toBe('success');
+    expect(final.nodeResults.after.data).toBe('approved-by-alice');
+  });
+
+  it('resuming an unknown or non-waiting execution id returns 404', async () => {
+    const res = await app.handle(req('POST', '/api/workflows/resume/does-not-exist', {}));
+    expect(res.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 404
 // ---------------------------------------------------------------------------
 

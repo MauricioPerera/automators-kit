@@ -322,6 +322,20 @@ const BUILTIN_NODES = [
     },
   },
   {
+    type: 'wait.forWebhook',
+    name: 'Wait For Webhook',
+    category: 'core',
+    description: 'Pause a workflow indefinitely until an explicit resume call arrives for THIS execution (POST /api/workflows/resume/:execId), surviving process restarts. Only meaningful inside a WorkflowEngine execution -- resolves immediately with no data if run standalone via NodeRegistry.execute().',
+    inputs: [
+      { name: 'secret', type: 'string' }, // optional -- if set, the resume call must present it (X-Resume-Secret header)
+    ],
+    outputs: [
+      { name: 'resumedAt', type: 'number' },
+      { name: 'resumeData', type: 'object' },
+    ],
+    handler: async (inputs) => ({ secret: inputs.secret || null, resumedAt: null, resumeData: null }),
+  },
+  {
     type: 'if',
     name: 'IF Condition',
     category: 'core',

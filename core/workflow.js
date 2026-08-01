@@ -40,19 +40,20 @@
  * `A -> B -> A` cycle throws `Circular sub-workflow reference` instead of
  * recursing forever.
  *
- * Persisted wait: the `wait.until` node (`core/nodes.js`) pauses an
- * execution until a time/duration, surviving process restarts -- unlike
- * the plain `wait` node's in-memory `setTimeout`. `execute()`/`_runLevels`
- * stop dispatching further DAG levels and store `status: 'waiting'` with
- * enough state (`execution.waitState`) to resume from the SAME persisted
- * execution document later, in this process or a fresh one. A timer
- * (`start()`/`stop()`, `opts.waitPollInterval`) scans for due waits and
- * resumes them via `_resumeExecution`. A downstream node that must run
- * AFTER a wait needs an explicit `{{waitNodeId.resumeAt}}` reference in
- * its `inputs` to land in a later DAG level — same existing gotcha as the
- * `if`/`onFalse: 'skip'` barrier, not a new one. Only time-based waiting
- * is implemented; webhook-based resume is a separate, not-yet-built
- * feature.
+ * Persisted wait: two nodes (`core/nodes.js`) pause an execution,
+ * surviving process restarts -- unlike the plain `wait` node's in-memory
+ * `setTimeout`. `wait.until` resumes automatically once a time/duration
+ * passes (a timer, `start()`/`stop()`/`opts.waitPollInterval`, scans for
+ * due ones). `wait.forWebhook` resumes only via an explicit
+ * `resumeWebhook()` call / `POST /api/workflows/resume/:execId`
+ * (routes/workflows.js) -- never auto-resumed. Either way, `execute()`/
+ * `_runLevels` stop dispatching further DAG levels and store
+ * `status: 'waiting'` with enough state (`execution.waitState`) to resume
+ * from the SAME persisted execution document later, in this process or a
+ * fresh one (`_resumeExecution`). A downstream node that must run AFTER a
+ * wait needs an explicit `{{waitNodeId.resumeAt}}`/`{{waitNodeId.resumeData}}`
+ * reference in its `inputs` to land in a later DAG level — same existing
+ * gotcha as the `if`/`onFalse: 'skip'` barrier, not a new one.
  *
  * Workflow definition:
  * {
@@ -337,13 +338,13 @@ export class WorkflowEngine {
    * Runs `levels[startIndex..]` against `context`, mutating `execution` in
    * place (nodeResults/errors/status). Factored out of execute() so a
    * fresh run (startIndex 0) and _resumeExecution() (startIndex ==
-   * wherever a `wait.until` previously paused) share the exact same
-   * dispatch logic.
+   * wherever a wait previously paused) share the exact same dispatch logic.
    *
-   * On a `wait.until` node whose resumeAt is still in the future,
-   * `execution.status` becomes 'waiting' and `execution.waitState`
-   * records where to resume -- the caller must check for that before
-   * treating the execution as finished (see _finalizeExecution).
+   * A `wait.until` node whose resumeAt is still in the future, or a
+   * `wait.forWebhook` node (always), pauses: `execution.status` becomes
+   * 'waiting' and `execution.waitState` records where/how to resume --
+   * the caller must check for that before treating the execution as
+   * finished (see _finalizeExecution).
    */
   async _runLevels(wf, execution, context, nodeMap, levels, startIndex, subWorkflowChain) {
     try {
@@ -376,12 +377,12 @@ export class WorkflowEngine {
           return this._nodeRegistry.execute(node.type, resolvedInputs, creds, { callChain: subWorkflowChain });
         }));
 
-        // A `wait.until` node in this level whose resumeAt is still ahead
-        // pauses the whole execution AFTER this level's results are
-        // committed -- checked below, alongside the existing skip/error
-        // commit loop, not before it (same "same-level siblings already
-        // dispatched still finish" philosophy as the `if` skip barrier).
-        let pauseUntil = null;
+        // A `wait.until`/`wait.forWebhook` node in this level pauses the
+        // whole execution AFTER this level's results are committed --
+        // checked below, alongside the existing skip/error commit loop,
+        // not before it (same "same-level siblings already dispatched
+        // still finish" philosophy as the `if` skip barrier).
+        let pauseState = null; // null | { mode: 'time', resumeAt, nodeId } | { mode: 'webhook', secret, nodeId }
 
         // Commit in the level's (array-preserving) order for deterministic,
         // backward-compatible nodeResults regardless of settle order.
@@ -406,7 +407,10 @@ export class WorkflowEngine {
               skipRemaining = true;
             }
             if (node.type === 'wait.until' && typeof nodeResult?.resumeAt === 'number' && nodeResult.resumeAt > Date.now()) {
-              pauseUntil = nodeResult.resumeAt;
+              pauseState = { mode: 'time', resumeAt: nodeResult.resumeAt, nodeId };
+            }
+            if (node.type === 'wait.forWebhook') {
+              pauseState = { mode: 'webhook', secret: nodeResult?.secret ?? null, nodeId };
             }
           } else {
             const err = outcome.reason;
@@ -425,9 +429,9 @@ export class WorkflowEngine {
         // A failure or a skip barrier in the SAME level takes priority
         // over pausing -- an execution that's already failed or been told
         // to stop everything should not be resurrected as 'waiting'.
-        if (pauseUntil !== null && !stopped && !skipRemaining) {
+        if (pauseState && !stopped && !skipRemaining) {
           execution.status = 'waiting';
-          execution.waitState = { resumeAt: pauseUntil, remainingLevelIndex: levelIndex + 1, subWorkflowChain };
+          execution.waitState = { ...pauseState, remainingLevelIndex: levelIndex + 1, subWorkflowChain };
           return;
         }
       }
@@ -493,8 +497,13 @@ export class WorkflowEngine {
    * in-memory state -- this is what makes the pause genuinely survive a
    * process restart: a brand-new WorkflowEngine instance pointed at the
    * same DocStore can call this and continue correctly.
+   *
+   * @param {object} executionDoc
+   * @param {*} [resumeData] - For a `wait.forWebhook` resume: whatever the
+   *   caller of `resumeWebhook()` provided, becomes
+   *   `{{waitNodeId.resumeData}}` for the rest of the workflow.
    */
-  async _resumeExecution(executionDoc) {
+  async _resumeExecution(executionDoc, resumeData) {
     const wf = this._workflows.findById(executionDoc.workflowId);
     if (!wf) {
       // The workflow was deleted while this execution was waiting -- fail
@@ -527,18 +536,31 @@ export class WorkflowEngine {
     }
 
     const execution = { ...executionDoc, status: 'running' };
-    const { remainingLevelIndex, subWorkflowChain } = executionDoc.waitState;
+    const { remainingLevelIndex, subWorkflowChain, mode, nodeId: waitNodeId } = executionDoc.waitState;
     delete execution.waitState;
+
+    // For a webhook-mode wait, the paused node's own committed result was
+    // just a placeholder ({ resumedAt: null, resumeData: null }) -- now
+    // that the resume has genuinely happened, replace it with the real
+    // resume time and whatever data the caller of resumeWebhook() sent, so
+    // downstream nodes referencing {{waitNodeId.resumeData}} see it.
+    if (mode === 'webhook' && waitNodeId) {
+      const resumedValue = { resumedAt: Date.now(), resumeData: resumeData ?? null };
+      context[waitNodeId] = resumedValue;
+      execution.nodeResults[waitNodeId] = { status: 'success', data: resumedValue, duration: null };
+    }
 
     await this._runLevels(wf, execution, context, nodeMap, levels, remainingLevelIndex, subWorkflowChain || []);
     this._finalizeExecution(wf, execution, executionDoc.trigger);
   }
 
   /**
-   * Scans for waiting executions whose resumeAt has passed and resumes
-   * each fire-and-forget -- called on a timer started by start()/stopped
-   * by stop(), mirroring core/cron.js's CronScheduler start()/stop().
-   * Same-process re-entrancy guard: flips status away from 'waiting'
+   * Scans for TIME-mode waiting executions whose resumeAt has passed and
+   * resumes each fire-and-forget -- called on a timer started by
+   * start()/stopped by stop(), mirroring core/cron.js's CronScheduler
+   * start()/stop(). `wait.forWebhook` pauses (mode: 'webhook') are never
+   * touched here; they only ever resume via an explicit resumeWebhook()
+   * call. Same-process re-entrancy guard: flips status away from 'waiting'
    * synchronously (no `await` between the find and this update) before
    * resuming, so a slow resume overlapping the next tick can't double-fire.
    * A genuinely concurrent second PROCESS polling the same db is a
@@ -546,7 +568,11 @@ export class WorkflowEngine {
    * for core/db.js's single-process design.
    */
   _pollWaitingExecutions() {
-    const due = this._executions.find({ status: 'waiting', 'waitState.resumeAt': { $lte: Date.now() } }).toArray();
+    const due = this._executions.find({
+      status: 'waiting',
+      'waitState.mode': 'time',
+      'waitState.resumeAt': { $lte: Date.now() },
+    }).toArray();
     for (const execDoc of due) {
       const claimed = this._executions.update({ _id: execDoc._id, status: 'waiting' }, { $set: { status: 'resuming' } });
       if (!claimed) continue;
@@ -555,6 +581,40 @@ export class WorkflowEngine {
       });
     }
     this.db.flush();
+  }
+
+  /**
+   * Resumes an execution paused at a `wait.forWebhook` node -- the
+   * counterpart to `webhookTrigger()` below, but for resuming an
+   * already-running execution instead of starting a new one. Called from
+   * `POST /api/workflows/resume/:execId` (routes/workflows.js).
+   *
+   * @param {string} executionId
+   * @param {*} [data] - becomes `{{waitNodeId.resumeData}}` for the rest
+   *   of the workflow.
+   * @param {string} [providedSecret] - required to match the wait node's
+   *   own `secret` input, if it set one.
+   * @returns {string|null} workflowId on success; null when the execution
+   *   doesn't exist, isn't waiting on a webhook, or the secret is wrong --
+   *   same "don't leak which case" shape as fireWebhook()'s trigger check.
+   */
+  resumeWebhook(executionId, data, providedSecret) {
+    const execDoc = this._executions.findById(executionId);
+    if (!execDoc || execDoc.status !== 'waiting' || execDoc.waitState?.mode !== 'webhook') return null;
+
+    const { secret } = execDoc.waitState;
+    if (secret !== undefined && secret !== null && secret !== '') {
+      if (providedSecret !== secret) return null;
+    }
+
+    const claimed = this._executions.update({ _id: executionId, status: 'waiting' }, { $set: { status: 'resuming' } });
+    if (!claimed) return null; // already being resumed (or resumed) by another call
+    this.db.flush();
+
+    this._resumeExecution({ ...execDoc, status: 'resuming' }, data).catch((err) => {
+      console.error(`[Workflow] Webhook resume failed for execution '${executionId}':`, err.message);
+    });
+    return execDoc.workflowId;
   }
 
   /**

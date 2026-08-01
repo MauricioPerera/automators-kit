@@ -1057,3 +1057,90 @@ describe('Persisted Wait (wait.until node)', () => {
     expect(childExec.status).toBe('waiting'); // independently still paused
   });
 });
+
+// ---------------------------------------------------------------------------
+// Persisted Wait (wait.forWebhook + resumeWebhook)
+// ---------------------------------------------------------------------------
+
+describe('Persisted Wait (wait.forWebhook + resumeWebhook)', () => {
+  it('pauses indefinitely at wait.forWebhook -- the poller never touches it', async () => {
+    const wf = engine.create({
+      name: 'WaitForWebhookOnly',
+      nodes: [{ id: 'pause', type: 'wait.forWebhook', inputs: {} }],
+    });
+    const exec = await engine.run(wf._id);
+
+    expect(exec.status).toBe('waiting');
+    expect(exec.waitState.mode).toBe('webhook');
+    expect(exec.waitState.resumeAt).toBeUndefined(); // no auto-resume time at all
+
+    engine._pollWaitingExecutions(); // even if called directly, mode:'time' filter excludes it
+    await new Promise((r) => setTimeout(r, 50));
+    expect(engine.getExecution(exec._id).status).toBe('waiting'); // untouched
+  });
+
+  it('resumeWebhook() resumes it, threading resume data into {{waitNodeId.resumeData}} for downstream nodes', async () => {
+    const wf = engine.create({
+      name: 'ResumeWithData',
+      nodes: [
+        { id: 'pause', type: 'wait.forWebhook', inputs: {} },
+        { id: 'after', type: 'set.value', inputs: { value: 'approved-by-{{pause.resumeData.approver}}' } },
+      ],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('waiting');
+
+    const workflowId = engine.resumeWebhook(exec._id, { approver: 'alice' });
+    expect(workflowId).toBe(wf._id);
+
+    // resumeWebhook() is fire-and-forget, same as the time-based poller.
+    let final;
+    const start = Date.now();
+    while (Date.now() - start < 2000) {
+      final = engine.getExecution(exec._id);
+      if (final.status !== 'waiting' && final.status !== 'resuming') break;
+      await new Promise((r) => setTimeout(r, 15));
+    }
+
+    expect(final.status).toBe('success');
+    expect(final.nodeResults.after.data).toBe('approved-by-alice');
+    expect(typeof final.nodeResults.pause.data.resumedAt).toBe('number'); // real timestamp now, not the null placeholder
+  });
+
+  it('rejects resume with a wrong or missing secret, accepts it with the right one', async () => {
+    const wf = engine.create({
+      name: 'SecretGated',
+      nodes: [{ id: 'pause', type: 'wait.forWebhook', inputs: { secret: 'top-secret' } }],
+    });
+    const exec = await engine.run(wf._id);
+
+    expect(engine.resumeWebhook(exec._id, {}, undefined)).toBeNull();
+    expect(engine.resumeWebhook(exec._id, {}, 'wrong')).toBeNull();
+    expect(engine.getExecution(exec._id).status).toBe('waiting'); // still untouched after 2 rejected attempts
+
+    expect(engine.resumeWebhook(exec._id, {}, 'top-secret')).toBe(wf._id);
+  });
+
+  it('resuming an execution that is not waiting on a webhook (or does not exist) returns null', async () => {
+    expect(engine.resumeWebhook('does-not-exist', {})).toBeNull();
+
+    const wf = engine.create({ name: 'AlreadyDone', nodes: [{ id: 'v', type: 'set.value', inputs: { value: 1 } }] });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    expect(engine.resumeWebhook(exec._id, {})).toBeNull(); // not waiting at all
+
+    const timeWaiter = engine.create({ name: 'TimeWaiter', nodes: [{ id: 'pause', type: 'wait.until', inputs: { ms: 60000 } }] });
+    const timeExec = await engine.run(timeWaiter._id);
+    expect(engine.resumeWebhook(timeExec._id, {})).toBeNull(); // waiting, but mode is 'time', not 'webhook'
+  });
+
+  it('a double resumeWebhook() call only resumes once -- the second returns null (re-entrancy guard)', async () => {
+    const wf = engine.create({ name: 'DoubleResume', nodes: [{ id: 'pause', type: 'wait.forWebhook', inputs: {} }] });
+    const exec = await engine.run(wf._id);
+
+    const first = engine.resumeWebhook(exec._id, {});
+    const second = engine.resumeWebhook(exec._id, {});
+    expect(first).toBe(wf._id);
+    expect(second).toBeNull();
+  });
+});
