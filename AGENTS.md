@@ -43,11 +43,15 @@ loads the adapter's data into an in-memory `Map` once (`_ensureLoaded()`)
 and never re-reads it; `flush()` is the only path back to disk, with no
 invalidation/coherency protocol. Two processes sharing the same underlying
 data would silently diverge, not error. Applies to everything built on
-`DocStore` (`cms.js`, `credentials.js`, `memory.js`, `workflow.js`'s
-execution history). `integrations/postgres-queue.js` sidesteps this for
-job queueing by never caching state at all — that pattern doesn't
-generalize to `Collection` without redesigning its caching model, out of
-scope for now.
+`DocStore` (`cms.js`, `credentials.js`, `memory.js`). `integrations/`
+sidesteps this for two specific pieces by never caching state at all
+(every operation is a fresh round trip): `postgres-queue.js` for job
+queueing, `postgres-execution-log.js` for workflow execution history.
+Neither touches `core/db.js`/`core/workflow.js` — standalone sidecars,
+not a fix to `Collection`. Could extend case by case to
+`cms.js`/`credentials.js`/`memory.js`, but doesn't generalize into one
+fix — `Collection`'s caching model itself would need a redesign from
+scratch, out of scope for now.
 
 ## Quick Start
 
@@ -743,6 +747,31 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 frozen oracle for `claimJobs` specifically; `tests/integrations-postgres-queue.test.js`
 covers the rest of the class (enqueue/stats/list/deadLetter/retry/purge)
 with the same rigor, no separate formal contract.
+
+`integrations/postgres-execution-log.js` — `PostgresExecutionLog`, a
+shared, multi-process-readable workflow execution history. Closes the
+last of the 3 infra gaps identified for running Automators Kit as an
+n8n alternative under intense, own-server use (the other two: horizontal
+job-queue scaling, above, and `a2e.js` concurrent `execute()` — see
+[Security](#security)). No `core/workflow.js` change needed:
+`WorkflowEngine.execute()` already returns the full execution object
+once it's done, so a caller just does `await log.record(exec)` right
+after `await engine.execute(...)` — multiple `WorkflowEngine` instances
+(one per worker process, each with its own local `DocStore`) can funnel
+into this one shared table instead of each staying trapped in its own
+process's local `_executions` collection. Unlike `claimJobs()`, no
+atomic/concurrency-critical operation here (record/read/purge are plain
+INSERT/SELECT/DELETE) — no KDD contract, same test-first discipline
+without the formal apparatus. Requires the optional `pg` dependency.
+Tests skip cleanly unless `POSTGRES_TEST_URL` is set; run this file
+alone, not stacked with the other `integrations-postgres-*.test.js`
+files — 3+ concurrent `pg.Pool`s against the same session-mode pooler
+tenant can exceed its connection limit (not a bug in the modules; each
+passes cleanly alone, and the queue's own 2-file pair still passes
+together):
+```bash
+POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-postgres-execution-log.test.js
+```
 
 ## MCP Server
 

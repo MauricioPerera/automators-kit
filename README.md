@@ -64,14 +64,18 @@ is why it's fast, and also why it can't be safely shared across multiple
 processes or machines: there's no cache invalidation or coherency protocol,
 so two processes each holding their own `Collection` over the same data
 would silently diverge instead of erroring. This applies to everything
-built on `DocStore` — `cms.js`, `credentials.js`, `memory.js`, and
-`workflow.js`'s execution history — not just one module.
-[`integrations/postgres-queue.js`](integrations/postgres-queue.js)'s
-`PostgresJobQueue` sidesteps this for job queueing specifically by never
-caching state at all (every claim is a fresh round trip) — that pattern
-doesn't generalize to `Collection` without redesigning its caching model
-from scratch, a project of a different scale than async-ifying method
-signatures alone.
+built on `DocStore` — `cms.js`, `credentials.js`, and `memory.js` — not
+just one module. [`integrations/`](#optional-integrations) sidesteps this
+for two specific pieces by never caching state at all (every operation is
+a fresh round trip): `postgres-queue.js`'s `PostgresJobQueue` for job
+queueing, and `postgres-execution-log.js`'s `PostgresExecutionLog` for
+workflow execution history. Neither touches `core/db.js` or
+`core/workflow.js` — they're standalone sidecars, not a fix to
+`Collection` itself. The same sidecar pattern could extend to
+`cms.js`/`credentials.js`/`memory.js` case by case, but doesn't generalize
+into one fix — `Collection`'s caching model itself would need a redesign
+from scratch to be safe across processes, a project of a different scale
+than async-ifying method signatures alone.
 
 ## Usage
 
@@ -696,13 +700,40 @@ skip cleanly unless `POSTGRES_TEST_URL` is set:
 POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-postgres-queue-claim.test.js tests/integrations-postgres-queue.test.js
 ```
 
+**[`integrations/postgres-execution-log.js`](integrations/postgres-execution-log.js)**
+— `PostgresExecutionLog`, a shared, multi-process-readable workflow
+execution history, closing the last of the 3 infra gaps identified for
+running Automators Kit as an n8n alternative under intense, own-server use
+(the other two: horizontal job-queue scaling, above, and `a2e.js`
+concurrent `execute()` — see [Security](#security)). Multiple
+`WorkflowEngine` instances (one per worker process, each with its own
+local file-based `DocStore` for workflow definitions) can funnel their
+execution history into this one shared table instead of each staying
+trapped in its own process's local `_executions` collection. No core
+change needed: `WorkflowEngine.execute()` already returns the full
+execution object once it's done, so a caller just does
+`await log.record(exec)` right after `await engine.execute(...)`. Unlike
+`claimJobs()` above, there's no atomic/concurrency-critical operation
+here (record/read/purge are plain INSERT/SELECT/DELETE), so no KDD
+contract for this one — same test-first discipline, without the formal
+apparatus. Verified live against a real Postgres (stable across repeated
+runs). Tests skip cleanly unless `POSTGRES_TEST_URL` is set; run this
+file alone, not stacked with the other `integrations-postgres-*.test.js`
+files in one invocation — 3+ concurrent `pg.Pool`s against the same
+session-mode pooler tenant can exceed its connection limit and cause
+unrelated timeouts (not a bug in any of the modules; each passes cleanly
+alone, and the queue's own 2-file pair still passes together):
+```bash
+POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-postgres-execution-log.test.js
+```
+
 ## Testing
 
 ```bash
-bun test tests/    # 892 tests across 61 files, ~29 seconds
+bun test tests/    # 894 tests across 62 files, ~29 seconds
 ```
 
-61 test files covering all core modules plus the `examples/content-pipeline`,
+62 test files covering all core modules plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -720,11 +751,12 @@ bun test tests/    # 892 tests across 61 files, ~29 seconds
 `examples/mcp-job-queue`, `examples/queue-access-control`, and
 `examples/vault-access-control`, and `examples/trigger-driven-a2e`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
-— see [Security](#security) below), plus 2 opt-in files for
-`integrations/postgres-queue.js` (`tests/integrations-postgres-queue-claim.test.js`,
-`tests/integrations-postgres-queue.test.js`) that skip cleanly and count as
-0 tests unless `POSTGRES_TEST_URL` is set — the 892/61 numbers above are the
-default, fully offline run. Fully deterministic — no known-flaky tests: `memory.test.js`'s dream-heuristic test used to assert
+— see [Security](#security) below), plus 3 opt-in files for the
+`integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
+`tests/integrations-postgres-queue.test.js`,
+`tests/integrations-postgres-execution-log.test.js`) that skip cleanly and
+count as 0 tests unless `POSTGRES_TEST_URL` is set — the 894/62 numbers
+above are the default, fully offline run. Fully deterministic — no known-flaky tests: `memory.test.js`'s dream-heuristic test used to assert
 `duration_ms > 0` on an operation that can legitimately finish in under
 0.5ms (rounds to exactly 0), now asserts the type/shape instead; and
 `vector.test.js`'s `QuantizedStore` test used to assert the quantized
