@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf)
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 20 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -724,7 +724,7 @@ fires each getting their own uncorrupted decision. Run with
 `tests/examples-trigger-driven-a2e.test.js`.
 
 `examples/agent-authored-node/` — answers a real question from the n8n
-comparison directly: n8n ships a CSV node, `core/nodes.js`'s 18
+comparison directly: n8n ships a CSV node, `core/nodes.js`'s 19
 built-ins don't. Instead of waiting for the framework to grow one, this
 demonstrates building it — an agent following a
 [KDD](https://github.com/MauricioPerera/KDD) task contract for the
@@ -1242,9 +1242,9 @@ engine.create({
 await engine.run(workflowId, { title: 'My Post' });
 ```
 
-### 18 Built-in Nodes
+### 19 Built-in Nodes
 
-Core: http.request, set.value, filter, merge, wait, if
+Core: http.request, set.value, filter, merge, wait, if, switch
 Communication: slack.send, discord.send, email.send
 Data: json.parse, json.stringify, text.template, base64.encode, base64.decode, math.calc, datetime.now
 AI: openai.chat, anthropic.chat
@@ -1254,6 +1254,37 @@ behind a keyword denylist that was trivially bypassable (real RCE, not a sandbox
 your own `handler` on a custom node if you need to run trusted code — see below.
 
 Custom nodes: `engine.nodes.add({ type: 'my.node', handler: async (inputs, creds) => ... })`
+
+### Branching
+
+`if` is binary and only offers a global `onFalse: 'skip'` barrier — false
+aborts every later DAG level, not just one branch. `switch` + a per-node
+`runIf` guard gives real N-way routing: each branch's nodes only run when
+they match, and unrelated nodes elsewhere in the workflow are unaffected.
+
+```javascript
+nodes: [
+  { id: 'tier', type: 'switch', inputs: {
+      value: '{{_trigger.plan}}',
+      cases: [{ when: 'gold', label: 'goldPath' }, { when: 'silver', label: 'silverPath' }],
+      default: 'basicPath',
+    } },
+  { id: 'goldPerk', type: 'slack.send', inputs: { message: 'VIP!' },
+    runIf: { equals: ['{{tier}}', 'goldPath'] }, credentials: 'slack' },
+  { id: 'basicPerk', type: 'set.value', inputs: { value: 'welcome' },
+    runIf: { equals: ['{{tier}}', 'basicPath'] } },
+]
+```
+
+A node whose `runIf` evaluates false gets `nodeResults[id].status === 'skipped'`
+(not an error, not aborted) — `context[id]` stays unset, so any node
+referencing `{{id...}}` resolves to `undefined`, same as referencing a node
+that never ran for any other reason. Only `{ equals: [a, b] }` is
+supported (each side resolved the same way `inputs` values are — a
+`{{ref}}` template or a literal) — enough to drive `switch`-based routing
+without growing into a general expression language. A node referenced
+inside another node's `runIf` counts as a DAG dependency the same way an
+`inputs` reference does, so it's always scheduled into an earlier level.
 
 ### Triggers
 - manual: `engine.run(id, data)`
@@ -1739,6 +1770,21 @@ JavaScript, so `Number('not-a-number')` (`NaN`) sailed through validation as a "
 creating an entry with a broken value. Verified live before the fix: an entry with `price: NaN` was
 created without error. Fixed to also require `Number.isFinite(value)`, with explicit approval; new
 regression test in `tests/cms.test.js`, verified live before/after.
+
+**`workflow.js` Switch node + `runIf` added (2026-08-01):** closes a real gap from this session's
+n8n comparison that was never actually attempted — only the 4 "hard infra" items (queue scaling,
+`db.js`/`Collection`, `a2e.js` concurrency, observability) got tracked and closed at the time.
+`workflow.js` only had the binary `if` node plus a global `onFalse: 'skip'` barrier that aborts
+everything after it; there was no way to route to one of several distinct branches while leaving
+unrelated nodes unaffected. Added the `switch` node (`core/nodes.js`, first `==` match against an
+ordered `cases` list wins, falls back to `default`) and a per-node `runIf: { equals: [a, b] }` guard
+(`core/workflow.js`) — a node whose guard evaluates false is marked `skipped`, not run, not an error,
+and critically not a global abort. `_buildWorkflowDAG`'s dependency scan now also covers `runIf`, so
+a node gated on a switch's output is correctly scheduled into a later DAG level and never races the
+switch it depends on. 3 new regression tests in `tests/workflow.test.js`. Verified: 30+ full-suite
+runs post-change and 8 baseline runs, all clean except one early run whose failure output wasn't
+captured and never recurred across everything that followed — noted rather than silently dropped,
+since it couldn't be conclusively ruled in or out as caused by this change.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
