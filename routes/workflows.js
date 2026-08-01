@@ -27,6 +27,17 @@ export function workflowRoutes(cms, engine) {
 
   r.get('/', auth, async () => json({ workflows: engine.list() }));
 
+  // Registered here, BEFORE the generic `/:id` catch-all below, because
+  // Router matches in registration order and `/:id` (a single path
+  // segment, same shape as `/credentials`) would otherwise shadow this
+  // route entirely -- GET /credentials would 404 as "Workflow not found"
+  // (id="credentials") instead of ever reaching the real handler. Found
+  // live while adding the OAuth2 routes below (same route-shadowing bug
+  // class already found once this session in an example's webhook path).
+  r.get('/credentials', auth, requireRole('admin'), async () => {
+    return json({ credentials: engine.vault.list() });
+  });
+
   r.get('/:id', auth, async (ctx) => {
     const wf = engine.get(ctx.params.id);
     if (!wf) return error('Workflow not found', 404);
@@ -132,10 +143,8 @@ export function workflowRoutes(cms, engine) {
   });
 
   // ─── CREDENTIALS ──────────────────────────────────────────
-
-  r.get('/credentials', auth, requireRole('admin'), async () => {
-    return json({ credentials: engine.vault.list() });
-  });
+  // (GET /credentials itself is registered near the top, before /:id --
+  // see the comment there)
 
   r.post('/credentials', auth, requireRole('admin'), async (ctx) => {
     const body = await ctx.json();
@@ -147,6 +156,36 @@ export function workflowRoutes(cms, engine) {
   r.delete('/credentials/:name', auth, requireRole('admin'), async (ctx) => {
     engine.vault.remove(ctx.params.name);
     return json({ deleted: true });
+  });
+
+  // ─── OAUTH2 ───────────────────────────────────────────────
+
+  // Config (including clientSecret) travels in the POST body, never a
+  // query string, so it never lands in access logs or browser history.
+  r.post('/oauth2/:name/start', auth, requireRole('admin'), async (ctx) => {
+    const config = await ctx.json();
+    try {
+      const authorizeUrl = await engine.vault.startOAuth2(ctx.params.name, config);
+      return json({ authorizeUrl });
+    } catch (err) {
+      return error(err.message, 400);
+    }
+  });
+
+  // No `auth` here by design: the OAuth2 provider calls this directly and
+  // cannot present our app's JWT. `state` (verified inside completeOAuth2)
+  // is the correct CSRF protection for this step, standard OAuth2
+  // semantics -- not a gap.
+  r.get('/oauth2/:name/callback', async (ctx) => {
+    const code = ctx.query.code;
+    const state = ctx.query.state;
+    if (!code || !state) return error('code and state are required', 400);
+    try {
+      await engine.vault.completeOAuth2(ctx.params.name, code, state);
+      return json({ authorized: ctx.params.name });
+    } catch (err) {
+      return error(err.message, 400);
+    }
   });
 
   return r;

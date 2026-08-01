@@ -9,6 +9,21 @@
  *   await vault.init();
  *   await vault.store('slack', { webhookUrl: 'https://hooks.slack.com/...' });
  *   const creds = await vault.get('slack');
+ *
+ * OAuth2 (authorization-code + PKCE + refresh, generic across any
+ * provider -- not per-provider presets):
+ *   const authorizeUrl = await vault.startOAuth2('github', {
+ *     authUrl: 'https://github.com/login/oauth/authorize',
+ *     tokenUrl: 'https://github.com/login/oauth/access_token',
+ *     clientId, clientSecret, redirectUri: 'https://your-app/api/workflows/oauth2/github/callback',
+ *     scope: 'repo',
+ *   });
+ *   // redirect the admin's browser to authorizeUrl; the provider then
+ *   // calls redirectUri with ?code=...&state=..., which the route hands to:
+ *   await vault.completeOAuth2('github', code, state);
+ *   const creds = await vault.get('github'); // { token: '...', refreshToken: '...' }
+ *   // get() transparently refreshes an expiring token before returning it --
+ *   // no special handling needed by callers, including node handlers.
  */
 
 import { FieldCrypto } from './db.js';
@@ -19,6 +34,30 @@ function _bytesToBase64(uint8) {
   let binary = '';
   for (let i = 0; i < uint8.length; i++) binary += String.fromCharCode(uint8[i]);
   return btoa(binary);
+}
+
+// base64url (no padding) -- same transform core/db.js's JWT helpers use,
+// duplicated locally rather than exported from db.js to avoid growing that
+// module's public surface for a credentials.js-only need.
+function _bytesToBase64url(uint8) {
+  return _bytesToBase64(uint8).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function _getWebCrypto() {
+  return globalThis.crypto?.webcrypto || globalThis.crypto;
+}
+
+function _randomToken(byteLength = 32) {
+  const bytes = _getWebCrypto().getRandomValues(new Uint8Array(byteLength));
+  return _bytesToBase64url(bytes);
+}
+
+/** PKCE (RFC 7636): a random code_verifier plus its S256 code_challenge. */
+async function _generatePKCE() {
+  const verifier = _randomToken(32);
+  const digest = await _getWebCrypto().subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  const challenge = _bytesToBase64url(new Uint8Array(digest));
+  return { verifier, challenge };
 }
 
 export class CredentialVault {
@@ -99,17 +138,36 @@ export class CredentialVault {
   }
 
   /**
-   * Get decrypted credentials.
+   * Get decrypted credentials. For an OAuth2 credential whose access token
+   * is expired or about to be (within 60s), transparently refreshes it
+   * first -- callers, including node handlers, never need to think about
+   * OAuth2 token lifetime. A refresh failure is logged and swallowed
+   * (returns the possibly-stale token rather than throwing): the vault
+   * itself becoming a new failure mode is worse than letting the actual
+   * API call fail naturally on a real 401.
    * @param {string} name
    * @returns {Promise<object|null>}
    */
   async get(name) {
     this._ensureInit();
-    const doc = this._col.findOne({ name });
+    let doc = this._col.findOne({ name });
     if (!doc) return null;
 
+    if (doc.type === 'oauth2' && typeof doc.expiresAt === 'number' && doc.expiresAt - Date.now() < 60_000) {
+      try {
+        await this._refreshOAuth2(doc);
+        doc = this._col.findOne({ name });
+      } catch (err) {
+        console.error(`[CredentialVault] OAuth2 refresh failed for '${name}':`, err.message);
+      }
+    }
+
+    return this._decryptValues(doc.values);
+  }
+
+  async _decryptValues(values) {
     const decrypted = {};
-    for (const [k, v] of Object.entries(doc.values || {})) {
+    for (const [k, v] of Object.entries(values || {})) {
       decrypted[k] = await this._crypto.decrypt(v);
     }
     return decrypted;
@@ -123,6 +181,8 @@ export class CredentialVault {
       name: doc.name,
       service: doc.service,
       description: doc.description,
+      type: doc.type || 'basic',
+      ...(doc.type === 'oauth2' ? { expiresAt: doc.expiresAt ?? null, pendingAuthorization: !!doc.pendingState } : {}),
       createdAt: doc.createdAt,
       updatedAt: doc.updatedAt,
       fields: Object.keys(doc.values || {}),
@@ -139,6 +199,163 @@ export class CredentialVault {
   /** Check if a credential exists */
   has(name) {
     return !!this._col.findOne({ name });
+  }
+
+  // ── OAuth2 (authorization-code + PKCE + refresh) ──────────
+
+  /**
+   * Begins an OAuth2 authorization-code flow for credential `name`.
+   * Persists `config` and a fresh PKCE verifier/state (encrypted) so the
+   * flow survives a restart between this call and the provider's redirect
+   * back to `completeOAuth2()`. Returns the URL to send the admin's
+   * browser to.
+   *
+   * Deliberately does NOT run `config.authUrl`/`tokenUrl`/`redirectUri`
+   * through net-guard.js's `assertPublicUrl`: that guard exists for
+   * outbound requests driven by untrusted WORKFLOW definitions. This
+   * config comes from an authenticated admin action (same trust level
+   * `store()` already extends to arbitrary `values`), and applying the
+   * SSRF lockdown here would also block legitimate internal/on-prem OAuth2
+   * providers with no way to opt out. Only basic URL parsing (rejects
+   * malformed input) is applied.
+   *
+   * @param {string} name
+   * @param {object} config
+   * @param {string} config.authUrl
+   * @param {string} config.tokenUrl
+   * @param {string} config.clientId
+   * @param {string} config.clientSecret
+   * @param {string} config.redirectUri
+   * @param {string} [config.scope]
+   * @returns {Promise<string>} authorizeUrl
+   */
+  async startOAuth2(name, config) {
+    this._ensureInit();
+    for (const field of ['authUrl', 'tokenUrl', 'clientId', 'clientSecret', 'redirectUri']) {
+      if (!config?.[field]) throw new Error(`startOAuth2: config.${field} is required`);
+    }
+    new URL(config.authUrl); new URL(config.tokenUrl); new URL(config.redirectUri); // throws on malformed input
+
+    const state = _randomToken(24);
+    const { verifier, challenge } = await _generatePKCE();
+
+    const existing = this._col.findOne({ name });
+    const doc = {
+      name,
+      type: 'oauth2',
+      oauth2Config: await this._crypto.encrypt(config),
+      pendingState: state,
+      pendingVerifier: await this._crypto.encrypt(verifier),
+      values: existing?.values || {}, // preserve a still-valid token across a re-authorize attempt
+      service: existing?.service || name,
+      description: existing?.description || '',
+      updatedAt: Date.now(),
+    };
+    if (existing) this._col.update({ _id: existing._id }, { $set: doc });
+    else this._col.insert({ ...doc, createdAt: Date.now() });
+    this.db.flush();
+
+    const url = new URL(config.authUrl);
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('client_id', config.clientId);
+    url.searchParams.set('redirect_uri', config.redirectUri);
+    url.searchParams.set('state', state);
+    url.searchParams.set('code_challenge', challenge);
+    url.searchParams.set('code_challenge_method', 'S256');
+    if (config.scope) url.searchParams.set('scope', config.scope);
+    return url.toString();
+  }
+
+  /**
+   * Completes an OAuth2 flow: exchanges the provider's `code` for tokens,
+   * using the state/PKCE verifier `startOAuth2()` stashed. Called from the
+   * `GET /api/workflows/oauth2/:name/callback` route.
+   * @param {string} name
+   * @param {string} code
+   * @param {string} state - must match what startOAuth2() generated
+   */
+  async completeOAuth2(name, code, state) {
+    this._ensureInit();
+    const doc = this._col.findOne({ name });
+    if (!doc || doc.type !== 'oauth2' || !doc.pendingState) {
+      throw new Error(`No pending OAuth2 flow for '${name}'`);
+    }
+    // Plain comparison, matching this codebase's existing convention for
+    // webhook-secret checks (core/triggers.js) -- not upgraded to a
+    // constant-time compare here either.
+    if (doc.pendingState !== state) {
+      throw new Error('OAuth2 state mismatch — possible CSRF, aborting');
+    }
+
+    const config = await this._crypto.decrypt(doc.oauth2Config);
+    const verifier = await this._crypto.decrypt(doc.pendingVerifier);
+
+    const res = await fetch(config.tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: config.redirectUri,
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    if (!res.ok) throw new Error(`OAuth2 token exchange failed: HTTP ${res.status}`);
+    const tokens = await res.json();
+    if (!tokens.access_token) throw new Error('OAuth2 token endpoint did not return access_token');
+
+    await this._storeOAuth2Tokens(name, config, tokens);
+  }
+
+  /** @private Refreshes an OAuth2 credential's access token via its stored refresh token. */
+  async _refreshOAuth2(doc) {
+    const config = await this._crypto.decrypt(doc.oauth2Config);
+    const refreshToken = await this._crypto.decrypt(doc.values?.refreshToken);
+    if (!refreshToken || typeof refreshToken !== 'string') {
+      throw new Error(`OAuth2 credential '${doc.name}' has no refresh token — re-authorize via startOAuth2()`);
+    }
+
+    const res = await fetch(config.tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+      }),
+    });
+    if (!res.ok) throw new Error(`OAuth2 token refresh failed: HTTP ${res.status}`);
+    const tokens = await res.json();
+    if (!tokens.access_token) throw new Error('OAuth2 refresh did not return access_token');
+    // Many providers omit refresh_token on a refresh response -- keep the old one.
+    if (!tokens.refresh_token) tokens.refresh_token = refreshToken;
+
+    await this._storeOAuth2Tokens(doc.name, config, tokens);
+  }
+
+  /** @private Persists a token exchange/refresh result and clears any pending-flow state. */
+  async _storeOAuth2Tokens(name, config, tokens) {
+    const values = { token: tokens.access_token, refreshToken: tokens.refresh_token };
+    const encrypted = {};
+    for (const [k, v] of Object.entries(values)) {
+      if (v !== undefined) encrypted[k] = await this._crypto.encrypt(v);
+    }
+    const expiresAt = typeof tokens.expires_in === 'number' ? Date.now() + tokens.expires_in * 1000 : null;
+
+    const doc = this._col.findOne({ name });
+    this._col.update({ _id: doc._id }, {
+      $set: {
+        values: { ...doc.values, ...encrypted },
+        oauth2Config: await this._crypto.encrypt(config),
+        expiresAt,
+        updatedAt: Date.now(),
+      },
+      $unset: { pendingState: 1, pendingVerifier: 1 },
+    });
+    this.db.flush();
   }
 
   _ensureInit() {

@@ -3,7 +3,7 @@
  * Full API flow: createApp → HTTP requests → verify responses
  */
 
-import { describe, it, expect, beforeAll } from 'bun:test';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'bun:test';
 import { createApp } from '../index.js';
 import { MemoryStorageAdapter } from '../core/db.js';
 
@@ -340,6 +340,87 @@ describe('Webhook resume', () => {
   it('resuming an unknown or non-waiting execution id returns 404', async () => {
     const res = await app.handle(req('POST', '/api/workflows/resume/does-not-exist', {}));
     expect(res.status).toBe(404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OAuth2 (authorization-code + PKCE) over real HTTP
+// ---------------------------------------------------------------------------
+
+describe('OAuth2', () => {
+  let mock;
+  function startMockOAuth2Server() {
+    const calls = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(r) {
+        const url = new URL(r.url);
+        if (url.pathname === '/token' && r.method === 'POST') {
+          const parsed = Object.fromEntries(new URLSearchParams(await r.text()));
+          calls.push(parsed);
+          if (parsed.grant_type === 'authorization_code' && parsed.code === 'valid-code' && parsed.code_verifier) {
+            return Response.json({ access_token: 'http-access-1', refresh_token: 'http-refresh-1', expires_in: 3600 });
+          }
+          return Response.json({ error: 'invalid_grant' }, { status: 400 });
+        }
+        return new Response('not found', { status: 404 });
+      },
+    });
+    return { stop: () => server.stop(true), calls, tokenUrl: `http://localhost:${server.port}/token`, authUrl: `http://localhost:${server.port}/authorize` };
+  }
+  beforeEach(() => { mock = startMockOAuth2Server(); });
+  afterEach(() => { mock.stop(); });
+
+  it('POST /oauth2/:name/start requires admin auth and returns a well-formed authorize URL', async () => {
+    const body = {
+      authUrl: mock.authUrl, tokenUrl: mock.tokenUrl,
+      clientId: 'cid', clientSecret: 'csecret', redirectUri: 'https://app.example/cb',
+    };
+
+    const noAuthRes = await app.handle(req('POST', '/api/workflows/oauth2/http-oauth/start', body));
+    expect(noAuthRes.status).toBe(401);
+
+    const okRes = await app.handle(req('POST', '/api/workflows/oauth2/http-oauth/start', body, adminToken));
+    expect(okRes.status).toBe(200);
+    const { authorizeUrl } = await json(okRes);
+    const url = new URL(authorizeUrl);
+    expect(url.origin + url.pathname).toBe(mock.authUrl);
+    expect(url.searchParams.get('code_challenge_method')).toBe('S256');
+    expect(authorizeUrl).not.toContain('csecret'); // client secret never in the URL
+  });
+
+  it('GET /oauth2/:name/callback completes the flow end to end (no auth required -- the provider calls it)', async () => {
+    const startRes = await app.handle(req('POST', '/api/workflows/oauth2/http-oauth2/start', {
+      authUrl: mock.authUrl, tokenUrl: mock.tokenUrl,
+      clientId: 'cid', clientSecret: 'csecret', redirectUri: 'https://app.example/cb',
+    }, adminToken));
+    const { authorizeUrl } = await json(startRes);
+    const state = new URL(authorizeUrl).searchParams.get('state');
+
+    const callbackRes = await app.handle(req('GET', `/api/workflows/oauth2/http-oauth2/callback?code=valid-code&state=${state}`));
+    expect(callbackRes.status).toBe(200);
+    expect((await json(callbackRes)).authorized).toBe('http-oauth2');
+    expect(mock.calls[0].code_verifier).toBeTruthy();
+
+    // Verify via the (already admin-authed) credentials list -- never
+    // exposes the decrypted token itself, just that it's live now.
+    const listRes = await app.handle(req('GET', '/api/workflows/credentials', null, adminToken));
+    const entry = (await json(listRes)).credentials.find((c) => c.name === 'http-oauth2');
+    expect(entry.type).toBe('oauth2');
+    expect(entry.pendingAuthorization).toBe(false);
+    expect(entry.expiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it('GET /oauth2/:name/callback with a wrong state returns 400, over real HTTP', async () => {
+    const startRes = await app.handle(req('POST', '/api/workflows/oauth2/wrong-state-test/start', {
+      authUrl: mock.authUrl, tokenUrl: mock.tokenUrl,
+      clientId: 'cid', clientSecret: 'csecret', redirectUri: 'https://app.example/cb',
+    }, adminToken));
+    expect(startRes.status).toBe(200);
+
+    const res = await app.handle(req('GET', '/api/workflows/oauth2/wrong-state-test/callback?code=valid-code&state=totally-wrong'));
+    expect(res.status).toBe(400);
+    expect(mock.calls.length).toBe(0); // rejected before ever reaching the token endpoint
   });
 });
 
