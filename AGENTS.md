@@ -795,6 +795,28 @@ imports with `price` stored as a real number, not the CSV's original
 string. Run with `bun examples/csv-bulk-import/setup.js`; regression
 test in `tests/examples-csv-bulk-import.test.js`.
 
+`examples/async-vector-index/` — combines `core/vector.js` with
+`core/queue.js`: embedding + indexing run inside a background job, off
+the HTTP request path — a submitted document is not immediately
+searchable, only once its job completes. Every other vector search
+example indexes synchronously in the same call that submits the
+document; this is `examples/job-queue`'s "kick off + poll" pattern
+applied to indexing specifically. A genuinely surprising finding from
+building this live: with the fully synchronous offline embedding
+(`examples/vector-memory`'s, reused directly) and no artificial delay,
+`core/queue.js`'s `enqueue()` triggers `_poll()` internally when already
+started, and since the handler has no real `await`, its whole body
+(embed + `store.set()` + `flush()`) runs synchronously before
+`enqueue()` even returns — an immediate search right after submit did
+find the document, making the "not searchable yet" window unobservable.
+Fixed by simulating a real embeddings API's network latency
+(`embedDelayMs`, default 30ms); the regression test proves the race
+deterministically with zero-latency in-process JS calls — manual `curl`
+testing may not reliably reproduce it, since HTTP round-trip time often
+exceeds the simulated delay itself. Run with
+`bun examples/async-vector-index/setup.js`; regression test in
+`tests/examples-async-vector-index.test.js`.
+
 ## Optional Integrations
 
 Standalone modules living outside `core/`, gated behind `optionalDependencies`

@@ -767,6 +767,28 @@ the rest of the batch still imports with `price` stored as a real
 number, not the CSV's original string. Run with
 `bun examples/csv-bulk-import/setup.js`.
 
+**[`examples/async-vector-index/`](examples/async-vector-index/)** —
+combines [`core/vector.js`](core/vector.js) with `core/queue.js`:
+embedding + indexing run inside a background job, off the HTTP request
+path — a submitted document is not immediately searchable, only once its
+job completes. Every other vector search example indexes synchronously
+in the same call that submits the document; this is
+`examples/job-queue`'s "kick off + poll" pattern applied to indexing
+specifically. A genuinely surprising finding from building this live:
+with the fully synchronous offline embedding
+(`examples/vector-memory`'s, reused directly) and no artificial delay,
+`core/queue.js`'s `enqueue()` triggers `_poll()` internally when already
+started, and since the handler has no real `await`, its whole body
+(embed + `store.set()` + `flush()`) runs synchronously before
+`enqueue()` even returns — an immediate search right after submit **did**
+find the document, making the "not searchable yet" window unobservable.
+Fixed by simulating a real embeddings API's network latency
+(`embedDelayMs`, default 30ms); the regression test proves the race
+deterministically with zero-latency in-process JS calls — manual `curl`
+testing may not reliably reproduce it, since HTTP round-trip time often
+exceeds the simulated delay itself. Run with
+`bun examples/async-vector-index/setup.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -827,10 +849,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 944 tests across 69 files, ~31 seconds
+bun test tests/    # 947 tests across 70 files, ~31 seconds
 ```
 
-69 test files covering all core modules (including `log.js`/`metrics.js`/
+70 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -849,7 +871,8 @@ bun test tests/    # 944 tests across 69 files, ~31 seconds
 `examples/mcp-job-queue`, `examples/queue-access-control`, and
 `examples/vault-access-control`, `examples/trigger-driven-a2e`,
 `examples/agent-authored-node`, `examples/workflow-observability`,
-`examples/scheduled-report-queue`, and `examples/csv-bulk-import`
+`examples/scheduled-report-queue`, `examples/csv-bulk-import`, and
+`examples/async-vector-index`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
