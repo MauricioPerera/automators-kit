@@ -6,7 +6,7 @@ By automators.work | 781 tests | 0 deps | 23 core modules
 ## Architecture
 
 ```
-Core (23 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
+Core (25 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
 
 db.js              Document DB: MongoDB queries, indices, JWT auth, AES-256-GCM encryption
 vector.js          Vector DB: Float32/Int8/Polar3bit/Binary, IVF, Matryoshka, BM25
@@ -31,6 +31,8 @@ connector.js       HTTP client: auth presets, retries, timeout (Slack/Discord/RE
 memory.js          Agent memory: semantic + episodic + working, recall with decay
 parallel.js        Task orchestration: race/merge/all strategies, timeout, weighted scoring
 net-guard.js       SSRF guard: blocks loopback/RFC1918/link-local/cloud-metadata destinations
+log.js             Structured logging: leveled, JSON-per-line entries, pluggable sink
+metrics.js         In-process metrics: counters/gauges/histograms, Prometheus text exposition format
 ```
 
 **Similar-sounding modules, when to reach for which:**
@@ -1012,6 +1014,31 @@ await restApi('https://api.github.com', 'ghp_...').get('/user');
 await slack('https://hooks.slack.com/...').post('', { text: 'Hello!' });
 ```
 
+## Observability
+
+```javascript
+import { Router, logger, metricsHandler } from './core/http.js';
+import { createLogger } from './core/log.js';
+import { MetricsRegistry } from './core/metrics.js';
+
+const log = createLogger('api');
+const metrics = new MetricsRegistry();
+
+const router = new Router();
+router.use(logger({ log, metrics })); // records http_requests_total / http_request_duration_ms
+router.get('/metrics', metricsHandler(metrics)); // Prometheus text exposition format
+```
+
+`log.js`'s `createLogger(module, opts)` returns `{debug, info, warn, error}`,
+each `(msg, fields) => void`, emitting structured JSON-per-line entries
+(pluggable via `opts.sink`). `metrics.js`'s `MetricsRegistry` exposes
+`counter(name, help)`/`gauge(name, help)`/`histogram(name, help, buckets)`,
+each supporting label objects (e.g. `.inc({method: 'GET'})`), and
+`render()` for the Prometheus text format. No distributed tracing — not
+honestly buildable zero-dependency without an external collector;
+correlation IDs threaded through `log.js` entries are the practical
+middle ground.
+
 ## Portable Text
 
 Block types: heading, paragraph, image, code, list, quote, divider, embed, table, custom
@@ -1357,6 +1384,20 @@ at the end, never during execution. 2 new regression tests verified against the 
 with corrupted/cross-contaminated results) and the fix (both pass); full suite green twice after.
 The fresh-executor-per-job pattern in `a2e-background`/`trigger-driven-a2e` is no longer required,
 though it remains valid.
+
+**`http.js` found while building `core/log.js`/`core/metrics.js` (2026-08-01):** real bug, previously
+untested. `logger()` measured request duration via `await next()`, but global middleware (registered
+via `router.use(...)`) runs through `_runMiddleware`, whose `next()` is a no-op continuation signal —
+routing happens separately, afterward, only if no middleware short-circuited with a Response. So
+`next()` could never observe the real route's duration. Verified live: a route that genuinely took
+200ms was logged as `"0.0ms"`, every time, regardless of actual duration, for every request in any
+app using `opts.logger` in `createApp()` or `examples/api-gateway`. Fixed by stashing the start time
+on `ctx.state` when `logger()` runs, read back by `Router.handle()` once the real `response` is known
+(after routing/CORS/rate-limit) — no restructuring of the middleware chain, verified before/after with
+a controlled-delay route. `logger()` now optionally emits structured entries via `core/log.js` and
+records `http_requests_total`/`http_request_duration_ms` into a `core/metrics.js` `MetricsRegistry`.
+A double-counting bug in `metrics.js`'s own histogram `render()` (bucket counts are already cumulative
+from `observe()`, don't re-accumulate) was also caught and fixed during verification.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly

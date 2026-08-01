@@ -23,7 +23,7 @@ bun server-bun.js  # start at http://localhost:3000
 
 No `npm install`. Zero dependencies.
 
-## 23 Core Modules
+## 25 Core Modules
 
 | Module | What it does |
 |--------|-------------|
@@ -50,6 +50,8 @@ No `npm install`. Zero dependencies.
 | **memory.js** | Agent memory: semantic + episodic + working, scoping, dedup, dream cycle, correction boost |
 | **parallel.js** | Task orchestration: race/merge/all strategies, timeout, weighted scoring |
 | **net-guard.js** | SSRF guard: blocks fetches to loopback/RFC1918/link-local/cloud-metadata destinations |
+| **log.js** | Structured logging: leveled, JSON-per-line entries, pluggable sink |
+| **metrics.js** | In-process metrics: counters/gauges/histograms, Prometheus text exposition format |
 
 **Picking between similar-sounding modules:**
 - **`memory.js` vs `vector.js`** — `memory.js`'s `recall()` is keyword/term matching with time decay, zero ML dependency, works out of the box (see [`examples/agent-memory-backend`](examples/agent-memory-backend/)). `vector.js` does real cosine-similarity search over embeddings *you* provide — it never calls an embedding API itself (see [`examples/vector-memory`](examples/vector-memory/)). Reach for `memory.js` first; reach for `vector.js` when word-overlap isn't good enough and you're willing to bring an embedding function. Combining them as a keyword-first, vector-fallback strategy is **not** a semantic upgrade with the zero-dependency offline embedding either module ships with — see [`examples/hybrid-recall`](examples/hybrid-recall/) for what verified, honest value the combination actually has (coverage, not paraphrase understanding).
@@ -117,6 +119,23 @@ bun cli.js structure
 import { DocStore, Router, VectorStore, WorkflowEngine, Shell, AgentMemory } from './index.js';
 // Build whatever you want — each module works independently
 ```
+
+### With observability
+```javascript
+import { Router, logger, metricsHandler } from './core/http.js';
+import { createLogger } from './core/log.js';
+import { MetricsRegistry } from './core/metrics.js';
+
+const log = createLogger('api');           // structured JSON-per-line entries
+const metrics = new MetricsRegistry();     // counters/gauges/histograms
+
+const router = new Router();
+router.use(logger({ log, metrics }));      // logs + records http_requests_total / http_request_duration_ms
+router.get('/metrics', metricsHandler(metrics)); // Prometheus text exposition format
+```
+No distributed tracing — not honestly buildable zero-dependency without an
+external collector to send spans to; correlation IDs threaded through
+`log.js` entries are the practical middle ground.
 
 ## Examples
 
@@ -730,10 +749,11 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 894 tests across 62 files, ~29 seconds
+bun test tests/    # 917 tests across 64 files, ~29 seconds
 ```
 
-62 test files covering all core modules plus the `examples/content-pipeline`,
+64 test files covering all core modules (including `log.js`/`metrics.js`)
+plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -755,8 +775,11 @@ end-to-end scenarios (includes the regression tests added by the 2026-07 securit
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
 `tests/integrations-postgres-queue.test.js`,
 `tests/integrations-postgres-execution-log.test.js`) that skip cleanly and
-count as 0 tests unless `POSTGRES_TEST_URL` is set — the 894/62 numbers
-above are the default, fully offline run. Fully deterministic — no known-flaky tests: `memory.test.js`'s dream-heuristic test used to assert
+count as 0 tests unless `POSTGRES_TEST_URL` is set — the 917/64 numbers
+above are the default, fully offline run. Deterministic except one known
+flaky test (`examples-agent-memory-hnsw.test.js`'s benchmark assertion,
+timing-sensitive under machine load — being tracked/fixed separately, not
+a correctness issue in `core/hnsw.js` itself): `memory.test.js`'s dream-heuristic test used to assert
 `duration_ms > 0` on an operation that can legitimately finish in under
 0.5ms (rounds to exactly 0), now asserts the type/shape instead; and
 `vector.test.js`'s `QuantizedStore` test used to assert the quantized
@@ -807,6 +830,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`db.js` found while building `examples/trigger-driven-a2e`)**: real core bug, low severity. `Auth.init()` already guards its 3 `createIndex()` calls with `try {} catch {}` (same pattern as `credentials.js`/`memory.js`/`workflow.js`), so a restart against already-persisted data never crashes — but it logged the **whole caught `Error` object**, not `err.message`, which Bun renders with a full stack trace and source-code snippet on stderr on every single normal restart, reading like a crash when it isn't. Fixed to log `err.message` only, verified live with a real `FileStorageAdapter` restart before/after.
 - **2026-07 (`examples/trigger-driven-a2e` finding)**: not a new core bug — the same DAG-dispatch-doesn't-stop-on-failure behavior already documented for `examples/a2e-vault-api`, reproduced in a different domain. A custom op throwing on bad data left its output undefined; the downstream `Conditional` read that as `false` and silently picked the exact same branch as a genuine negative classification. Verified live before the fix: a payload with no email came back routed to "personal" with no visible sign anything failed except a buried `errors` field. Fixed entirely at the example level (not core), matching `a2e-vault-api`'s own precedent — the bridge now stores an explicit `decision: null` / `status: "failed"` instead of trusting a Conditional computed from a failed op's undefined output.
 - **2026-07-31 (`a2e.js` concurrent `execute()` fixed properly in core)**: closes the gap first documented while building `examples/a2e-background` (2026-07, above) — `WorkflowExecutor.state`/`.results`/`.errors` lived on `this`, so two `execute()` calls on the same instance running concurrently corrupted each other's results; the only fix at the time was a per-job workaround (construct a fresh executor). Moved `state`/`results`/`errors` into a context object local to each `execute()` call, threaded through `_executeOp`/`_executeLoop`; public API (`constructor`/`load`/`execute`/`registerHandler`) is unchanged, and `executor.state`/`.results`/`.errors` are preserved as an informational snapshot of the last completed run (needed by `examples/a2e-pipeline`), written once at the end, never during execution. 2 new regression tests verified against the old code (both fail with corrupted/cross-contaminated results) and the fix (both pass); full suite green twice after. The fresh-executor-per-job pattern in `a2e-background`/`trigger-driven-a2e` is no longer required, though it remains valid.
+- **2026-08-01 (`http.js` found while building `core/log.js`/`core/metrics.js`)**: real bug, previously untested. `logger()` measured request duration via `await next()`, but global middleware (registered via `router.use(...)`) runs through `_runMiddleware`, whose `next()` is a no-op continuation signal — routing happens separately, afterward, only if no middleware short-circuited with a Response. So `next()` could never observe the real route's duration. Verified live: a route that genuinely took 200ms was logged as `"0.0ms"`, every time, regardless of actual duration — for every request, in any app using `opts.logger` in `createApp()` or `examples/api-gateway`. Fixed by stashing the start time on `ctx.state` when `logger()` runs, read back by `Router.handle()` once the real `response` is known (after routing/CORS/rate-limit) — no restructuring of the middleware chain, verified before/after with a controlled-delay route. `logger()` now optionally emits structured entries via `core/log.js` and records `http_requests_total`/`http_request_duration_ms` into a `core/metrics.js` `MetricsRegistry`.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:
