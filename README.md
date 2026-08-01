@@ -924,6 +924,27 @@ silently always defaulted to `add` regardless of what was requested.
 Caught before running anything; fixed by renaming the arithmetic field
 to `operation`. Run with `bun examples/shell-a2e-runner/setup.js`.
 
+**[`examples/mcp-content-render/`](examples/mcp-content-render/)** —
+combines `core/mcp.js` with `core/portable-text.js`: "let an AI client
+render/normalize/query markdown itself," directly, without needing a
+CMS entry to exist first. Distinct from every other `portable-text.js`
+example: `examples/mcp-cms` exposes CMS entry CRUD as MCP tools (entries
+may happen to *store* portable-text content, but rendering itself isn't
+a tool there); `examples/content-render-workflow` uses
+`portable-text.js` as a `core/workflow.js` **node**, not an MCP tool;
+`examples/content-formats` is HTTP/shell only, no MCP transport. 3
+tools: `render_markdown` (HTML/plain text/word count/excerpt),
+`normalize_markdown` (parse then re-serialize, normalizing formatting),
+and `find_blocks` (a structural query — e.g. `type: 'code'` to pull
+every fenced code block, `type: 'heading'` for the outline — something
+no other example demonstrates at all). Uses `{ includeCmsTools: false }`
+(same choice `mcp-vector-search`/`mcp-vault` made). Verified live over a
+real spawned stdio process; the regression test also confirms
+`normalize_markdown`'s round-trip is structurally stable — re-rendering
+its output produces byte-identical HTML to the original, even though
+the markdown text itself isn't guaranteed to match verbatim. Run with
+`bun examples/mcp-content-render/mcp-server.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -984,10 +1005,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 981 tests across 77 files, ~33 seconds
+bun test tests/    # 988 tests across 78 files, ~32 seconds
 ```
 
-77 test files covering all core modules (including `log.js`/`metrics.js`/
+78 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -1010,8 +1031,8 @@ bun test tests/    # 981 tests across 77 files, ~33 seconds
 `examples/async-vector-index`, `examples/queue-observability`,
 `examples/mcp-vector-search`, `examples/validated-job-queue`,
 `examples/mcp-vault`, `examples/parallel-workflow-race`,
-`examples/memory-consolidation-queue`, and
-`examples/shell-a2e-runner`
+`examples/memory-consolidation-queue`, `examples/shell-a2e-runner`, and
+`examples/mcp-content-render`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,

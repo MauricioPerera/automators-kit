@@ -950,6 +950,25 @@ Caught before running anything; fixed by renaming the arithmetic field
 to `operation`. Run with `bun examples/shell-a2e-runner/setup.js`;
 regression test in `tests/examples-shell-a2e-runner.test.js`.
 
+`examples/mcp-content-render/` — combines `core/mcp.js` with
+`core/portable-text.js`: "let an AI client render/normalize/query
+markdown itself," directly, without needing a CMS entry to exist first.
+Distinct from every other `portable-text.js` example: `examples/mcp-cms`
+exposes CMS entry CRUD as MCP tools (rendering itself isn't a tool
+there); `examples/content-render-workflow` uses `portable-text.js` as a
+`core/workflow.js` node, not an MCP tool; `examples/content-formats` is
+HTTP/shell only, no MCP transport. 3 tools: `render_markdown`
+(HTML/plain text/word count/excerpt), `normalize_markdown` (parse then
+re-serialize, normalizing formatting), and `find_blocks` (a structural
+query — e.g. `type: 'code'` to pull every fenced code block, `type:
+'heading'` for the outline — something no other example demonstrates).
+Uses `{ includeCmsTools: false }` (same choice `mcp-vector-search`/
+`mcp-vault` made). Verified live over a real spawned stdio process; the
+regression test also confirms `normalize_markdown`'s round-trip is
+structurally stable — re-rendering its output produces byte-identical
+HTML to the original. Run with `bun examples/mcp-content-render/mcp-server.js`;
+regression test in `tests/examples-mcp-content-render.test.js`.
+
 ## Optional Integrations
 
 Standalone modules living outside `core/`, gated behind `optionalDependencies`
