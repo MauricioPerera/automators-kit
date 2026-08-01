@@ -746,6 +746,27 @@ proves normal retry/backoff still applies to jobs from a scheduled
 batch, not just manually-enqueued ones. Run with
 `bun examples/scheduled-report-queue/setup.js`.
 
+**[`examples/csv-bulk-import/`](examples/csv-bulk-import/)** — combines
+[`core/csv.js`](core/csv.js) with `core/cms.js`: each CSV row becomes a
+real CMS entry via `cms.entries.create()`, not a throwaway in-memory
+array like `examples/agent-authored-node`'s `csv.parse` workflow node —
+a real n8n-style "import a spreadsheet" pattern neither existing example
+covers. `importProductsCsv()` reports per-row failures (a duplicate
+title colliding on the auto-generated slug, invalid data) instead of
+throwing and discarding everything already imported — a bulk import
+where one bad row aborts the other 999 is a bad UX n8n users would never
+accept from a CSV node either. Found and fixed a real `core/cms.js` bug
+while building this: `validateContent()` checked `typeof value !==
+'number'` for a `number`-typed field, but `typeof NaN === 'number'` is
+`true` in JavaScript — `Number('not-a-number')` sailed through
+validation as a "valid" number (zero prior test coverage for
+number-typed fields at all). Fixed to also require
+`Number.isFinite(value)` — see [Security](#security). Verified live: a
+row with an unparseable price is correctly rejected and reported, while
+the rest of the batch still imports with `price` stored as a real
+number, not the CSV's original string. Run with
+`bun examples/csv-bulk-import/setup.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -806,10 +827,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 938 tests across 68 files, ~31 seconds
+bun test tests/    # 944 tests across 69 files, ~31 seconds
 ```
 
-68 test files covering all core modules (including `log.js`/`metrics.js`/
+69 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -827,8 +848,8 @@ bun test tests/    # 938 tests across 68 files, ~31 seconds
 `examples/cms-semantic-search`, `examples/validated-workflow-nodes`, and
 `examples/mcp-job-queue`, `examples/queue-access-control`, and
 `examples/vault-access-control`, `examples/trigger-driven-a2e`,
-`examples/agent-authored-node`, `examples/workflow-observability`, and
-`examples/scheduled-report-queue`
+`examples/agent-authored-node`, `examples/workflow-observability`,
+`examples/scheduled-report-queue`, and `examples/csv-bulk-import`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
@@ -890,6 +911,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-07 (`examples/trigger-driven-a2e` finding)**: not a new core bug — the same DAG-dispatch-doesn't-stop-on-failure behavior already documented for `examples/a2e-vault-api`, reproduced in a different domain. A custom op throwing on bad data left its output undefined; the downstream `Conditional` read that as `false` and silently picked the exact same branch as a genuine negative classification. Verified live before the fix: a payload with no email came back routed to "personal" with no visible sign anything failed except a buried `errors` field. Fixed entirely at the example level (not core), matching `a2e-vault-api`'s own precedent — the bridge now stores an explicit `decision: null` / `status: "failed"` instead of trusting a Conditional computed from a failed op's undefined output.
 - **2026-07-31 (`a2e.js` concurrent `execute()` fixed properly in core)**: closes the gap first documented while building `examples/a2e-background` (2026-07, above) — `WorkflowExecutor.state`/`.results`/`.errors` lived on `this`, so two `execute()` calls on the same instance running concurrently corrupted each other's results; the only fix at the time was a per-job workaround (construct a fresh executor). Moved `state`/`results`/`errors` into a context object local to each `execute()` call, threaded through `_executeOp`/`_executeLoop`; public API (`constructor`/`load`/`execute`/`registerHandler`) is unchanged, and `executor.state`/`.results`/`.errors` are preserved as an informational snapshot of the last completed run (needed by `examples/a2e-pipeline`), written once at the end, never during execution. 2 new regression tests verified against the old code (both fail with corrupted/cross-contaminated results) and the fix (both pass); full suite green twice after. The fresh-executor-per-job pattern in `a2e-background`/`trigger-driven-a2e` is no longer required, though it remains valid.
 - **2026-08-01 (`http.js` found while building `core/log.js`/`core/metrics.js`)**: real bug, previously untested. `logger()` measured request duration via `await next()`, but global middleware (registered via `router.use(...)`) runs through `_runMiddleware`, whose `next()` is a no-op continuation signal — routing happens separately, afterward, only if no middleware short-circuited with a Response. So `next()` could never observe the real route's duration. Verified live: a route that genuinely took 200ms was logged as `"0.0ms"`, every time, regardless of actual duration — for every request, in any app using `opts.logger` in `createApp()` or `examples/api-gateway`. Fixed by stashing the start time on `ctx.state` when `logger()` runs, read back by `Router.handle()` once the real `response` is known (after routing/CORS/rate-limit) — no restructuring of the middleware chain, verified before/after with a controlled-delay route. `logger()` now optionally emits structured entries via `core/log.js` and records `http_requests_total`/`http_request_duration_ms` into a `core/metrics.js` `MetricsRegistry`.
+- **2026-08-01 (`cms.js` found while building `examples/csv-bulk-import`)**: real bug, previously untested — zero prior test coverage for number-typed content-type fields at all. `validateContent()` checked `typeof value !== 'number'` for a `number` field, but `typeof NaN === 'number'` is `true` in JavaScript, so `Number('not-a-number')` (`NaN`) sailed through validation as a "valid" number, silently creating an entry with a broken value. Verified live before the fix: an entry with `price: NaN` was created without error. Fixed to also require `Number.isFinite(value)`, with your explicit approval; new regression test in `tests/cms.test.js`, verified live before/after.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:

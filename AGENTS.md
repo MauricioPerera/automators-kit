@@ -776,6 +776,25 @@ applies to jobs from a scheduled batch, not just manually-enqueued ones.
 Run with `bun examples/scheduled-report-queue/setup.js`; regression test
 in `tests/examples-scheduled-report-queue.test.js`.
 
+`examples/csv-bulk-import/` — combines `core/csv.js` with `core/cms.js`:
+each CSV row becomes a real CMS entry via `cms.entries.create()`, not a
+throwaway in-memory array like `examples/agent-authored-node`'s
+`csv.parse` workflow node — a real n8n-style "import a spreadsheet"
+pattern neither existing example covers. `importProductsCsv()` reports
+per-row failures (a duplicate title colliding on the auto-generated
+slug, invalid data) instead of throwing and discarding everything
+already imported. Found and fixed a real `core/cms.js` bug while
+building this (see Security below): `validateContent()` checked `typeof
+value !== 'number'` for a `number`-typed field, but `typeof NaN ===
+'number'` is `true` in JavaScript — `Number('not-a-number')` sailed
+through validation as a "valid" number (zero prior test coverage for
+number-typed fields at all). Fixed to also require
+`Number.isFinite(value)`. Verified live: a row with an unparseable price
+is correctly rejected and reported, while the rest of the batch still
+imports with `price` stored as a real number, not the CSV's original
+string. Run with `bun examples/csv-bulk-import/setup.js`; regression
+test in `tests/examples-csv-bulk-import.test.js`.
+
 ## Optional Integrations
 
 Standalone modules living outside `core/`, gated behind `optionalDependencies`
@@ -1455,6 +1474,14 @@ a controlled-delay route. `logger()` now optionally emits structured entries via
 records `http_requests_total`/`http_request_duration_ms` into a `core/metrics.js` `MetricsRegistry`.
 A double-counting bug in `metrics.js`'s own histogram `render()` (bucket counts are already cumulative
 from `observe()`, don't re-accumulate) was also caught and fixed during verification.
+
+**`cms.js` found while building `examples/csv-bulk-import` (2026-08-01):** real bug, previously
+untested — zero prior test coverage for number-typed content-type fields at all. `validateContent()`
+checked `typeof value !== 'number'` for a `number` field, but `typeof NaN === 'number'` is `true` in
+JavaScript, so `Number('not-a-number')` (`NaN`) sailed through validation as a "valid" number, silently
+creating an entry with a broken value. Verified live before the fix: an entry with `price: NaN` was
+created without error. Fixed to also require `Number.isFinite(value)`, with explicit approval; new
+regression test in `tests/cms.test.js`, verified live before/after.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
