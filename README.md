@@ -1127,17 +1127,23 @@ and count as 0 tests unless `POSTGRES_TEST_URL` is set — 4 for the
 `tests/integrations-postgres-execution-log.test.js`,
 `tests/integrations-postgres-collection.test.js`) plus
 `tests/examples-postgres-cached-content.test.js` for the example above —
-the numbers above are the default, fully offline run. Deterministic except one known
-flaky test (`examples-agent-memory-hnsw.test.js`'s benchmark assertion,
-timing-sensitive under machine load — being tracked/fixed separately, not
-a correctness issue in `core/hnsw.js` itself): `memory.test.js`'s dream-heuristic test used to assert
+the numbers above are the default, fully offline run. Deterministic:
+`memory.test.js`'s dream-heuristic test used to assert
 `duration_ms > 0` on an operation that can legitimately finish in under
-0.5ms (rounds to exactly 0), now asserts the type/shape instead; and
+0.5ms (rounds to exactly 0), now asserts the type/shape instead;
 `vector.test.js`'s `QuantizedStore` test used to assert the quantized
 top-1 result always exactly matches the float32 top-1 — INT8 quantization
-is lossy by design, so that held only 498/500 over random trials. Now
+is lossy by design, so that held only 498/500 over random trials, now
 asserts the real guarantee (float32's top-1 shows up within the quantized
-top-3, which held 500/500).
+top-3, which held 500/500); and `examples-agent-memory-hnsw.test.js`'s
+semantic-vs-exact timing comparison used to flake ~1-in-5 at the file's
+560-entry default dataset size — both operations completed in well under
+a millisecond there, so the real (confirmed by profiling) HNSW-vs-brute-force
+gap was smaller than ordinary measurement noise. Fixed by running that one
+assertion against a separate, larger 2000-entry dataset (where the gap is
+consistently hundreds-of-microseconds-to-milliseconds) and taking the
+median over 5 trials instead of a single sample — verified stable across
+20 fresh isolated runs, 0 failures.
 
 ## Multi-runtime
 
