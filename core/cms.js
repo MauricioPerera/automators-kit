@@ -127,7 +127,9 @@ function validateContent(content, contentType) {
         }
         break;
       case 'number':
-        if (typeof value !== 'number') errors.push(`Field '${field.name}' must be a number`);
+        // typeof NaN === 'number' is true in JS -- a bare typeof check lets
+        // NaN (e.g. from Number('not-a-number')) through as "valid".
+        if (typeof value !== 'number' || !Number.isFinite(value)) errors.push(`Field '${field.name}' must be a number`);
         break;
       case 'boolean':
         if (typeof value !== 'boolean') errors.push(`Field '${field.name}' must be a boolean`);

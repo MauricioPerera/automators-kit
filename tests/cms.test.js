@@ -165,6 +165,15 @@ describe('Entries', () => {
       expect(e.message).toContain('must be a string');
     }
   });
+
+  it('rejects NaN for a number field instead of silently accepting it (typeof NaN === "number" in JS)', async () => {
+    await cms.contentTypes.create({
+      name: 'Product', slug: 'product', fields: [{ name: 'price', type: 'number', required: true }],
+    });
+    await expect(
+      cms.entries.create({ title: 'Bad Price', contentTypeSlug: 'product', content: { price: Number('not-a-number') } }, authorId)
+    ).rejects.toThrow(/must be a number/);
+  });
 });
 
 // ---------------------------------------------------------------------------
