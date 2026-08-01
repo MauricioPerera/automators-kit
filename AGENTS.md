@@ -46,15 +46,18 @@ loads the adapter's data into an in-memory `Map` once (`_ensureLoaded()`)
 and never re-reads it; `flush()` is the only path back to disk, with no
 invalidation/coherency protocol. Two processes sharing the same underlying
 data would silently diverge, not error. Applies to everything built on
-`DocStore` (`cms.js`, `credentials.js`, `memory.js`). `integrations/`
-sidesteps this for two specific pieces by never caching state at all
-(every operation is a fresh round trip): `postgres-queue.js` for job
-queueing, `postgres-execution-log.js` for workflow execution history.
-Neither touches `core/db.js`/`core/workflow.js` — standalone sidecars,
-not a fix to `Collection`. Could extend case by case to
-`cms.js`/`credentials.js`/`memory.js`, but doesn't generalize into one
-fix — `Collection`'s caching model itself would need a redesign from
-scratch, out of scope for now.
+`DocStore` (`cms.js`, `credentials.js`, `memory.js`). `integrations/` has
+three sidecars addressing this, none touching `core/db.js` itself:
+`postgres-queue.js` and `postgres-execution-log.js` sidestep the
+coherency problem entirely by never caching state (every operation is a
+fresh round trip); `postgres-collection.js`'s `PostgresCollection` is the
+first to actually solve it for a real `Collection`-shaped use case — it
+caches (for `Collection`-like read speed) and keeps that cache correct
+across processes via Postgres LISTEN/NOTIFY, verified live: a second
+process's cache reflects a first process's write with zero manual
+re-reads. Could extend case by case to `cms.js`/`credentials.js`/
+`memory.js`, but doesn't generalize into one fix — `Collection`'s caching
+model itself would need a redesign from scratch, out of scope for now.
 
 ## Quick Start
 
@@ -1058,6 +1061,32 @@ passes cleanly alone, and the queue's own 2-file pair still passes
 together):
 ```bash
 POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-postgres-execution-log.test.js
+```
+
+`integrations/postgres-collection.js` — `PostgresCollection`, the piece
+the "Known limit" note above says is missing: a `Collection`-equivalent
+that actually caches AND actually invalidates that cache across
+processes, instead of sidestepping the problem like the two sidecars
+above. Reads (`findById`/`findOne`/`find`/`count`) hit a local in-memory
+`Map` — no Postgres round trip — populated by `init()` and kept correct
+via Postgres's native `LISTEN`/`NOTIFY`: every write notifies a small
+`{op, id}` payload (never the full doc — `NOTIFY` payloads cap at 8000
+bytes), and every listening process either drops or targeted-refetches
+just that one row. Query/update semantics reuse `core/db.js`'s own
+exported `matchFilter`/`applyUpdate` directly — the same `$gt`/`$in`/
+`$regex`/`$set`/`$inc`/... language `Collection` uses, not a
+reimplemented subset. Verified live against a real Postgres: two
+separate `PostgresCollection` instances against the same table, one
+inserts/updates/deletes, the other's cache reflects it with the client
+never manually re-reading — the actual point of the module. Also covers
+the honest limitation: `LISTEN`/`NOTIFY` doesn't queue notifications for
+a dropped connection, so a listener that disconnects mid-run can miss a
+change; calling `init()` again does a full resync and is the documented
+recovery path (no automatic reconnect — out of scope for this pilot).
+Requires the optional `pg` dependency. Tests skip cleanly unless
+`POSTGRES_TEST_URL` is set:
+```bash
+POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-postgres-collection.test.js
 ```
 
 ## MCP Server

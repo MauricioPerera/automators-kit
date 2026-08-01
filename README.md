@@ -68,17 +68,20 @@ processes or machines: there's no cache invalidation or coherency protocol,
 so two processes each holding their own `Collection` over the same data
 would silently diverge instead of erroring. This applies to everything
 built on `DocStore` — `cms.js`, `credentials.js`, and `memory.js` — not
-just one module. [`integrations/`](#optional-integrations) sidesteps this
-for two specific pieces by never caching state at all (every operation is
-a fresh round trip): `postgres-queue.js`'s `PostgresJobQueue` for job
-queueing, and `postgres-execution-log.js`'s `PostgresExecutionLog` for
-workflow execution history. Neither touches `core/db.js` or
-`core/workflow.js` — they're standalone sidecars, not a fix to
-`Collection` itself. The same sidecar pattern could extend to
-`cms.js`/`credentials.js`/`memory.js` case by case, but doesn't generalize
-into one fix — `Collection`'s caching model itself would need a redesign
-from scratch to be safe across processes, a project of a different scale
-than async-ifying method signatures alone.
+just one module. [`integrations/`](#optional-integrations) has three
+sidecars addressing this, none of which touch `core/db.js` itself:
+`postgres-queue.js`'s `PostgresJobQueue` and `postgres-execution-log.js`'s
+`PostgresExecutionLog` sidestep the coherency problem entirely by never
+caching state (every operation is a fresh round trip); `postgres-collection.js`'s
+`PostgresCollection` is the first one to actually solve it for a real
+`Collection`-shaped use case — it caches (for `Collection`-like read
+speed) and keeps that cache correct across processes via Postgres
+LISTEN/NOTIFY, verified live: a second process's cache reflects a first
+process's write with zero manual re-reads. The same pattern could extend
+case by case to `cms.js`/`credentials.js`/`memory.js`, but doesn't
+generalize into one fix — `Collection`'s caching model itself would need
+a redesign from scratch to be safe across processes, a project of a
+different scale than async-ifying method signatures alone.
 
 ## Usage
 
@@ -1039,13 +1042,40 @@ alone, and the queue's own 2-file pair still passes together):
 POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-postgres-execution-log.test.js
 ```
 
+**[`integrations/postgres-collection.js`](integrations/postgres-collection.js)**
+— `PostgresCollection`, the piece the "Known architectural limit" note
+above says is missing: a `Collection`-equivalent that actually caches
+AND actually invalidates that cache across processes, instead of
+sidestepping the problem like the two sidecars above. Reads
+(`findById`/`findOne`/`find`/`count`) hit a local in-memory `Map` — no
+Postgres round trip — populated by `init()` and kept correct via
+Postgres's native `LISTEN`/`NOTIFY`: every write notifies a small
+`{op, id}` payload (never the full doc — `NOTIFY` payloads cap at 8000
+bytes), and every listening process either drops or targeted-refetches
+just that one row. Query/update semantics aren't reinvented: `find()`/
+`findOne()`/`update()` run the cached docs through `core/db.js`'s own
+exported `matchFilter`/`applyUpdate` — the same `$gt`/`$in`/`$regex`/
+`$set`/`$inc`/... language `Collection` uses. Verified live against a
+real Postgres: two separate `PostgresCollection` instances against the
+same table, one inserts/updates/deletes, the other's cache reflects it
+with the client never manually re-reading — the actual point of the
+module. Also covers the honest limitation head-on: `LISTEN`/`NOTIFY`
+doesn't queue notifications for a dropped connection, so a listener that
+disconnects mid-run can miss a change; calling `init()` again does a full
+resync and is the documented recovery path (no automatic reconnect is
+wired up — out of scope for this pilot). Requires the optional `pg`
+dependency. Tests skip cleanly unless `POSTGRES_TEST_URL` is set:
+```bash
+POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-postgres-collection.test.js
+```
+
 ## Testing
 
 ```bash
-bun test tests/    # 997 tests across 80 files, ~32 seconds
+bun test tests/    # 997 tests across 81 files, ~32 seconds
 ```
 
-80 test files covering all core modules (including `log.js`/`metrics.js`/
+81 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -1072,11 +1102,12 @@ bun test tests/    # 997 tests across 80 files, ~32 seconds
 `examples/mcp-content-render`, `examples/csv-report-queue`, and
 `examples/mcp-hnsw-search`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
-— see [Security](#security) below), plus 3 opt-in files for the
+— see [Security](#security) below), plus 4 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
 `tests/integrations-postgres-queue.test.js`,
-`tests/integrations-postgres-execution-log.test.js`) that skip cleanly and
-count as 0 tests unless `POSTGRES_TEST_URL` is set — the 917/64 numbers
+`tests/integrations-postgres-execution-log.test.js`,
+`tests/integrations-postgres-collection.test.js`) that skip cleanly and
+count as 0 tests unless `POSTGRES_TEST_URL` is set — the numbers
 above are the default, fully offline run. Deterministic except one known
 flaky test (`examples-agent-memory-hnsw.test.js`'s benchmark assertion,
 timing-sensitive under machine load — being tracked/fixed separately, not
