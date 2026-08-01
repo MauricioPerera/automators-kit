@@ -9,6 +9,8 @@
  *   Bun.serve({ fetch: r.handle })
  */
 
+import { createLogger } from './log.js';
+
 // ---------------------------------------------------------------------------
 // RESPONSE HELPERS
 // ---------------------------------------------------------------------------
@@ -30,6 +32,16 @@ export function error(message, status = 400) {
 
 export function notFound(message = 'Not found') {
   return json({ error: message }, 404);
+}
+
+/**
+ * Route handler exposing a MetricsRegistry (core/metrics.js) in Prometheus
+ * text exposition format.
+ * @param {import('./metrics.js').MetricsRegistry} registry
+ * @example router.get('/metrics', metricsHandler(metrics));
+ */
+export function metricsHandler(registry) {
+  return () => new Response(registry.render(), { headers: { 'Content-Type': 'text/plain; version=0.0.4' } });
 }
 
 /**
@@ -233,6 +245,21 @@ export class Router {
     // ctx.state) into the final response.
     response = this._applyCors(response, ctx);
     response = this._applyRateLimit(response, ctx);
+
+    // Emit the request log entry / metrics now, with the real total
+    // duration and final status — see logger()'s doc comment for why this
+    // can't happen inside the middleware itself.
+    if (ctx.state._loggerStart !== undefined) {
+      const ms = performance.now() - ctx.state._loggerStart;
+      const status = response ? response.status : 0;
+      ctx.state._loggerLog.info('request', { method: ctx.method, path: ctx.path, status, ms: Math.round(ms * 10) / 10 });
+      if (ctx.state._loggerMetrics) {
+        const labels = { method: ctx.method, path: ctx.path, status: String(status) };
+        ctx.state._loggerMetrics.counter('http_requests_total', 'Total HTTP requests').inc(labels);
+        ctx.state._loggerMetrics.histogram('http_request_duration_ms', 'HTTP request duration in ms').observe(labels, ms);
+      }
+    }
+
     return response;
   }
 
@@ -388,15 +415,33 @@ export function cors(opts = {}) {
   };
 }
 
+const _defaultHttpLog = createLogger('http');
+
 /**
  * Request logger middleware.
+ *
+ * Global middleware (registered via `router.use(...)`) runs through
+ * `_runMiddleware`, whose `next()` is a no-op continuation signal, NOT a
+ * real chain into routing — routing happens separately, afterward, only
+ * if no global middleware short-circuited with a Response. So `await
+ * next()` here can never observe how long the actual route took (verified
+ * live: it used to always report ~0ms regardless of real duration). This
+ * stashes the start time on `ctx.state` instead; `Router.handle()` — which
+ * runs after routing/CORS/rate-limit are all resolved — reads it back and
+ * emits the real entry once the true `response` is known.
+ *
+ * @param {object} [opts]
+ * @param {ReturnType<typeof import('./log.js').createLogger>} [opts.log] - defaults to a module-level 'http' logger
+ * @param {import('./metrics.js').MetricsRegistry} [opts.metrics] - optional; records http_requests_total / http_request_duration_ms when provided
  */
-export function logger() {
+export function logger(opts = {}) {
+  const log = opts.log || _defaultHttpLog;
+  const metrics = opts.metrics || null;
   return async (ctx, next) => {
-    const start = performance.now();
+    ctx.state._loggerStart = performance.now();
+    ctx.state._loggerLog = log;
+    ctx.state._loggerMetrics = metrics;
     await next();
-    const ms = (performance.now() - start).toFixed(1);
-    console.log(`${ctx.method} ${ctx.path} ${ms}ms`);
   };
 }
 

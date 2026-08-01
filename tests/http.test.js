@@ -4,7 +4,8 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { Router, json, error, notFound, cors, rateLimit, getActiveRateLimitTimerCount } from '../core/http.js';
+import { Router, json, error, notFound, cors, rateLimit, getActiveRateLimitTimerCount, logger, metricsHandler } from '../core/http.js';
+import { MetricsRegistry } from '../core/metrics.js';
 
 function req(method, path, body = null, headers = {}) {
   const opts = { method, headers: new Headers(headers) };
@@ -401,5 +402,76 @@ describe('Malformed path params', () => {
     const res = await r.handle(req('GET', '/users/hello%20world'));
     expect(res.status).toBe(200);
     expect((await jsonBody(res)).id).toBe('hello world');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// logger() request logging + metrics
+// ---------------------------------------------------------------------------
+
+describe('logger()', () => {
+  it('reports the real request duration, not ~0ms (regression: next() in global middleware never actually chained into routing)', async () => {
+    const entries = [];
+    const log = { debug() {}, warn() {}, error() {}, info: (msg, fields) => entries.push({ msg, ...fields }) };
+    const r = new Router();
+    r.use(logger({ log }));
+    r.get('/slow', async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return json({ ok: true });
+    });
+
+    await r.handle(req('GET', '/slow'));
+
+    expect(entries.length).toBe(1);
+    expect(entries[0].method).toBe('GET');
+    expect(entries[0].path).toBe('/slow');
+    expect(entries[0].status).toBe(200);
+    expect(entries[0].ms).toBeGreaterThanOrEqual(90);
+  });
+
+  it('records status of a non-200 response correctly', async () => {
+    const entries = [];
+    const log = { debug() {}, warn() {}, error() {}, info: (msg, fields) => entries.push({ msg, ...fields }) };
+    const r = new Router();
+    r.use(logger({ log }));
+    r.get('/missing', () => notFound());
+
+    await r.handle(req('GET', '/nope'));
+
+    expect(entries[0].status).toBe(404);
+  });
+
+  it('with no matching request, ctx.state._loggerStart stays unset and no entry is logged for routes never reached via logger()', async () => {
+    // A router with no logger() middleware at all must not throw or log anything.
+    const r = new Router();
+    r.get('/x', () => json({ ok: true }));
+    const res = await r.handle(req('GET', '/x'));
+    expect(res.status).toBe(200);
+  });
+
+  it('feeds http_requests_total / http_request_duration_ms into a MetricsRegistry when provided', async () => {
+    const metrics = new MetricsRegistry();
+    const r = new Router();
+    r.use(logger({ metrics }));
+    r.get('/ping', () => json({ ok: true }));
+
+    await r.handle(req('GET', '/ping'));
+
+    const output = metrics.render();
+    expect(output).toContain('http_requests_total{method="GET",path="/ping",status="200"} 1');
+    expect(output).toContain('http_request_duration_ms_count{method="GET",path="/ping",status="200"} 1');
+  });
+
+  it('metricsHandler() exposes a registry in Prometheus text format', async () => {
+    const metrics = new MetricsRegistry();
+    metrics.counter('demo_total', 'demo counter').inc({ x: '1' });
+    const r = new Router();
+    r.get('/metrics', metricsHandler(metrics));
+
+    const res = await r.handle(req('GET', '/metrics'));
+    expect(res.headers.get('Content-Type')).toContain('text/plain');
+    const text = await res.text();
+    expect(text).toContain('# TYPE demo_total counter');
+    expect(text).toContain('demo_total{x="1"} 1');
   });
 });
