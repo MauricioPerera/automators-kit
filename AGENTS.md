@@ -18,9 +18,9 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until)
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook)
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
-nodes.js           Node registry: 20 built-in nodes (core, communication, data, AI)
+nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
 credentials.js     Credential vault: AES-256-GCM encrypted storage
 shell.js           Agent shell: command gateway, parser, pipeline, JQ filter, RBAC
@@ -724,7 +724,7 @@ fires each getting their own uncorrupted decision. Run with
 `tests/examples-trigger-driven-a2e.test.js`.
 
 `examples/agent-authored-node/` — answers a real question from the n8n
-comparison directly: n8n ships a CSV node, `core/nodes.js`'s 20
+comparison directly: n8n ships a CSV node, `core/nodes.js`'s 21
 built-ins don't. Instead of waiting for the framework to grow one, this
 demonstrates building it — an agent following a
 [KDD](https://github.com/MauricioPerera/KDD) task contract for the
@@ -1242,9 +1242,9 @@ engine.create({
 await engine.run(workflowId, { title: 'My Post' });
 ```
 
-### 20 Built-in Nodes
+### 21 Built-in Nodes
 
-Core: http.request, set.value, filter, merge, wait, wait.until, if, switch
+Core: http.request, set.value, filter, merge, wait, wait.until, wait.forWebhook, if, switch
 Communication: slack.send, discord.send, email.send
 Data: json.parse, json.stringify, text.template, base64.encode, base64.decode, math.calc, datetime.now
 AI: openai.chat, anthropic.chat
@@ -1320,7 +1320,7 @@ by a depth counter smuggled through the error trigger data, capped at 5.
 ### Sub-workflows
 
 `workflow.execute` — registered per-instance in `WorkflowEngine`'s
-constructor, NOT one of the 20 engine-agnostic `core/nodes.js`
+constructor, NOT one of the 21 engine-agnostic `core/nodes.js`
 `BUILTIN_NODES` (it needs a live engine to call back into) — runs another
 workflow by id and returns its result:
 
@@ -1352,9 +1352,11 @@ both direct self-calls and indirect cycles (`A -> B -> A`).
 
 ### Persisted Wait
 
-`wait.until` pauses an execution until a time/duration, surviving process
-restarts — unlike the plain `wait` node's in-memory `setTimeout` (kept
-unchanged, still fine for short in-process delays):
+Two nodes pause an execution, surviving process restarts — unlike the
+plain `wait` node's in-memory `setTimeout` (kept unchanged, still fine
+for short in-process delays):
+
+**`wait.until`** resumes automatically once a time/duration passes:
 
 ```javascript
 engine.create({
@@ -1368,25 +1370,49 @@ engine.create({
 engine.start(); // also starts the wait-resume poller (opts.waitPollInterval, default 1000ms)
 ```
 
-A downstream node that must run *after* the wait needs an explicit
-`{{waitNodeId.resumeAt}}` reference in its `inputs` to land in a later
-DAG level — the same existing gotcha as the `if`/`onFalse: 'skip'`
-barrier (`_buildWorkflowDAG` only infers ordering from `{{ref}}`
-occurrences), not a new one. The paused execution is a real, persisted
-`_executions` document (`status: 'waiting'`) — any fresh `WorkflowEngine`
-instance pointed at the same `DocStore` (a real process restart, not
-just a new object) can resume it; verified live over two genuinely
-separate processes with a real `FileStorageAdapter` directory.
+**`wait.forWebhook`** resumes only via an explicit external call — never
+auto-resumed by the poller:
 
-Only time-based waiting is implemented — no webhook-based resume (the
-other half of n8n's Wait node). Also documented, not solved: two
-concurrent *processes* polling the same db for due waits (same class of
-gap as `db.js`'s single-process design); editing a workflow's `nodes`
-while an execution is paused is undefined; a `wait.until` **inside a
-sub-workflow** does not block the parent — `workflow.execute`'s handler
-treats a `'waiting'` sub-execution as an immediate success (not a throw),
-so the sub-workflow becomes an independently-resuming execution rather
-than the parent blocking on it.
+```javascript
+engine.create({
+  name: 'Approval Gate',
+  nodes: [
+    { id: 'pause', type: 'wait.forWebhook', inputs: { secret: 'my-resume-secret' } }, // secret optional
+    { id: 'notify', type: 'slack.send', credentials: 'slack',
+      inputs: { message: 'Approved by {{pause.resumeData.approver}}' } },
+  ],
+});
+```
+
+Resume it with `POST /api/workflows/resume/:execId` (`routes/workflows.js`)
+— `X-Resume-Secret` header if the node set one, same convention as the
+trigger webhook's `X-Webhook-Secret` (generic 404 whether the execution
+isn't waiting on a webhook or the secret is wrong — doesn't leak which).
+The request body becomes `{{waitNodeId.resumeData}}` for the rest of the
+workflow. Programmatically: `engine.resumeWebhook(executionId, data,
+secret)` — same secret/404 semantics, returns the workflow id on success
+or `null`.
+
+Either way, a downstream node that must run *after* the wait needs an
+explicit `{{waitNodeId.resumeAt}}`/`{{waitNodeId.resumeData}}` reference
+in its `inputs` to land in a later DAG level — the same existing gotcha
+as the `if`/`onFalse: 'skip'` barrier (`_buildWorkflowDAG` only infers
+ordering from `{{ref}}` occurrences), not a new one. The paused execution
+is a real, persisted `_executions` document (`status: 'waiting'`) — any
+fresh `WorkflowEngine` instance pointed at the same `DocStore` (a real
+process restart, not just a new object) can resume it; verified live
+over two genuinely separate processes with a real `FileStorageAdapter`
+directory for `wait.until`, and over a real spawned HTTP server with
+real `curl` calls for `wait.forWebhook`/`resumeWebhook`.
+
+Documented, not solved: two concurrent *processes* polling the same db
+for due `wait.until` waits (same class of gap as `db.js`'s
+single-process design); editing a workflow's `nodes` while an execution
+is paused is undefined; a wait **inside a sub-workflow** does not block
+the parent — `workflow.execute`'s handler treats a `'waiting'`
+sub-execution as an immediate success (not a throw), so the sub-workflow
+becomes an independently-resuming execution rather than the parent
+blocking on it.
 
 ### Triggers
 - manual: `engine.run(id, data)`
@@ -1937,6 +1963,37 @@ verified: 20 isolated runs and 2 full-suite runs, all clean. Also verified live 
 separate OS processes with a real `FileStorageAdapter` directory — process A paused a workflow and
 exited completely (`process.exit`), process B (a fresh Bun process, fresh `WorkflowEngine` instance)
 resumed it purely from disk and completed correctly.
+
+**`workflow.js` webhook-based Wait resume added (2026-08-01):** completes persisted Wait (previously
+time-based only). New `wait.forWebhook` node (optional per-node `secret`) never auto-resumes — unlike
+`wait.until`, `_pollWaitingExecutions`'s query now filters to `waitState.mode === 'time'` specifically,
+leaving webhook-mode pauses untouched by the timer. New public `resumeWebhook(executionId, data,
+providedSecret)` — the counterpart to `webhookTrigger()` for resuming an already-running execution
+instead of starting a new one, same "don't leak which case" secret-check shape. New route
+`POST /api/workflows/resume/:execId` (`routes/workflows.js`), mirroring the existing trigger webhook's
+`X-Webhook-Secret` convention with its own `X-Resume-Secret` header. `_resumeExecution` now accepts
+optional resume data and, for a webhook-mode wait, replaces the paused node's placeholder result with
+the real resume time and caller-provided data, so downstream nodes can reference
+`{{waitNodeId.resumeData}}`. 10 new regression tests (5 engine-level, 5 over real HTTP via
+`app.handle()` covering secret enforcement end to end). Verified: 20 isolated runs and 2 full-suite
+runs, all clean. Also verified live over a real spawned HTTP server with real `curl` calls: missing/
+wrong secret both 404, correct secret resumes and completes with resume data correctly threaded through.
+
+**A real intermittent flaky test, finally caught and fixed (2026-08-01):** root cause of an elusive
+full-suite flake that had surfaced repeatedly across this session, previously uncaptured (confirmed
+unrelated to the day's actual code changes — it recurred even on a docs-only diff, which is why).
+`tests/examples-content-render-workflow.test.js`'s `waitForExecution` polled `getExecutions()` (sorted
+`startedAt` DESC) and trusted `list[0]` to always be the newest execution, gated only by a length check.
+`Array.sort` is stable but has no tie-breaker for EQUAL `startedAt` values (a `Date.now()` millisecond)
+— when two consecutive tests' executions started within the same millisecond (common at in-memory
+speed), the stable sort left the OLDER one first, so a later test picked up an EARLIER test's execution
+and its content instead of its own. Caught live: the "escapes an inline script tag" test received the
+previous test's "Launch Day" HTML instead of its own "Security Note" markdown's render. Same bug class
+already diagnosed and fixed in `examples/scheduled-sync` earlier this session (`updatedAt` ties) — just
+never caught in this file until now. Fixed the same way `tests/examples-workflow-observability.test.js`
+already does it correctly: track which execution ids existed BEFORE triggering and wait for one NOT in
+that set, independent of sort order. Verified: 30 isolated runs of the fixed file and 7 full-suite runs,
+all clean — the flake that appeared roughly 1-in-15 to 1-in-30 runs all session has not recurred once.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
