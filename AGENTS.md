@@ -987,6 +987,23 @@ silently included or crashing the job. Run with
 `bun examples/csv-report-queue/setup.js`; regression test in
 `tests/examples-csv-report-queue.test.js`.
 
+`examples/mcp-hnsw-search/` — combines `core/mcp.js` with
+`core/hnsw.js`: a real 3000-product catalog (the same deterministic
+generator `examples/large-catalog-search` uses) indexed into a
+standalone `HNSWIndex`, exposed as MCP tools. Distinct from
+`examples/mcp-vector-search`: that one wraps `core/vector.js`'s
+`VectorStore` (linear scan, no benchmark tool at all). This one exposes
+`benchmark_search` — real ANN-vs-exact timing/recall comparison,
+self-verifiable by the client. Found and fixed a real bug before
+running anything: calling `buildCatalogTools(hnsw)` twice (once to
+index, once inside the MCP tools) built two separate, unrelated
+id→vector maps — the second empty, silently breaking
+`benchmark_search`'s exact-scan side (recall always `0`). Fixed by
+threading the same instance through both. Verified live over a real
+spawned stdio process with 3000 products indexed: a real ~3.9x speedup,
+recall 1.0. Run with `bun examples/mcp-hnsw-search/mcp-server.js`;
+regression test in `tests/examples-mcp-hnsw-search.test.js`.
+
 ## Optional Integrations
 
 Standalone modules living outside `core/`, gated behind `optionalDependencies`

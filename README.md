@@ -963,6 +963,25 @@ the real aggregate arrives via polling; rows with an unparseable
 included or crashing the job. Run with
 `bun examples/csv-report-queue/setup.js`.
 
+**[`examples/mcp-hnsw-search/`](examples/mcp-hnsw-search/)** — combines
+`core/mcp.js` with `core/hnsw.js`: a real 3000-product catalog (the same
+deterministic generator `examples/large-catalog-search` uses) indexed
+into a standalone `HNSWIndex`, exposed as MCP tools — "let an AI client
+search a large catalog via approximate nearest-neighbor AND interrogate
+the honest speed/recall trade-off itself." Distinct from
+`examples/mcp-vector-search`: that one wraps `core/vector.js`'s
+`VectorStore` (linear scan, small demo scale, no benchmark tool at all).
+This one exposes `benchmark_search` — no other MCP example lets the
+client itself measure and compare against ground truth, not just call
+search and trust it. Found and fixed a real bug before running anything:
+calling `buildCatalogTools(hnsw)` twice (once to index, once inside the
+MCP tools) built two separate, unrelated id→vector maps — the second one
+empty, silently breaking `benchmark_search`'s exact-scan side (recall
+always `0`). Fixed by threading the same instance through both. Verified
+live over a real spawned stdio process with 3000 products indexed: a
+real ~3.9x speedup, recall 1.0 for the tested query. Run with
+`bun examples/mcp-hnsw-search/mcp-server.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -1023,10 +1042,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 992 tests across 79 files, ~31 seconds
+bun test tests/    # 997 tests across 80 files, ~32 seconds
 ```
 
-79 test files covering all core modules (including `log.js`/`metrics.js`/
+80 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -1050,7 +1069,8 @@ bun test tests/    # 992 tests across 79 files, ~31 seconds
 `examples/mcp-vector-search`, `examples/validated-job-queue`,
 `examples/mcp-vault`, `examples/parallel-workflow-race`,
 `examples/memory-consolidation-queue`, `examples/shell-a2e-runner`,
-`examples/mcp-content-render`, and `examples/csv-report-queue`
+`examples/mcp-content-render`, `examples/csv-report-queue`, and
+`examples/mcp-hnsw-search`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
