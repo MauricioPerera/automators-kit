@@ -930,6 +930,26 @@ pending job id, the real `dream()` report arrives later via polling.
 Run with `bun examples/memory-consolidation-queue/setup.js`; regression
 test in `tests/examples-memory-consolidation-queue.test.js`.
 
+`examples/shell-a2e-runner/` — combines `core/shell.js` with
+`core/a2e.js`: `pipeline:run` reaches through the same command gateway
+`examples/command-gateway` uses for CRUD into a real, parameterized
+`core/a2e.js` `WorkflowExecutor` pipeline, chosen and configured by the
+shell command's own args at call time. Distinct from every other
+`a2e.js` example: `a2e-pipeline`/`a2e-vault-api`/`a2e-background` invoke
+pipelines directly from `setup.js` code, never through a shell command;
+`trigger-driven-a2e` fires them from a webhook, not a shell command.
+`pipelines.js` holds pipeline builders, not fixed definitions — each
+bakes the shell command's own args into a fresh compact-JSON definition
+per call, the same pattern `a2e-vault-api`/`trigger-driven-a2e` already
+use for `execute()`'s lack of per-call input. Found and fixed a real bug
+in this example's own first draft, not the product: `op` did double
+duty as both the pipeline selector and (inside the `calc` pipeline) the
+arithmetic operation, both reading the same `args.op` field — `calc`
+silently always defaulted to `add` regardless of what was requested.
+Caught before running anything; fixed by renaming the arithmetic field
+to `operation`. Run with `bun examples/shell-a2e-runner/setup.js`;
+regression test in `tests/examples-shell-a2e-runner.test.js`.
+
 ## Optional Integrations
 
 Standalone modules living outside `core/`, gated behind `optionalDependencies`

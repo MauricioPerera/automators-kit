@@ -904,6 +904,26 @@ consolidation passes racing each other is a correctness risk
 `dream()` report arrives later via polling. Run with
 `bun examples/memory-consolidation-queue/setup.js`.
 
+**[`examples/shell-a2e-runner/`](examples/shell-a2e-runner/)** —
+combines `core/shell.js` with `core/a2e.js`: `pipeline:run` reaches
+through the same command gateway `examples/command-gateway` uses for
+CRUD into a real, parameterized `core/a2e.js` `WorkflowExecutor`
+pipeline, chosen and configured by the shell command's own args at call
+time. Distinct from every other `a2e.js` example: `a2e-pipeline`/
+`a2e-vault-api`/`a2e-background` invoke pipelines directly from
+`setup.js` code, never through a shell command; `trigger-driven-a2e`
+fires them from a webhook, not a shell command. `pipelines.js` holds
+pipeline **builders**, not fixed definitions — each bakes the shell
+command's own args into a fresh compact-JSON definition per call, the
+same pattern `a2e-vault-api`/`trigger-driven-a2e` already use for
+`execute()`'s lack of per-call input. Found and fixed a real bug in this
+example's own first draft, not the product: `op` did double duty as
+both the pipeline selector and (inside the `calc` pipeline) the
+arithmetic operation, both reading the same `args.op` field — `calc`
+silently always defaulted to `add` regardless of what was requested.
+Caught before running anything; fixed by renaming the arithmetic field
+to `operation`. Run with `bun examples/shell-a2e-runner/setup.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -964,10 +984,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 975 tests across 76 files, ~32 seconds
+bun test tests/    # 981 tests across 77 files, ~33 seconds
 ```
 
-76 test files covering all core modules (including `log.js`/`metrics.js`/
+77 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -989,8 +1009,9 @@ bun test tests/    # 975 tests across 76 files, ~32 seconds
 `examples/scheduled-report-queue`, `examples/csv-bulk-import`,
 `examples/async-vector-index`, `examples/queue-observability`,
 `examples/mcp-vector-search`, `examples/validated-job-queue`,
-`examples/mcp-vault`, `examples/parallel-workflow-race`, and
-`examples/memory-consolidation-queue`
+`examples/mcp-vault`, `examples/parallel-workflow-race`,
+`examples/memory-consolidation-queue`, and
+`examples/shell-a2e-runner`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
