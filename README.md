@@ -789,6 +789,43 @@ testing may not reliably reproduce it, since HTTP round-trip time often
 exceeds the simulated delay itself. Run with
 `bun examples/async-vector-index/setup.js`.
 
+**[`examples/queue-observability/`](examples/queue-observability/)** —
+combines `core/log.js` + `core/metrics.js` with `core/queue.js`: real job
+outcomes (completed / dead-lettered / immediately failed with no
+registered handler), completing the observability trio alongside
+`core/http.js`'s own `logger()`/`metricsHandler()` and
+`examples/workflow-observability`. `observe.js`'s `observeJobQueue()`
+watches `_queue_jobs`/`_queue_dead` via `DocStore.watch()` — no
+`core/queue.js` changes needed. Verified live with a direct `db.watch()`
+probe before writing any example code: a job document goes through
+several `update()` calls (pending → processing → pending again on retry
+→ processing → ...) but exactly **one** terminal event fires per job,
+regardless of retries — retries and the final `_queue_jobs` row deletion
+after moving to dead are correctly ignored. Documents a real nuance, not
+a flaw: `queue_job_duration_ms` measures enqueue-to-terminal-state, not
+handler execution time alone — verified live, a job needing one retry
+(`backoffMs: 100`) reported ~240ms vs. an immediate success's ~0ms. Run
+with `bun examples/queue-observability/setup.js`.
+
+**[`examples/mcp-vector-search/`](examples/mcp-vector-search/)** —
+combines `core/mcp.js` with `core/vector.js`: real cosine-similarity
+semantic search exposed directly as MCP tools — "give an AI client its
+own semantic search tool," distinct from `examples/vector-memory`
+(shell/HTTP only, no MCP transport) and `examples/agent-memory-backend`
+(MCP, but `core/memory.js`'s keyword recall, not real vector search).
+`tools.js` reuses `examples/vector-memory`'s own handlers directly (same
+precedent `examples/mcp-job-queue` set reusing `examples/job-queue`'s
+`tools.js`). Uses `createMCPServer`'s documented
+`{ includeCmsTools: false }` option — deliberately differing from
+`agent-memory-backend`'s default of including the base CMS tools — and
+verified live over a **real spawned stdio process** (not just
+`handleMCPRequest()`): `tools/list` returns exactly the 4 vector tools,
+no CMS noise. Found a bug in this example's own first-draft regression
+test, not the product: it assumed the shared offline embedding
+understands paraphrase/synonyms, which `examples/hybrid-recall` already
+documented it does not (word-overlap only) — fixed to use genuinely
+shared vocabulary. Run with `bun examples/mcp-vector-search/mcp-server.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -849,10 +886,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 947 tests across 70 files, ~31 seconds
+bun test tests/    # 958 tests across 72 files, ~32 seconds
 ```
 
-70 test files covering all core modules (including `log.js`/`metrics.js`/
+72 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -871,8 +908,9 @@ bun test tests/    # 947 tests across 70 files, ~31 seconds
 `examples/mcp-job-queue`, `examples/queue-access-control`, and
 `examples/vault-access-control`, `examples/trigger-driven-a2e`,
 `examples/agent-authored-node`, `examples/workflow-observability`,
-`examples/scheduled-report-queue`, `examples/csv-bulk-import`, and
-`examples/async-vector-index`
+`examples/scheduled-report-queue`, `examples/csv-bulk-import`,
+`examples/async-vector-index`, `examples/queue-observability`, and
+`examples/mcp-vector-search`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,

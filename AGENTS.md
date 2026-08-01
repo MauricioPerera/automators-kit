@@ -817,6 +817,45 @@ exceeds the simulated delay itself. Run with
 `bun examples/async-vector-index/setup.js`; regression test in
 `tests/examples-async-vector-index.test.js`.
 
+`examples/queue-observability/` — combines `core/log.js` +
+`core/metrics.js` with `core/queue.js`: real job outcomes (completed /
+dead-lettered / immediately failed with no registered handler),
+completing the observability trio alongside `core/http.js`'s own
+`logger()`/`metricsHandler()` and `examples/workflow-observability`.
+`observe.js`'s `observeJobQueue()` watches `_queue_jobs`/`_queue_dead`
+via `DocStore.watch()` — no `core/queue.js` changes needed. Verified
+live with a direct `db.watch()` probe before writing any example code: a
+job document goes through several `update()` calls (pending →
+processing → pending again on retry → processing → ...) but exactly one
+terminal event fires per job, regardless of retries — retries and the
+final `_queue_jobs` row deletion after moving to dead are correctly
+ignored. Documents a real nuance, not a flaw: `queue_job_duration_ms`
+measures enqueue-to-terminal-state, not handler execution time alone —
+verified live, a job needing one retry (`backoffMs: 100`) reported
+~240ms vs. an immediate success's ~0ms. Run with
+`bun examples/queue-observability/setup.js`; regression test in
+`tests/examples-queue-observability.test.js`.
+
+`examples/mcp-vector-search/` — combines `core/mcp.js` with
+`core/vector.js`: real cosine-similarity semantic search exposed
+directly as MCP tools — "give an AI client its own semantic search
+tool," distinct from `examples/vector-memory` (shell/HTTP only, no MCP
+transport) and `examples/agent-memory-backend` (MCP, but
+`core/memory.js`'s keyword recall, not real vector search). `tools.js`
+reuses `examples/vector-memory`'s own handlers directly (same precedent
+`examples/mcp-job-queue` set reusing `examples/job-queue`'s `tools.js`).
+Uses `createMCPServer`'s documented `{ includeCmsTools: false }` option
+— deliberately differing from `agent-memory-backend`'s default of
+including the base CMS tools — and verified live over a real spawned
+stdio process (not just `handleMCPRequest()`): `tools/list` returns
+exactly the 4 vector tools, no CMS noise. Found a bug in this example's
+own first-draft regression test, not the product: it assumed the shared
+offline embedding understands paraphrase/synonyms, which
+`examples/hybrid-recall` already documented it does not (word-overlap
+only) — fixed to use genuinely shared vocabulary. Run with
+`bun examples/mcp-vector-search/mcp-server.js`; regression test in
+`tests/examples-mcp-vector-search.test.js`.
+
 ## Optional Integrations
 
 Standalone modules living outside `core/`, gated behind `optionalDependencies`
