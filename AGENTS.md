@@ -1007,6 +1007,25 @@ spawned stdio process with 3000 products indexed: a real ~3.9x speedup,
 recall 1.0. Run with `bun examples/mcp-hnsw-search/mcp-server.js`;
 regression test in `tests/examples-mcp-hnsw-search.test.js`.
 
+`examples/postgres-cached-content/` — combines
+`integrations/postgres-collection.js` (below) with `core/http.js`'s
+`Router`: a content-pages HTTP API with no `DocStore`/CMS involved at
+all — what a `Collection`-shaped API looks like when `db.js`'s
+single-process limit (see "Known limit" above) genuinely doesn't apply.
+`server.js` has no offline mode by design; it requires a real Postgres.
+Verified live with two genuinely separate OS processes (not two
+instances in one test) against a real Postgres over an SSH tunnel: a
+write via one process's HTTP API (`POST /pages`) showed up on the
+other's `GET`/list without it ever querying Postgres directly — a read
+attempted 0.3s after the write correctly missed it (real `NOTIFY`
+latency over a real network), 2s later it was there; `PUT`/`DELETE`
+propagated the same way in the same run. Regression test in
+`tests/examples-postgres-cached-content.test.js` spawns two real
+`Bun.serve()` instances to prove the same property survives being
+wrapped in an HTTP API, one layer above what
+`tests/integrations-postgres-collection.test.js` already proves at the
+class level. Both are opt-in, skipped unless `POSTGRES_TEST_URL` is set.
+
 ## Optional Integrations
 
 Standalone modules living outside `core/`, gated behind `optionalDependencies`

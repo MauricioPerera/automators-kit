@@ -985,6 +985,24 @@ live over a real spawned stdio process with 3000 products indexed: a
 real ~3.9x speedup, recall 1.0 for the tested query. Run with
 `bun examples/mcp-hnsw-search/mcp-server.js`.
 
+**[`examples/postgres-cached-content/`](examples/postgres-cached-content/)**
+— combines [`integrations/postgres-collection.js`](#optional-integrations)
+with `core/http.js`'s `Router`: a content-pages HTTP API with no
+`DocStore`/CMS involved at all — what a `Collection`-shaped API looks
+like when `db.js`'s "single-process by design" limit (see above) genuinely
+doesn't apply. `server.js` has no offline mode by design; it requires a
+real Postgres. Verified live with **two genuinely separate OS processes**
+(not two instances in one test) against a real Postgres over an SSH
+tunnel: a write via one process's HTTP API (`POST /pages`) showed up on
+the other's `GET`/list without it ever querying Postgres directly — a
+read attempted 0.3s after the write correctly missed it (honest, real
+`NOTIFY` latency over a real network), 2s later it was there; `PUT`/
+`DELETE` propagated the same way in the same run. The opt-in regression
+test spawns two real `Bun.serve()` instances to prove the same property
+survives being wrapped in an HTTP API, one layer above what
+`tests/integrations-postgres-collection.test.js` already proves at the
+class level.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -1072,10 +1090,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 997 tests across 81 files, ~32 seconds
+bun test tests/    # 997 tests across 82 files, ~32 seconds
 ```
 
-81 test files covering all core modules (including `log.js`/`metrics.js`/
+82 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -1099,16 +1117,17 @@ bun test tests/    # 997 tests across 81 files, ~32 seconds
 `examples/mcp-vector-search`, `examples/validated-job-queue`,
 `examples/mcp-vault`, `examples/parallel-workflow-race`,
 `examples/memory-consolidation-queue`, `examples/shell-a2e-runner`,
-`examples/mcp-content-render`, `examples/csv-report-queue`, and
-`examples/mcp-hnsw-search`
+`examples/mcp-content-render`, `examples/csv-report-queue`,
+`examples/mcp-hnsw-search`, and `examples/postgres-cached-content`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
-— see [Security](#security) below), plus 4 opt-in files for the
+— see [Security](#security) below), plus 5 opt-in files that skip cleanly
+and count as 0 tests unless `POSTGRES_TEST_URL` is set — 4 for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
 `tests/integrations-postgres-queue.test.js`,
 `tests/integrations-postgres-execution-log.test.js`,
-`tests/integrations-postgres-collection.test.js`) that skip cleanly and
-count as 0 tests unless `POSTGRES_TEST_URL` is set — the numbers
-above are the default, fully offline run. Deterministic except one known
+`tests/integrations-postgres-collection.test.js`) plus
+`tests/examples-postgres-cached-content.test.js` for the example above —
+the numbers above are the default, fully offline run. Deterministic except one known
 flaky test (`examples-agent-memory-hnsw.test.js`'s benchmark assertion,
 timing-sensitive under machine load — being tracked/fixed separately, not
 a correctness issue in `core/hnsw.js` itself): `memory.test.js`'s dream-heuristic test used to assert
