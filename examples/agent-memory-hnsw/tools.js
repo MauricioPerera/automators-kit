@@ -47,8 +47,13 @@ export function buildHnswMemoryTools(memory, hnsw, db, agentId) {
   }
 
   function recallSemantic(query, k = 5) {
+    // embed() timed outside the window, same as recallExact below and
+    // large-catalog-search/tools.js's searchAnn/searchExact -- otherwise
+    // this path alone pays the embedding cost inside its own "ms", an
+    // unfair handicap vs. the brute-force scan it's benchmarked against.
+    const qv = embed(query, DIM);
     const start = performance.now();
-    const hits = hnsw.search(embed(query, DIM), k);
+    const hits = hnsw.search(qv, k);
     const results = hits.map((h) => ({ id: h.id, title: semanticCol.findById(h.id)?.title, score: Number(h.score.toFixed(4)) }));
     return { results, ms: performance.now() - start };
   }
