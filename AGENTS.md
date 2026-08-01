@@ -6,7 +6,7 @@ By automators.work | 781 tests | 0 deps | 23 core modules
 ## Architecture
 
 ```
-Core (25 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
+Core (26 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
 
 db.js              Document DB: MongoDB queries, indices, JWT auth, AES-256-GCM encryption
 vector.js          Vector DB: Float32/Int8/Polar3bit/Binary, IVF, Matryoshka, BM25
@@ -33,6 +33,7 @@ parallel.js        Task orchestration: race/merge/all strategies, timeout, weigh
 net-guard.js       SSRF guard: blocks loopback/RFC1918/link-local/cloud-metadata destinations
 log.js             Structured logging: leveled, JSON-per-line entries, pluggable sink
 metrics.js         In-process metrics: counters/gauges/histograms, Prometheus text exposition format
+csv.js             CSV parsing: RFC-4180 quoted fields, embedded delimiters/newlines, escaped quotes
 ```
 
 **Similar-sounding modules, when to reach for which:**
@@ -718,6 +719,44 @@ business/personal routing, a failed enrichment correctly stored as
 fires each getting their own uncorrupted decision. Run with
 `bun examples/trigger-driven-a2e/setup.js`; regression test in
 `tests/examples-trigger-driven-a2e.test.js`.
+
+`examples/agent-authored-node/` — answers a real question from the n8n
+comparison directly: n8n ships a CSV node, `core/nodes.js`'s 18
+built-ins don't. Instead of waiting for the framework to grow one, this
+demonstrates building it — an agent following a
+[KDD](https://github.com/MauricioPerera/KDD) task contract for the
+correctness-critical piece (RFC-4180 quoting/escaping, kept external per
+this project's KDD-as-companion-methodology decision), validated against
+a frozen-oracle suite (`tests/csv.test.js`) and the real CCDD gate before
+use. `core/csv.js`'s `parseCsv` is a real, reusable core module, not
+example-local throwaway code — the "created once, stored, reusable" half
+of the thesis. `nodes.js`'s `csv.parse` wraps it via the same
+`WorkflowEngine.nodes.add()` extension point every other custom node in
+this repo already uses, and composes with the built-in `filter` node in
+a real workflow. Verified live with curl against a running server: a
+comma embedded inside a quoted field survives the whole pipeline intact.
+Run with `bun examples/agent-authored-node/setup.js`; regression test in
+`tests/examples-agent-authored-node.test.js`.
+
+`examples/workflow-observability/` — combines `core/log.js` +
+`core/metrics.js` (built to close the "no observability" gap for
+running Automators Kit in production) with `core/workflow.js`: real
+workflow-execution logging/metrics, complementing `core/http.js`'s own
+request-level `logger()`/`metricsHandler()`. `observe.js`'s
+`observeWorkflowEngine()` watches `_executions` via `DocStore.watch()`
+rather than wrapping `execute()`/`run()` directly, since webhook/cron/
+poll triggers call `execute()` fire-and-forget internally — a
+caller-side "await execute() then log" wrapper (the pattern
+`integrations/postgres-execution-log.js` uses) would silently miss every
+trigger-fired run. No core changes needed. Found a real routing gotcha
+while building this (not a bug, documented in the example's own
+README): the demo's original webhook path `run` collided with the
+protected `POST /:id/run` route registered earlier in
+`routes/workflows.js` — `Router`'s first-match-wins semantics dispatched
+to the wrong (401'ing) handler. Verified live: `/metrics` correctly
+separates successful and failed executions by label. Run with
+`bun examples/workflow-observability/setup.js`; regression test in
+`tests/examples-workflow-observability.test.js`.
 
 ## Optional Integrations
 

@@ -23,7 +23,7 @@ bun server-bun.js  # start at http://localhost:3000
 
 No `npm install`. Zero dependencies.
 
-## 25 Core Modules
+## 26 Core Modules
 
 | Module | What it does |
 |--------|-------------|
@@ -52,6 +52,7 @@ No `npm install`. Zero dependencies.
 | **net-guard.js** | SSRF guard: blocks fetches to loopback/RFC1918/link-local/cloud-metadata destinations |
 | **log.js** | Structured logging: leveled, JSON-per-line entries, pluggable sink |
 | **metrics.js** | In-process metrics: counters/gauges/histograms, Prometheus text exposition format |
+| **csv.js** | CSV parsing: RFC-4180 quoted fields, embedded delimiters/newlines, escaped quotes |
 
 **Picking between similar-sounding modules:**
 - **`memory.js` vs `vector.js`** — `memory.js`'s `recall()` is keyword/term matching with time decay, zero ML dependency, works out of the box (see [`examples/agent-memory-backend`](examples/agent-memory-backend/)). `vector.js` does real cosine-similarity search over embeddings *you* provide — it never calls an embedding API itself (see [`examples/vector-memory`](examples/vector-memory/)). Reach for `memory.js` first; reach for `vector.js` when word-overlap isn't good enough and you're willing to bring an embedding function. Combining them as a keyword-first, vector-fallback strategy is **not** a semantic upgrade with the zero-dependency offline embedding either module ships with — see [`examples/hybrid-recall`](examples/hybrid-recall/) for what verified, honest value the combination actually has (coverage, not paraphrase understanding).
@@ -689,6 +690,44 @@ business/personal routing, a failed enrichment correctly stored as
 fires each getting their own uncorrupted decision. Run with
 `bun examples/trigger-driven-a2e/setup.js`.
 
+**[`examples/agent-authored-node/`](examples/agent-authored-node/)** —
+answers a real question from the n8n comparison directly: n8n ships a
+CSV node, `core/nodes.js`'s 18 built-ins don't. Instead of waiting for
+the framework to grow one, this demonstrates building it — an agent
+following a [KDD](https://github.com/MauricioPerera/KDD) task contract
+for the correctness-critical piece (RFC-4180 quoting/escaping, kept
+external per this project's KDD-as-companion-methodology decision),
+validated against a frozen-oracle suite and the real CCDD gate before
+use. [`core/csv.js`](core/csv.js)'s `parseCsv` is a real, reusable core
+module (not example-local throwaway code) — the "created once, stored,
+reusable" half of the thesis. `nodes.js`'s `csv.parse` wraps it via the
+same `WorkflowEngine.nodes.add()` extension point every other custom
+node in this repo already uses, and composes with the **built-in**
+`filter` node in a real workflow. Verified live with curl against a
+running server: a comma embedded inside a quoted field survives the
+whole pipeline intact, never split into an extra column. Run with
+`bun examples/agent-authored-node/setup.js`.
+
+**[`examples/workflow-observability/`](examples/workflow-observability/)**
+— combines [`core/log.js`](core/log.js) + [`core/metrics.js`](core/metrics.js)
+(built to close the "no observability" gap for running Automators Kit in
+production) with `core/workflow.js`: real workflow-execution logging and
+metrics, complementing `core/http.js`'s own request-level
+`logger()`/`metricsHandler()`. `observe.js`'s `observeWorkflowEngine()`
+watches `_executions` via `DocStore.watch()` — an existing extension
+point — rather than wrapping `execute()`/`run()` directly, since
+webhook/cron/poll triggers call `execute()` fire-and-forget internally; a
+caller-side "await execute() then log" wrapper (the pattern
+[`integrations/postgres-execution-log.js`](integrations/postgres-execution-log.js)
+uses) would silently miss every trigger-fired run. No core changes
+needed. Found a real routing gotcha while building this (not a bug,
+documented in the example's own README): the demo's original webhook
+path `run` collided with the protected `POST /:id/run` route registered
+earlier in `routes/workflows.js` — `Router`'s first-match-wins semantics
+dispatched to the wrong (401'ing) handler. Verified live: `/metrics`
+correctly separates successful and failed executions by label. Run with
+`bun examples/workflow-observability/setup.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -749,11 +788,11 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 917 tests across 64 files, ~29 seconds
+bun test tests/    # 936 tests across 67 files, ~31 seconds
 ```
 
-64 test files covering all core modules (including `log.js`/`metrics.js`)
-plus the `examples/content-pipeline`,
+67 test files covering all core modules (including `log.js`/`metrics.js`/
+`csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -769,7 +808,8 @@ plus the `examples/content-pipeline`,
 `examples/hybrid-catalog-search`, `examples/rate-limited-queue`, and
 `examples/cms-semantic-search`, `examples/validated-workflow-nodes`, and
 `examples/mcp-job-queue`, `examples/queue-access-control`, and
-`examples/vault-access-control`, and `examples/trigger-driven-a2e`
+`examples/vault-access-control`, `examples/trigger-driven-a2e`,
+`examples/agent-authored-node`, and `examples/workflow-observability`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
