@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute)
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until)
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 20 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -724,7 +724,7 @@ fires each getting their own uncorrupted decision. Run with
 `tests/examples-trigger-driven-a2e.test.js`.
 
 `examples/agent-authored-node/` — answers a real question from the n8n
-comparison directly: n8n ships a CSV node, `core/nodes.js`'s 19
+comparison directly: n8n ships a CSV node, `core/nodes.js`'s 20
 built-ins don't. Instead of waiting for the framework to grow one, this
 demonstrates building it — an agent following a
 [KDD](https://github.com/MauricioPerera/KDD) task contract for the
@@ -1242,9 +1242,9 @@ engine.create({
 await engine.run(workflowId, { title: 'My Post' });
 ```
 
-### 19 Built-in Nodes
+### 20 Built-in Nodes
 
-Core: http.request, set.value, filter, merge, wait, if, switch
+Core: http.request, set.value, filter, merge, wait, wait.until, if, switch
 Communication: slack.send, discord.send, email.send
 Data: json.parse, json.stringify, text.template, base64.encode, base64.decode, math.calc, datetime.now
 AI: openai.chat, anthropic.chat
@@ -1320,7 +1320,7 @@ by a depth counter smuggled through the error trigger data, capped at 5.
 ### Sub-workflows
 
 `workflow.execute` — registered per-instance in `WorkflowEngine`'s
-constructor, NOT one of the 19 engine-agnostic `core/nodes.js`
+constructor, NOT one of the 20 engine-agnostic `core/nodes.js`
 `BUILTIN_NODES` (it needs a live engine to call back into) — runs another
 workflow by id and returns its result:
 
@@ -1349,6 +1349,44 @@ instance state, so concurrent unrelated executions never share or
 corrupt it) — re-entering a workflow id already in the chain throws
 `Circular sub-workflow reference` instead of recursing forever, catching
 both direct self-calls and indirect cycles (`A -> B -> A`).
+
+### Persisted Wait
+
+`wait.until` pauses an execution until a time/duration, surviving process
+restarts — unlike the plain `wait` node's in-memory `setTimeout` (kept
+unchanged, still fine for short in-process delays):
+
+```javascript
+engine.create({
+  name: 'Delayed Reminder',
+  nodes: [
+    { id: 'pause', type: 'wait.until', inputs: { ms: 3600000 } }, // 1 hour; or { resumeAt: <epoch ms> }
+    { id: 'notify', type: 'slack.send', credentials: 'slack',
+      inputs: { message: 'Reminder! (paused until {{pause.resumeAt}})' } },
+  ],
+});
+engine.start(); // also starts the wait-resume poller (opts.waitPollInterval, default 1000ms)
+```
+
+A downstream node that must run *after* the wait needs an explicit
+`{{waitNodeId.resumeAt}}` reference in its `inputs` to land in a later
+DAG level — the same existing gotcha as the `if`/`onFalse: 'skip'`
+barrier (`_buildWorkflowDAG` only infers ordering from `{{ref}}`
+occurrences), not a new one. The paused execution is a real, persisted
+`_executions` document (`status: 'waiting'`) — any fresh `WorkflowEngine`
+instance pointed at the same `DocStore` (a real process restart, not
+just a new object) can resume it; verified live over two genuinely
+separate processes with a real `FileStorageAdapter` directory.
+
+Only time-based waiting is implemented — no webhook-based resume (the
+other half of n8n's Wait node). Also documented, not solved: two
+concurrent *processes* polling the same db for due waits (same class of
+gap as `db.js`'s single-process design); editing a workflow's `nodes`
+while an execution is paused is undefined; a `wait.until` **inside a
+sub-workflow** does not block the parent — `workflow.execute`'s handler
+treats a `'waiting'` sub-execution as an immediate success (not a throw),
+so the sub-workflow becomes an independently-resuming execution rather
+than the parent blocking on it.
 
 ### Triggers
 - manual: `engine.run(id, data)`
@@ -1882,6 +1920,23 @@ share or corrupt it. Re-entering a workflow id already in the chain throws `Circ
 reference` instead of recursing forever, catching both direct self-calls and indirect cycles
 (`A -> B -> A`). 5 new regression tests in `tests/workflow.test.js`. Verified: 20 isolated runs of
 `workflow.test.js`/`nodes.test.js` and 3 full-suite runs, all clean.
+
+**`workflow.js` persisted Wait added (2026-08-01):** closes the last small, genuinely-buildable gap
+from this session's n8n comparison. The existing `wait` node is a bare `setTimeout` — the whole
+`execute()` call blocks in memory, so a process restart mid-wait loses all progress. Scoped explicitly
+to time-based waiting only; webhook-based resume (the other half of n8n's Wait node) is a separate
+feature, not built here. New `wait.until` node (`core/nodes.js`, existing `wait` untouched); `execute()`
+split into resumable pieces (`_runLevels`/`_finalizeExecution`/`_resumeExecution`/
+`_pollWaitingExecutions`) so a fresh run and a resume share identical dispatch logic. A paused
+execution's `waitState` (`{ resumeAt, remainingLevelIndex, subWorkflowChain }`) is the only extra state
+persisted — `context` is reconstructed from the execution's own already-stored `nodeResults`/`trigger`
+at resume time, no separate serialized blob. A timer (`start()`/`stop()`, `opts.waitPollInterval`,
+mirrors `core/cron.js`'s `CronScheduler`) scans for due waits and resumes them, atomically claiming
+each via a conditional `{_id, status:'waiting'} -> 'resuming'` update first. 6 new regression tests;
+verified: 20 isolated runs and 2 full-suite runs, all clean. Also verified live over two genuinely
+separate OS processes with a real `FileStorageAdapter` directory — process A paused a workflow and
+exited completely (`process.exit`), process B (a fresh Bun process, fresh `WorkflowEngine` instance)
+resumed it purely from disk and completed correctly.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
