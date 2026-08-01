@@ -818,3 +818,96 @@ describe('Error Workflow', () => {
     expect(total).toBeLessThan(10); // but it's bounded, not a runaway loop
   });
 });
+
+// ---------------------------------------------------------------------------
+// Sub-workflows (workflow.execute node)
+// ---------------------------------------------------------------------------
+
+describe('Sub-workflows (workflow.execute node)', () => {
+  beforeEach(() => {
+    engine.nodes.add({
+      type: 'test.boom',
+      name: 'Boom',
+      category: 'test',
+      handler: async () => { throw new Error('kaboom'); },
+    });
+  });
+
+  it("runs another workflow by id, passing data as the sub-workflow's {{_trigger...}}, and returns its result", async () => {
+    const child = engine.create({
+      name: 'Child',
+      nodes: [{ id: 'greet', type: 'set.value', inputs: { value: 'Hello {{_trigger.name}}' } }],
+    });
+    const parent = engine.create({
+      name: 'Parent',
+      nodes: [{ id: 'call', type: 'workflow.execute', inputs: { workflowId: child._id, data: { name: 'World' } } }],
+    });
+
+    const exec = await engine.run(parent._id);
+    expect(exec.status).toBe('success');
+    const result = exec.nodeResults.call.data;
+    expect(result.status).toBe('success');
+    expect(result.nodeResults.greet.data).toBe('Hello World');
+    expect(result.executionId).toBeDefined();
+
+    // The sub-execution is also independently retrievable via the normal
+    // execution-history API, using the id workflow.execute returned.
+    const childExec = engine.getExecution(result.executionId);
+    expect(childExec.workflowId).toBe(child._id);
+  });
+
+  it("a failing sub-workflow fails the calling node, which fails the parent (unless continueOnError)", async () => {
+    const child = engine.create({ name: 'FailingChild', nodes: [{ id: 'fails', type: 'test.boom', inputs: {} }] });
+    const parent = engine.create({
+      name: 'Parent',
+      nodes: [{ id: 'call', type: 'workflow.execute', inputs: { workflowId: child._id, data: {} } }],
+    });
+
+    const exec = await engine.run(parent._id);
+    expect(exec.status).toBe('failed');
+    expect(exec.errors.call).toContain(child._id);
+    expect(exec.errors.call).toContain('kaboom');
+  });
+
+  it('a workflow calling itself throws Circular sub-workflow reference instead of recursing forever', async () => {
+    const wf = engine.create({ name: 'SelfCaller', nodes: [] });
+    engine.update(wf._id, {
+      nodes: [{ id: 'call', type: 'workflow.execute', inputs: { workflowId: wf._id, data: {} } }],
+    });
+
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('failed');
+    expect(exec.errors.call).toContain('Circular sub-workflow reference');
+  });
+
+  it('an A -> B -> A indirect cycle is also caught, not just direct self-reference', async () => {
+    const a = engine.create({ name: 'IndirectA', nodes: [] });
+    const b = engine.create({
+      name: 'IndirectB',
+      nodes: [{ id: 'callA', type: 'workflow.execute', inputs: { workflowId: a._id, data: {} } }],
+    });
+    engine.update(a._id, {
+      nodes: [{ id: 'callB', type: 'workflow.execute', inputs: { workflowId: b._id, data: {} } }],
+    });
+
+    const exec = await engine.run(a._id);
+    expect(exec.status).toBe('failed');
+    expect(exec.errors.callB).toContain('Circular sub-workflow reference');
+  });
+
+  it('non-cyclic nested sub-workflows (A -> B -> C) run correctly, three levels deep', async () => {
+    const c = engine.create({ name: 'DeepC', nodes: [{ id: 'v', type: 'set.value', inputs: { value: 'deepest' } }] });
+    const b = engine.create({
+      name: 'DeepB',
+      nodes: [{ id: 'callC', type: 'workflow.execute', inputs: { workflowId: c._id, data: {} } }],
+    });
+    const a = engine.create({
+      name: 'DeepA',
+      nodes: [{ id: 'callB', type: 'workflow.execute', inputs: { workflowId: b._id, data: {} } }],
+    });
+
+    const exec = await engine.run(a._id);
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.callB.data.nodeResults.callC.data.nodeResults.v.data).toBe('deepest');
+  });
+});

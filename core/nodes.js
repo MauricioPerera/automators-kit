@@ -97,15 +97,20 @@ export class NodeRegistry {
    * @param {string} type - Node type
    * @param {object} inputs - Input values
    * @param {object} credentials - Resolved credential values
+   * @param {object} [ctx] - Optional caller context, passed through as the
+   *   handler's 3rd argument. Existing 2-arg handlers ignore it -- purely
+   *   additive. Used by `WorkflowEngine`'s `workflow.execute` node to
+   *   thread its sub-workflow call chain through for cycle detection
+   *   (see `core/workflow.js`'s doc comment).
    * @returns {Promise<any>}
    */
-  async execute(type, inputs = {}, credentials = {}) {
+  async execute(type, inputs = {}, credentials = {}, ctx) {
     const node = this._nodes.get(type);
     if (!node) throw new Error(`Node not found: ${type}`);
 
     // Custom handler
     if (node.handler) {
-      return node.handler(inputs, credentials);
+      return node.handler(inputs, credentials, ctx);
     }
 
     // API-based node: build and execute HTTP request

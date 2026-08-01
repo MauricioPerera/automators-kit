@@ -28,6 +28,18 @@
  * `{{_trigger.trigger}}` for the original trigger data) — see
  * `_maybeTriggerErrorWorkflow`.
  *
+ * Sub-workflows: the `workflow.execute` node (registered per-instance in
+ * the constructor, not in `core/nodes.js`'s engine-agnostic BUILTIN_NODES,
+ * since it needs a live engine to call back into) runs another workflow by
+ * id and returns `{ executionId, status, nodeResults }`; a failed
+ * sub-workflow throws, failing the calling node the same way any other
+ * node error does. `execute()` threads a call chain through
+ * `triggerData._subWorkflowChain` (local to each call's own closure, not
+ * instance state, so concurrent unrelated executions never share it) and
+ * refuses to re-enter a workflow id already in that chain — an
+ * `A -> B -> A` cycle throws `Circular sub-workflow reference` instead of
+ * recursing forever.
+ *
  * Workflow definition:
  * {
  *   name: "My Workflow",
@@ -99,6 +111,36 @@ export class WorkflowEngine {
     try { this._workflows.createIndex('name'); } catch {}
     try { this._workflows.createIndex('active'); } catch {}
     try { this._executions.createIndex('workflowId'); } catch {}
+
+    // 'workflow.execute' node -- registered here (not in core/nodes.js's
+    // engine-agnostic BUILTIN_NODES) because it needs a live WorkflowEngine
+    // to call back into, unlike every other built-in node. If `opts.
+    // nodeRegistry` is a registry SHARED across multiple engine instances,
+    // whichever engine registers last wins for this node type.
+    this._nodeRegistry.add({
+      type: 'workflow.execute',
+      name: 'Execute Workflow',
+      category: 'core',
+      description: 'Run another workflow by id and return its result',
+      inputs: [
+        { name: 'workflowId', type: 'string', required: true },
+        { name: 'data', type: 'object' }, // becomes the sub-workflow's {{_trigger...}}
+      ],
+      outputs: [{ name: 'result', type: 'object' }],
+      handler: async (inputs, _credentials, ctx) => {
+        const subTriggerData = {
+          trigger: 'workflow',
+          data: inputs.data || {},
+          _subWorkflowChain: ctx?.callChain || [],
+        };
+        const subExec = await this.execute(inputs.workflowId, subTriggerData);
+        if (subExec.status === 'failed') {
+          const message = Object.values(subExec.errors)[0] || 'sub-workflow execution failed';
+          throw new Error(`Sub-workflow '${inputs.workflowId}' failed: ${message}`);
+        }
+        return { executionId: subExec._id, status: subExec.status, nodeResults: subExec.nodeResults };
+      },
+    });
 
     // Trigger manager
     this._triggers = new TriggerManager({
@@ -221,6 +263,19 @@ export class WorkflowEngine {
     const wf = this._workflows.findById(id);
     if (!wf) throw new Error(`Workflow '${id}' not found`);
 
+    // Sub-workflow call chain, for the `workflow.execute` node's cycle
+    // detection. Read from `triggerData._subWorkflowChain` (only present
+    // when THIS execute() call was itself started by that node) rather
+    // than instance state, so it's correctly scoped to each call's own
+    // local closure -- concurrent unrelated top-level executions never
+    // share or corrupt each other's chain. A root-triggered execute()
+    // (webhook/cron/poll/manual/error-workflow) simply starts with [].
+    const callChain = Array.isArray(triggerData?._subWorkflowChain) ? triggerData._subWorkflowChain : [];
+    if (callChain.includes(id)) {
+      throw new Error(`Circular sub-workflow reference: ${[...callChain, id].join(' -> ')}`);
+    }
+    const subWorkflowChain = [...callChain, id];
+
     const execution = {
       workflowId: id,
       workflowName: wf.name,
@@ -270,7 +325,7 @@ export class WorkflowEngine {
             creds = await this._vault.get(node.credentials);
             if (!creds) throw new Error(`Credential '${node.credentials}' not found`);
           }
-          return this._nodeRegistry.execute(node.type, resolvedInputs, creds);
+          return this._nodeRegistry.execute(node.type, resolvedInputs, creds, { callChain: subWorkflowChain });
         }));
 
         // Commit in the level's (array-preserving) order for deterministic,
