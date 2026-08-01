@@ -826,6 +826,28 @@ understands paraphrase/synonyms, which `examples/hybrid-recall` already
 documented it does not (word-overlap only) — fixed to use genuinely
 shared vocabulary. Run with `bun examples/mcp-vector-search/mcp-server.js`.
 
+**[`examples/validated-job-queue/`](examples/validated-job-queue/)** —
+combines `core/validate.js` with `core/queue.js`: a job payload is
+validated against a schema **before** `enqueue()` ever runs — a
+malformed payload is rejected synchronously, with zero job document
+created. No existing example validates a queue job's payload shape at
+all — `examples/api-validation`/`examples/validated-webhooks`/
+`examples/validated-workflow-nodes` validate HTTP bodies, webhook
+trigger data, and node inputs respectively, but a bad job payload today
+only fails **inside the handler**, wasting a real processing attempt
+(and every retry too, before landing in the dead letter for nothing).
+`validated-queue.js`'s `createValidatedEnqueue()` wraps `enqueue()` — no
+`core/queue.js` changes needed. Found a real gotcha building this:
+`core/shell.js` masks a thrown validation error into a generic
+"Internal command error" with no detail (documented, intentional
+behavior) — since a validation failure is an expected, actionable
+outcome for the caller, not a server fault, the shell handler now
+catches it and returns `{ ok: false, error }` as ordinary data instead,
+the same reasoning `examples/mcp-job-queue` already documents for MCP
+tool errors. Verified live: an invalid payload creates exactly zero new
+jobs in `queue.stats()`. Run with
+`bun examples/validated-job-queue/setup.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -886,10 +908,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 958 tests across 72 files, ~32 seconds
+bun test tests/    # 962 tests across 73 files, ~32 seconds
 ```
 
-72 test files covering all core modules (including `log.js`/`metrics.js`/
+73 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -909,8 +931,8 @@ bun test tests/    # 958 tests across 72 files, ~32 seconds
 `examples/vault-access-control`, `examples/trigger-driven-a2e`,
 `examples/agent-authored-node`, `examples/workflow-observability`,
 `examples/scheduled-report-queue`, `examples/csv-bulk-import`,
-`examples/async-vector-index`, `examples/queue-observability`, and
-`examples/mcp-vector-search`
+`examples/async-vector-index`, `examples/queue-observability`,
+`examples/mcp-vector-search`, and `examples/validated-job-queue`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,

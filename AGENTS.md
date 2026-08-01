@@ -856,6 +856,28 @@ only) — fixed to use genuinely shared vocabulary. Run with
 `bun examples/mcp-vector-search/mcp-server.js`; regression test in
 `tests/examples-mcp-vector-search.test.js`.
 
+`examples/validated-job-queue/` — combines `core/validate.js` with
+`core/queue.js`: a job payload is validated against a schema before
+`enqueue()` ever runs — a malformed payload is rejected synchronously,
+with zero job document created. No existing example validates a queue
+job's payload shape at all — `examples/api-validation`/
+`examples/validated-webhooks`/`examples/validated-workflow-nodes`
+validate HTTP bodies, webhook trigger data, and node inputs
+respectively, but a bad job payload today only fails inside the
+handler, wasting a real processing attempt (and every retry too, before
+landing in the dead letter for nothing). `validated-queue.js`'s
+`createValidatedEnqueue()` wraps `enqueue()` — no `core/queue.js`
+changes needed. Found a real gotcha building this: `core/shell.js`
+masks a thrown validation error into a generic "Internal command error"
+with no detail (documented, intentional behavior) — since a validation
+failure is an expected, actionable outcome for the caller, not a server
+fault, the shell handler now catches it and returns
+`{ ok: false, error }` as ordinary data instead, the same reasoning
+`examples/mcp-job-queue` already documents for MCP tool errors.
+Verified live: an invalid payload creates exactly zero new jobs in
+`queue.stats()`. Run with `bun examples/validated-job-queue/setup.js`;
+regression test in `tests/examples-validated-job-queue.test.js`.
+
 ## Optional Integrations
 
 Standalone modules living outside `core/`, gated behind `optionalDependencies`
