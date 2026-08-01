@@ -40,6 +40,20 @@
  * `A -> B -> A` cycle throws `Circular sub-workflow reference` instead of
  * recursing forever.
  *
+ * Persisted wait: the `wait.until` node (`core/nodes.js`) pauses an
+ * execution until a time/duration, surviving process restarts -- unlike
+ * the plain `wait` node's in-memory `setTimeout`. `execute()`/`_runLevels`
+ * stop dispatching further DAG levels and store `status: 'waiting'` with
+ * enough state (`execution.waitState`) to resume from the SAME persisted
+ * execution document later, in this process or a fresh one. A timer
+ * (`start()`/`stop()`, `opts.waitPollInterval`) scans for due waits and
+ * resumes them via `_resumeExecution`. A downstream node that must run
+ * AFTER a wait needs an explicit `{{waitNodeId.resumeAt}}` reference in
+ * its `inputs` to land in a later DAG level — same existing gotcha as the
+ * `if`/`onFalse: 'skip'` barrier, not a new one. Only time-based waiting
+ * is implemented; webhook-based resume is a separate, not-yet-built
+ * feature.
+ *
  * Workflow definition:
  * {
  *   name: "My Workflow",
@@ -99,6 +113,8 @@ export class WorkflowEngine {
    * @param {string} [opts.defaultErrorWorkflow] - Workflow id run when any
    *   workflow's execution fails and that workflow has no `errorWorkflow`
    *   of its own set (see `create()`/`update()`'s `errorWorkflow` field).
+   * @param {number} [opts.waitPollInterval] - How often (ms) to scan for
+   *   due `wait.until` pauses to resume. Default 1000.
    */
   constructor(db, opts = {}) {
     this.db = db;
@@ -107,10 +123,13 @@ export class WorkflowEngine {
     this._nodeRegistry = opts.nodeRegistry || new NodeRegistry();
     this._vault = new CredentialVault(db, opts.masterKey || _generateMasterKey());
     this._defaultErrorWorkflow = opts.defaultErrorWorkflow || null;
+    this._waitPollInterval = opts.waitPollInterval || 1000;
+    this._waitTimer = null;
 
     try { this._workflows.createIndex('name'); } catch {}
     try { this._workflows.createIndex('active'); } catch {}
     try { this._executions.createIndex('workflowId'); } catch {}
+    try { this._executions.createIndex('status'); } catch {}
 
     // 'workflow.execute' node -- registered here (not in core/nodes.js's
     // engine-agnostic BUILTIN_NODES) because it needs a live WorkflowEngine
@@ -164,11 +183,22 @@ export class WorkflowEngine {
     }
   }
 
-  /** Start triggers (cron, polling) */
-  start() { this._triggers.start(); }
+  /** Start triggers (cron, polling) and the wait.until resume poller */
+  start() {
+    this._triggers.start();
+    if (!this._waitTimer) {
+      this._waitTimer = setInterval(() => this._pollWaitingExecutions(), this._waitPollInterval);
+    }
+  }
 
-  /** Stop all triggers */
-  stop() { this._triggers.stop(); }
+  /** Stop all triggers and the wait.until resume poller */
+  stop() {
+    this._triggers.stop();
+    if (this._waitTimer) {
+      clearInterval(this._waitTimer);
+      this._waitTimer = null;
+    }
+  }
 
   // ─── CRUD ────────────────────────────────────────────────
 
@@ -292,14 +322,31 @@ export class WorkflowEngine {
     const context = { _trigger: triggerData.data || triggerData };
     const nodes = wf.nodes || [];
     const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+    // Levels of node ids that can run in parallel (see _buildWorkflowDAG).
+    // A cycle (shouldn't happen — _validateNodeIds/the caller are expected
+    // to produce a valid DAG) falls back to one node per level, i.e. the
+    // old strictly-sequential order, rather than throwing.
+    const levels = _buildWorkflowDAG(nodes) || nodes.map((n) => [n.id]);
 
+    await this._runLevels(wf, execution, context, nodeMap, levels, 0, subWorkflowChain);
+
+    return this._finalizeExecution(wf, execution, triggerData);
+  }
+
+  /**
+   * Runs `levels[startIndex..]` against `context`, mutating `execution` in
+   * place (nodeResults/errors/status). Factored out of execute() so a
+   * fresh run (startIndex 0) and _resumeExecution() (startIndex ==
+   * wherever a `wait.until` previously paused) share the exact same
+   * dispatch logic.
+   *
+   * On a `wait.until` node whose resumeAt is still in the future,
+   * `execution.status` becomes 'waiting' and `execution.waitState`
+   * records where to resume -- the caller must check for that before
+   * treating the execution as finished (see _finalizeExecution).
+   */
+  async _runLevels(wf, execution, context, nodeMap, levels, startIndex, subWorkflowChain) {
     try {
-      // Levels of node ids that can run in parallel (see _buildWorkflowDAG).
-      // A cycle (shouldn't happen — _validateNodeIds/the caller are expected
-      // to produce a valid DAG) falls back to one node per level, i.e. the
-      // old strictly-sequential order, rather than throwing.
-      const levels = _buildWorkflowDAG(nodes) || nodes.map((n) => [n.id]);
-
       // Global skip barrier for `if` + `onFalse: 'skip'`, checked BETWEEN
       // levels. Nodes already dispatched in the same level as the `if` node
       // still run to completion even if the `if` evaluates false — there is
@@ -313,8 +360,9 @@ export class WorkflowEngine {
       let skipRemaining = false;
       let stopped = false;
 
-      for (const level of levels) {
+      for (let levelIndex = startIndex; levelIndex < levels.length; levelIndex++) {
         if (skipRemaining || stopped) break;
+        const level = levels[levelIndex];
 
         const settled = await Promise.allSettled(level.map(async (nodeId) => {
           const node = nodeMap.get(nodeId);
@@ -327,6 +375,13 @@ export class WorkflowEngine {
           }
           return this._nodeRegistry.execute(node.type, resolvedInputs, creds, { callChain: subWorkflowChain });
         }));
+
+        // A `wait.until` node in this level whose resumeAt is still ahead
+        // pauses the whole execution AFTER this level's results are
+        // committed -- checked below, alongside the existing skip/error
+        // commit loop, not before it (same "same-level siblings already
+        // dispatched still finish" philosophy as the `if` skip barrier).
+        let pauseUntil = null;
 
         // Commit in the level's (array-preserving) order for deterministic,
         // backward-compatible nodeResults regardless of settle order.
@@ -350,6 +405,9 @@ export class WorkflowEngine {
             if (node.type === 'if' && result === false && node.onFalse === 'skip') {
               skipRemaining = true;
             }
+            if (node.type === 'wait.until' && typeof nodeResult?.resumeAt === 'number' && nodeResult.resumeAt > Date.now()) {
+              pauseUntil = nodeResult.resumeAt;
+            }
           } else {
             const err = outcome.reason;
             execution.errors[nodeId] = err.message;
@@ -363,6 +421,15 @@ export class WorkflowEngine {
             }
           }
         }
+
+        // A failure or a skip barrier in the SAME level takes priority
+        // over pausing -- an execution that's already failed or been told
+        // to stop everything should not be resurrected as 'waiting'.
+        if (pauseUntil !== null && !stopped && !skipRemaining) {
+          execution.status = 'waiting';
+          execution.waitState = { resumeAt: pauseUntil, remainingLevelIndex: levelIndex + 1, subWorkflowChain };
+          return;
+        }
       }
 
       if (execution.status === 'running') {
@@ -373,24 +440,121 @@ export class WorkflowEngine {
       execution.status = 'failed';
       execution.errors._engine = err.message;
     }
+  }
 
-    execution.finishedAt = Date.now();
-    execution.duration = execution.finishedAt - execution.startedAt;
+  /**
+   * Persists `execution`'s final (or paused) state. Handles both a
+   * brand-new execution (no `_id` yet -- inserted) and a resumed one
+   * (already has `_id` from its earlier 'waiting' insert -- updated in
+   * place, never duplicated). Only fires the error workflow for a
+   * genuinely finished (non-waiting) run.
+   */
+  _finalizeExecution(wf, execution, triggerData) {
+    const isWaiting = execution.status === 'waiting';
+    if (!isWaiting) {
+      execution.finishedAt = Date.now();
+      execution.duration = execution.finishedAt - execution.startedAt;
+    }
 
-    // Store execution history. insert() returns a CLONE with `_id`
-    // assigned — it does not mutate the object passed in. Previously this
-    // discarded that return value entirely, so callers got an execution
-    // object with no `_id` back from execute()/run(), even though the
-    // stored copy (reachable via getExecutions()) had a real one — making
-    // getExecution(execution._id) unreachable from the return value of a
-    // run you just triggered. Same pattern EntryService.create() already
-    // uses correctly in core/cms.js.
-    execution._id = this._executions.insert(execution)._id;
+    if (execution._id) {
+      const updates = { status: execution.status, nodeResults: execution.nodeResults, errors: execution.errors };
+      if (isWaiting) {
+        updates.waitState = execution.waitState;
+        this._executions.update({ _id: execution._id }, { $set: updates });
+      } else {
+        updates.finishedAt = execution.finishedAt;
+        updates.duration = execution.duration;
+        this._executions.update({ _id: execution._id }, { $set: updates, $unset: { waitState: 1 } });
+      }
+    } else {
+      // Store execution history. insert() returns a CLONE with `_id`
+      // assigned — it does not mutate the object passed in. Previously this
+      // discarded that return value entirely, so callers got an execution
+      // object with no `_id` back from execute()/run(), even though the
+      // stored copy (reachable via getExecutions()) had a real one — making
+      // getExecution(execution._id) unreachable from the return value of a
+      // run you just triggered. Same pattern EntryService.create() already
+      // uses correctly in core/cms.js.
+      execution._id = this._executions.insert(execution)._id;
+    }
     this.db.flush();
 
-    this._maybeTriggerErrorWorkflow(wf, execution, triggerData);
+    if (!isWaiting) {
+      this._maybeTriggerErrorWorkflow(wf, execution, triggerData);
+    }
 
     return execution;
+  }
+
+  /**
+   * Resumes a previously-paused ('waiting') execution from where it left
+   * off. Rebuilds everything from the persisted execution document itself
+   * (plus a fresh read of the workflow definition) rather than any
+   * in-memory state -- this is what makes the pause genuinely survive a
+   * process restart: a brand-new WorkflowEngine instance pointed at the
+   * same DocStore can call this and continue correctly.
+   */
+  async _resumeExecution(executionDoc) {
+    const wf = this._workflows.findById(executionDoc.workflowId);
+    if (!wf) {
+      // The workflow was deleted while this execution was waiting -- fail
+      // it explicitly instead of leaving it stuck in 'resuming' forever.
+      const finishedAt = Date.now();
+      this._executions.update({ _id: executionDoc._id }, {
+        $set: {
+          status: 'failed',
+          errors: { ...(executionDoc.errors || {}), _engine: `Workflow '${executionDoc.workflowId}' no longer exists` },
+          finishedAt,
+          duration: finishedAt - executionDoc.startedAt,
+        },
+        $unset: { waitState: 1 },
+      });
+      this.db.flush();
+      return;
+    }
+
+    const nodes = wf.nodes || [];
+    const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+    const levels = _buildWorkflowDAG(nodes) || nodes.map((n) => [n.id]);
+
+    // Reconstruct context the SAME way execute() builds it initially, plus
+    // every already-completed node's result -- the persisted execution
+    // document is the single source of truth; no separate serialized
+    // context blob was ever stored.
+    const context = { _trigger: executionDoc.trigger?.data || executionDoc.trigger };
+    for (const [nodeId, result] of Object.entries(executionDoc.nodeResults || {})) {
+      if (result.status === 'success') context[nodeId] = result.data;
+    }
+
+    const execution = { ...executionDoc, status: 'running' };
+    const { remainingLevelIndex, subWorkflowChain } = executionDoc.waitState;
+    delete execution.waitState;
+
+    await this._runLevels(wf, execution, context, nodeMap, levels, remainingLevelIndex, subWorkflowChain || []);
+    this._finalizeExecution(wf, execution, executionDoc.trigger);
+  }
+
+  /**
+   * Scans for waiting executions whose resumeAt has passed and resumes
+   * each fire-and-forget -- called on a timer started by start()/stopped
+   * by stop(), mirroring core/cron.js's CronScheduler start()/stop().
+   * Same-process re-entrancy guard: flips status away from 'waiting'
+   * synchronously (no `await` between the find and this update) before
+   * resuming, so a slow resume overlapping the next tick can't double-fire.
+   * A genuinely concurrent second PROCESS polling the same db is a
+   * separate, unsolved class of gap -- the same one already documented
+   * for core/db.js's single-process design.
+   */
+  _pollWaitingExecutions() {
+    const due = this._executions.find({ status: 'waiting', 'waitState.resumeAt': { $lte: Date.now() } }).toArray();
+    for (const execDoc of due) {
+      const claimed = this._executions.update({ _id: execDoc._id, status: 'waiting' }, { $set: { status: 'resuming' } });
+      if (!claimed) continue;
+      this._resumeExecution({ ...execDoc, status: 'resuming' }).catch((err) => {
+        console.error(`[Workflow] Resume failed for execution '${execDoc._id}':`, err.message);
+      });
+    }
+    this.db.flush();
   }
 
   /**

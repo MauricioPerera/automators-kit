@@ -911,3 +911,149 @@ describe('Sub-workflows (workflow.execute node)', () => {
     expect(exec.nodeResults.callB.data.nodeResults.callC.data.nodeResults.v.data).toBe('deepest');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Persisted Wait (wait.until node)
+// ---------------------------------------------------------------------------
+
+describe('Persisted Wait (wait.until node)', () => {
+  async function waitForFinal(eng, execId, timeoutMs = 3000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const exec = eng.getExecution(execId);
+      if (exec && exec.status !== 'waiting' && exec.status !== 'resuming') return exec;
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    throw new Error(`waitForFinal(${execId}) timed out`);
+  }
+
+  it('pauses at a wait.until node: status "waiting", waitState recorded, nothing after it has run yet', async () => {
+    const wf = engine.create({
+      name: 'PauseOnly',
+      nodes: [
+        { id: 'pause', type: 'wait.until', inputs: { ms: 60000 } }, // 1 minute -- never resumes in this test
+        { id: 'after', type: 'set.value', inputs: { value: '{{pause.resumeAt}}-done' } },
+      ],
+    });
+    const exec = await engine.run(wf._id);
+
+    expect(exec.status).toBe('waiting');
+    expect(exec.nodeResults.pause.status).toBe('success');
+    expect(typeof exec.nodeResults.pause.data.resumeAt).toBe('number');
+    expect(exec.nodeResults.after).toBeUndefined(); // later level, correctly not dispatched
+    expect(exec.finishedAt).toBeNull(); // still genuinely in progress
+    expect(exec.waitState.remainingLevelIndex).toBeGreaterThan(0);
+  });
+
+  it('resumes automatically via the poller once resumeAt passes, running the rest of the DAG', async () => {
+    const fast = new WorkflowEngine(db, { masterKey: 'test-master-key!!!', nodeRegistry: engine.nodes, waitPollInterval: 20 });
+    await fast.init();
+
+    const wf = fast.create({
+      name: 'PauseThenResume',
+      nodes: [
+        { id: 'pause', type: 'wait.until', inputs: { ms: 50 } },
+        { id: 'after', type: 'set.value', inputs: { value: 'resumed-at-{{pause.resumeAt}}' } },
+      ],
+    });
+    const exec = await fast.run(wf._id);
+    expect(exec.status).toBe('waiting');
+
+    fast.start();
+    const final = await waitForFinal(fast, exec._id);
+    fast.stop();
+
+    expect(final.status).toBe('success');
+    expect(final.nodeResults.after.data).toContain('resumed-at-');
+    expect(final.waitState).toBeUndefined(); // cleaned up once no longer waiting
+    expect(final.finishedAt).not.toBeNull();
+  });
+
+  it('resumes correctly from a SECOND, independently-constructed WorkflowEngine instance sharing the same db (simulated process restart)', async () => {
+    const engineA = new WorkflowEngine(db, { masterKey: 'test-master-key!!!', waitPollInterval: 20 });
+    await engineA.init();
+    const wf = engineA.create({
+      name: 'RestartSurvival',
+      nodes: [
+        { id: 'pause', type: 'wait.until', inputs: { ms: 50 } },
+        { id: 'after', type: 'set.value', inputs: { value: 'survived-{{pause.resumeAt}}' } },
+      ],
+    });
+    const exec = await engineA.run(wf._id);
+    expect(exec.status).toBe('waiting');
+    // engineA never calls start() -- simulates the process exiting before
+    // its own poller ever got a chance to resume the execution.
+
+    const engineB = new WorkflowEngine(db, { masterKey: 'test-master-key!!!', waitPollInterval: 20 });
+    await engineB.init();
+    engineB.start();
+    const final = await waitForFinal(engineB, exec._id);
+    engineB.stop();
+
+    expect(final.status).toBe('success');
+    expect(final.nodeResults.after.data).toContain('survived-');
+  });
+
+  it('multiple sequential wait.until nodes in one workflow all pause and resume correctly, in order', async () => {
+    const fast = new WorkflowEngine(db, { masterKey: 'test-master-key!!!', nodeRegistry: engine.nodes, waitPollInterval: 20 });
+    await fast.init();
+
+    const wf = fast.create({
+      name: 'DoubleWait',
+      nodes: [
+        { id: 'p1', type: 'wait.until', inputs: { ms: 40 } },
+        { id: 'mid', type: 'set.value', inputs: { value: 'middle-{{p1.resumeAt}}' } },
+        // `after: '{{mid}}'` is unused by the handler -- it exists purely
+        // to create a {{ref}} dependency edge so _buildWorkflowDAG lands
+        // this node in a level AFTER 'mid' (same existing convention the
+        // if/onFalse:'skip' barrier already relies on).
+        { id: 'p2', type: 'wait.until', inputs: { ms: 40, after: '{{mid}}' } },
+        { id: 'final', type: 'set.value', inputs: { value: 'end-{{p2.resumeAt}}-after-{{mid}}' } },
+      ],
+    });
+    const exec = await fast.run(wf._id);
+    expect(exec.status).toBe('waiting');
+
+    fast.start();
+    const final = await waitForFinal(fast, exec._id, 5000);
+    fast.stop();
+
+    expect(final.status).toBe('success');
+    expect(final.nodeResults.mid.data).toContain('middle-');
+    expect(final.nodeResults.final.data).toContain('end-');
+    expect(final.nodeResults.final.data).toContain('after-middle-');
+  });
+
+  it('a workflow deleted while its execution is waiting fails that execution gracefully instead of crashing the poller', async () => {
+    const fast = new WorkflowEngine(db, { masterKey: 'test-master-key!!!', nodeRegistry: engine.nodes, waitPollInterval: 20 });
+    await fast.init();
+
+    const wf = fast.create({ name: 'DeletedWhileWaiting', nodes: [{ id: 'pause', type: 'wait.until', inputs: { ms: 40 } }] });
+    const exec = await fast.run(wf._id);
+    expect(exec.status).toBe('waiting');
+
+    fast.remove(wf._id);
+
+    fast.start();
+    const final = await waitForFinal(fast, exec._id);
+    fast.stop();
+
+    expect(final.status).toBe('failed');
+    expect(final.errors._engine).toContain('no longer exists');
+  });
+
+  it('a wait.until inside a sub-workflow does not block the parent -- the parent node succeeds immediately with status "waiting"', async () => {
+    const child = engine.create({ name: 'WaitingChild', nodes: [{ id: 'pause', type: 'wait.until', inputs: { ms: 60000 } }] });
+    const parent = engine.create({
+      name: 'ParentOfWaiter',
+      nodes: [{ id: 'call', type: 'workflow.execute', inputs: { workflowId: child._id, data: {} } }],
+    });
+
+    const exec = await engine.run(parent._id);
+    expect(exec.status).toBe('success'); // the PARENT finished -- it did not block on the child's wait
+    expect(exec.nodeResults.call.data.status).toBe('waiting');
+
+    const childExec = engine.getExecution(exec.nodeResults.call.data.executionId);
+    expect(childExec.status).toBe('waiting'); // independently still paused
+  });
+});

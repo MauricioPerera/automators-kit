@@ -307,6 +307,21 @@ const BUILTIN_NODES = [
     handler: async (inputs) => new Promise(r => setTimeout(r, inputs.ms || 1000)),
   },
   {
+    type: 'wait.until',
+    name: 'Wait Until (persisted)',
+    category: 'core',
+    description: 'Pause a workflow until a time/duration, surviving process restarts. Only meaningful inside a WorkflowEngine execution -- resolves immediately if run standalone via NodeRegistry.execute().',
+    inputs: [
+      { name: 'ms', type: 'number' },        // relative duration from now
+      { name: 'resumeAt', type: 'number' },  // absolute epoch ms -- wins if both given
+    ],
+    outputs: [{ name: 'resumeAt', type: 'number' }],
+    handler: async (inputs) => {
+      const resumeAt = inputs.resumeAt ?? (Date.now() + (inputs.ms ?? 0));
+      return { resumeAt };
+    },
+  },
+  {
     type: 'if',
     name: 'IF Condition',
     category: 'core',
