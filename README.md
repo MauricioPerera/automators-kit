@@ -728,6 +728,24 @@ dispatched to the wrong (401'ing) handler. Verified live: `/metrics`
 correctly separates successful and failed executions by label. Run with
 `bun examples/workflow-observability/setup.js`.
 
+**[`examples/scheduled-report-queue/`](examples/scheduled-report-queue/)**
+— combines [`core/cron.js`](core/cron.js) with `core/queue.js`: a cron
+tick enqueues one durable, independently-retryable job per report,
+instead of doing the work directly inline. Neither existing example
+covers this — `examples/scheduled-sync`'s cron job performs its sync
+action *directly* (no queue; a single failure blocks the cursor there
+until retried); `examples/job-queue` has no scheduling trigger at all,
+only manual enqueue calls; `examples/poll-to-queue` enqueues one job per
+**new** item detected by a poll trigger (event-driven), not a fixed
+batch on a schedule. Real cron ticks fire nightly — `reports:run-now`
+exposes the exact same enqueue function for the live demo. Verified
+live: two `run-now` calls back-to-back (simulating overlapping cron
+ticks) produce 6 distinct job ids, all complete exactly once, zero lost
+or duplicated; a deterministic first-attempt failure for one report
+proves normal retry/backoff still applies to jobs from a scheduled
+batch, not just manually-enqueued ones. Run with
+`bun examples/scheduled-report-queue/setup.js`.
+
 ## Optional integrations
 
 Standalone modules that trade the zero-dependency guarantee for one specific,
@@ -788,10 +806,10 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 936 tests across 67 files, ~31 seconds
+bun test tests/    # 938 tests across 68 files, ~31 seconds
 ```
 
-67 test files covering all core modules (including `log.js`/`metrics.js`/
+68 test files covering all core modules (including `log.js`/`metrics.js`/
 `csv.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
@@ -809,7 +827,8 @@ bun test tests/    # 936 tests across 67 files, ~31 seconds
 `examples/cms-semantic-search`, `examples/validated-workflow-nodes`, and
 `examples/mcp-job-queue`, `examples/queue-access-control`, and
 `examples/vault-access-control`, `examples/trigger-driven-a2e`,
-`examples/agent-authored-node`, and `examples/workflow-observability`
+`examples/agent-authored-node`, `examples/workflow-observability`, and
+`examples/scheduled-report-queue`
 end-to-end scenarios (includes the regression tests added by the 2026-07 security audit
 — see [Security](#security) below), plus 3 opt-in files for the
 `integrations/` modules above (`tests/integrations-postgres-queue-claim.test.js`,
