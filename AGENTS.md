@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf)
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 20 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -1286,6 +1286,37 @@ without growing into a general expression language. A node referenced
 inside another node's `runIf` counts as a DAG dependency the same way an
 `inputs` reference does, so it's always scheduled into an earlier level.
 
+### Error Workflow
+
+A workflow can declare `errorWorkflow: <id>`; the engine constructor can
+also set `opts.defaultErrorWorkflow` as a fallback for workflows with
+none of their own. When an execution ends with `status: 'failed'`, that
+workflow id runs fire-and-forget (same pattern webhook/cron/poll triggers
+already use) with error context as its trigger data:
+
+```javascript
+const handler = engine.create({
+  name: 'On Failure',
+  nodes: [
+    { id: 'notify', type: 'slack.send', credentials: 'slack', inputs: {
+        message: '{{_trigger.workflow.name}} failed: {{_trigger.error.message}}',
+      } },
+  ],
+});
+engine.create({ name: 'Main Flow', errorWorkflow: handler._id, nodes: [...] });
+// or engine-wide: new WorkflowEngine(db, { defaultErrorWorkflow: handler._id })
+```
+
+Context available as `{{_trigger...}}`: `workflow.id`/`workflow.name`,
+`execution.id`/`execution.status`, `error.message`/`error.nodeErrors`
+(the full `nodeId -> message` map), and `trigger` (the ORIGINAL trigger
+data that started the failed run, so a downstream node can still act on
+it). The caller of the failed `execute()`/`run()` gets its own result
+back immediately — it does not wait for the error workflow. Loop safety
+is intentionally simple: a workflow set as its own `errorWorkflow` is
+refused outright, and any longer chain (`A -> B -> A -> ...`) is bounded
+by a depth counter smuggled through the error trigger data, capped at 5.
+
 ### Triggers
 - manual: `engine.run(id, data)`
 - webhook: `POST /api/workflows/webhook/:path`
@@ -1785,6 +1816,23 @@ switch it depends on. 3 new regression tests in `tests/workflow.test.js`. Verifi
 runs post-change and 8 baseline runs, all clean except one early run whose failure output wasn't
 captured and never recurred across everything that followed — noted rather than silently dropped,
 since it couldn't be conclusively ruled in or out as caused by this change.
+
+**`workflow.js` global/per-workflow error workflow added (2026-08-01):** closes another gap from
+this session's n8n comparison — no way to react to a failed execution except polling execution
+history after the fact. A workflow can now declare `errorWorkflow: <id>`; the engine constructor
+accepts `opts.defaultErrorWorkflow` as a fallback for workflows with none of their own. When
+`execute()` finishes with `status: 'failed'`, `_maybeTriggerErrorWorkflow` fires that workflow
+fire-and-forget — the same pattern webhook/cron/poll triggers already use, so the original caller's
+own `execute()`/`run()` still returns immediately with its own result. The error workflow receives
+context as its trigger data: `{{_trigger.workflow.name}}`, `{{_trigger.error.message}}`,
+`{{_trigger.execution.id}}`, `{{_trigger.trigger}}` (the original trigger data that started the
+failed run). Loop safety kept intentionally simple: a workflow set as its own `errorWorkflow` is
+refused outright, and any longer chain (`A -> B -> A -> ...`) is bounded by a depth counter smuggled
+through the error trigger data, capped at 5. 5 new regression tests in `tests/workflow.test.js`
+(correct error context, `defaultErrorWorkflow` fallback via a second real `WorkflowEngine` instance
+sharing the same db/registry, success never triggers it, self-reference doesn't self-trigger, an
+A↔B cycle stays bounded). Verified: 20 isolated runs of `workflow.test.js` and 4 full-suite runs,
+all clean.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
