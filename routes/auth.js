@@ -7,14 +7,14 @@ import { Router, json, error } from '../core/http.js';
 import { validateBody } from '../core/validate.js';
 import { createAuth } from './middleware.js';
 
-const RegisterSchema = {
+export const RegisterSchema = {
   email: { type: 'string', format: 'email', required: true },
   password: { type: 'string', min: 8, max: 128, required: true },
   name: { type: 'string', min: 1, max: 128, required: true },
   role: { type: 'string', enum: ['admin', 'editor', 'author', 'viewer'] },
 };
 
-const LoginSchema = {
+export const LoginSchema = {
   email: { type: 'string', format: 'email', required: true },
   password: { type: 'string', required: true },
 };

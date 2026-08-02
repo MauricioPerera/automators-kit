@@ -6,7 +6,7 @@ import { Router, json, error } from '../core/http.js';
 import { validateBody } from '../core/validate.js';
 import { createAuth, requireRole } from './middleware.js';
 
-const UpdateSchema = {
+export const UpdateSchema = {
   name: { type: 'string', min: 1, max: 128 },
   role: { type: 'string', enum: ['admin', 'editor', 'author', 'viewer'] },
   avatar: { type: 'string', format: 'url' },

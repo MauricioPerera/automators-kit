@@ -7,7 +7,7 @@ import { Router, json, error } from '../core/http.js';
 import { validateBody } from '../core/validate.js';
 import { createAuth, requireRole } from './middleware.js';
 
-const CreateSchema = {
+export const CreateSchema = {
   name: { type: 'string', min: 1, max: 128, required: true },
   description: { type: 'string', max: 512 },
   trigger: { type: 'object' },

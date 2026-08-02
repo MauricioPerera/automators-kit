@@ -6,14 +6,14 @@ import { Router, json, error } from '../core/http.js';
 import { validateBody } from '../core/validate.js';
 import { createAuth, requirePermission } from './middleware.js';
 
-const CreateSchema = {
+export const CreateSchema = {
   name: { type: 'string', min: 1, max: 128, required: true },
   slug: { type: 'string', format: 'slug', required: true },
   description: { type: 'string', max: 512 },
   hierarchical: { type: 'boolean' },
 };
 
-const UpdateSchema = {
+export const UpdateSchema = {
   name: { type: 'string', min: 1, max: 128 },
   slug: { type: 'string', format: 'slug' },
   description: { type: 'string', max: 512 },

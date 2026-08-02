@@ -7,7 +7,7 @@ import { Router, json, error } from '../core/http.js';
 import { validateBody } from '../core/validate.js';
 import { createAuth, requirePermission } from './middleware.js';
 
-const CreateSchema = {
+export const CreateSchema = {
   title: { type: 'string', min: 1, max: 256, required: true },
   slug: { type: 'string', format: 'slug' },
   contentTypeSlug: { type: 'string' },
@@ -21,7 +21,7 @@ const CreateSchema = {
   $refine: (d) => (!d.contentTypeSlug && !d.contentTypeId) ? 'contentTypeSlug or contentTypeId is required' : null,
 };
 
-const UpdateSchema = {
+export const UpdateSchema = {
   title: { type: 'string', min: 1, max: 256 },
   slug: { type: 'string', format: 'slug' },
   content: { type: 'object' },

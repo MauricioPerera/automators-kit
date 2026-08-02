@@ -67,6 +67,47 @@ describe('Health', () => {
 });
 
 // ---------------------------------------------------------------------------
+// API Discovery
+// ---------------------------------------------------------------------------
+
+describe('API discovery', () => {
+  it('GET /api/schema returns a catalog covering every resource group', async () => {
+    const res = await app.handle(req('GET', '/api/schema'));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    const names = body.groups.map(g => g.name);
+    expect(names).toEqual([
+      'meta', 'auth', 'content-types', 'entries', 'taxonomies', 'terms',
+      'users', 'schema', 'workflows', 'projects', 'shell', 'a2e', 'db',
+    ]);
+  });
+
+  it('is public (no auth required)', async () => {
+    const res = await app.handle(req('GET', '/api/schema'));
+    expect(res.status).toBe(200);
+  });
+
+  it('reuses the real validateBody schema object for a route, not a re-transcription', async () => {
+    const res = await app.handle(req('GET', '/api/schema'));
+    const body = await json(res);
+    const auth = body.groups.find(g => g.name === 'auth');
+    const register = auth.endpoints.find(e => e.path === '/api/auth/register');
+    expect(register.bodySchema.email).toEqual({ type: 'string', format: 'email', required: true });
+    expect(register.bodySchema.password.min).toBe(8);
+  });
+
+  it('still serves the existing content-type field-management routes unshadowed', async () => {
+    await app.handle(req('POST', '/api/content-types', {
+      name: 'DiscoveryProbe', slug: 'discovery-probe',
+    }, adminToken));
+    const res = await app.handle(req('GET', '/api/schema/discovery-probe/fields'));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.contentType).toBe('discovery-probe');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------
 
