@@ -1144,3 +1144,123 @@ describe('Persisted Wait (wait.forWebhook + resumeWebhook)', () => {
     expect(second).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Per-item processing (loop.forEach node)
+// ---------------------------------------------------------------------------
+
+describe('Per-item processing (loop.forEach node)', () => {
+  it('runs the per-item workflow once per item, results array item-ordered and shaped correctly', async () => {
+    const perItem = engine.create({
+      name: 'DoubleItem',
+      nodes: [{ id: 'doubled', type: 'set.value', inputs: { value: '{{_trigger.item}}-processed' } }],
+    });
+    const batch = engine.create({
+      name: 'Batch',
+      nodes: [{ id: 'run', type: 'loop.forEach', inputs: { items: ['a', 'b', 'c'], workflowId: perItem._id } }],
+    });
+
+    const exec = await engine.run(batch._id);
+    expect(exec.status).toBe('success');
+    const results = exec.nodeResults.run.data.results;
+    expect(results.length).toBe(3);
+    expect(results.map((r) => r.item)).toEqual(['a', 'b', 'c']);
+    expect(results.every((r) => r.status === 'success')).toBe(true);
+    expect(results[1].nodeResults.doubled.data).toBe('b-processed');
+    expect(results[0].executionId).toBeDefined();
+  });
+
+  it('bounds real concurrency to the configured `concurrency` -- never more in flight at once', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    engine.nodes.add({
+      type: 'test.track',
+      name: 'Track',
+      category: 'test',
+      handler: async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 30)); // hold the slot long enough for overlap to be observable
+        inFlight--;
+        return 'ok';
+      },
+    });
+    const perItem = engine.create({ name: 'Tracked', nodes: [{ id: 't', type: 'test.track', inputs: {} }] });
+    const batch = engine.create({
+      name: 'BoundedBatch',
+      nodes: [{ id: 'run', type: 'loop.forEach', inputs: { items: [1, 2, 3, 4, 5, 6], workflowId: perItem._id, concurrency: 2 } }],
+    });
+
+    const exec = await engine.run(batch._id);
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.run.data.results.length).toBe(6);
+    expect(maxInFlight).toBeLessThanOrEqual(2);
+    expect(maxInFlight).toBeGreaterThan(1); // proves it's genuinely running some in parallel, not falling back to fully sequential
+  });
+
+  it('one item failing does not abort the batch by default -- others still succeed, the failed one is marked', async () => {
+    engine.nodes.add({
+      type: 'test.failOnTwo',
+      name: 'FailOnTwo',
+      category: 'test',
+      handler: async (inputs) => {
+        if (inputs.item === 2) throw new Error('item 2 boom');
+        return inputs.item;
+      },
+    });
+    const perItem = engine.create({ name: 'MayFail', nodes: [{ id: 'p', type: 'test.failOnTwo', inputs: { item: '{{_trigger.item}}' } }] });
+    const batch = engine.create({
+      name: 'PartialFailBatch',
+      nodes: [{ id: 'run', type: 'loop.forEach', inputs: { items: [1, 2, 3], workflowId: perItem._id, concurrency: 5 } }],
+    });
+
+    const exec = await engine.run(batch._id);
+    expect(exec.status).toBe('success'); // the loop.forEach NODE itself succeeded -- it collected results, it didn't throw
+    const results = exec.nodeResults.run.data.results;
+    expect(results[0].status).toBe('success');
+    expect(results[1].status).toBe('error');
+    expect(results[1].error).toContain('item 2 boom');
+    expect(results[2].status).toBe('success');
+  });
+
+  it('continueOnItemError: false stops queuing further chunks after the first failure', async () => {
+    const calls = [];
+    engine.nodes.add({
+      type: 'test.failOnTwoTrack',
+      name: 'FailOnTwoTrack',
+      category: 'test',
+      handler: async (inputs) => {
+        calls.push(inputs.item);
+        if (inputs.item === 2) throw new Error('stop here');
+        return inputs.item;
+      },
+    });
+    const perItem = engine.create({ name: 'MayFail2', nodes: [{ id: 'p', type: 'test.failOnTwoTrack', inputs: { item: '{{_trigger.item}}' } }] });
+    const batch = engine.create({
+      name: 'StoppingBatch',
+      // concurrency: 1 -> strictly one chunk (one item) at a time, so
+      // "stop queuing further chunks" is directly observable.
+      nodes: [{ id: 'run', type: 'loop.forEach', inputs: { items: [1, 2, 3, 4], workflowId: perItem._id, concurrency: 1, continueOnItemError: false } }],
+    });
+
+    const exec = await engine.run(batch._id);
+    const results = exec.nodeResults.run.data.results;
+    expect(results[0].status).toBe('success');
+    expect(results[1].status).toBe('error');
+    expect(results[2]).toBeUndefined(); // never attempted -- chunk 3 was never queued
+    expect(results[3]).toBeUndefined();
+    expect(calls).toEqual([1, 2]); // items 3 and 4's handler never even ran
+  });
+
+  it('a loop.forEach-induced cycle is caught by the existing sub-workflow cycle detection, same error', async () => {
+    const a = engine.create({ name: 'LoopCycleA', nodes: [] });
+    engine.update(a._id, {
+      nodes: [{ id: 'run', type: 'loop.forEach', inputs: { items: [1], workflowId: a._id } }],
+    });
+
+    const exec = await engine.run(a._id);
+    expect(exec.status).toBe('success'); // loop.forEach itself doesn't throw -- the cycle shows up as a per-item error
+    expect(exec.nodeResults.run.data.results[0].status).toBe('error');
+    expect(exec.nodeResults.run.data.results[0].error).toContain('Circular sub-workflow reference');
+  });
+});

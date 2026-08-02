@@ -40,6 +40,16 @@
  * `A -> B -> A` cycle throws `Circular sub-workflow reference` instead of
  * recursing forever.
  *
+ * Per-item processing: `loop.forEach` (built entirely on `workflow.execute`
+ * above -- NOT a real items-array data model; `context[nodeId]` is still a
+ * single value everywhere else in the engine) runs an already-defined
+ * sub-workflow once per item in an input array, chunked to `concurrency`
+ * (default 5) items at a time, and collects `{ item, status, nodeResults }`
+ * (or `{ item, status: 'error', error }`) per item into `results`. One
+ * item's sub-workflow failing doesn't abort the batch unless
+ * `continueOnItemError: false`. Cycle detection is free -- it goes through
+ * the same `execute()` call `workflow.execute` does.
+ *
  * Persisted wait: two nodes (`core/nodes.js`) pause an execution,
  * surviving process restarts -- unlike the plain `wait` node's in-memory
  * `setTimeout`. `wait.until` resumes automatically once a time/duration
@@ -159,6 +169,64 @@ export class WorkflowEngine {
           throw new Error(`Sub-workflow '${inputs.workflowId}' failed: ${message}`);
         }
         return { executionId: subExec._id, status: subExec.status, nodeResults: subExec.nodeResults };
+      },
+    });
+
+    // 'loop.forEach' node -- same "needs a live engine" reason as
+    // 'workflow.execute' above, and built entirely on top of it: runs an
+    // already-defined sub-workflow once per item in an input array,
+    // collecting each run's result. This is NOT a real items-array
+    // execution model (context[nodeId] is still a single value everywhere
+    // else in the engine) -- it's one additive, opt-in node that reuses
+    // execute()'s existing sub-workflow/cycle-detection/error-workflow
+    // machinery rather than a second, parallel per-item dispatch engine.
+    this._nodeRegistry.add({
+      type: 'loop.forEach',
+      name: 'For Each Item',
+      category: 'core',
+      description: 'Run a sub-workflow once per item in an array (bounded concurrency), collecting each run\'s result',
+      inputs: [
+        { name: 'items', type: 'array', required: true },
+        { name: 'workflowId', type: 'string', required: true },
+        { name: 'concurrency', type: 'number', default: 5 },
+        { name: 'continueOnItemError', type: 'boolean', default: true },
+      ],
+      outputs: [{ name: 'results', type: 'array' }],
+      handler: async (inputs, _credentials, ctx) => {
+        const items = Array.isArray(inputs.items) ? inputs.items : [];
+        const concurrency = Math.max(1, inputs.concurrency ?? 5);
+        const continueOnItemError = inputs.continueOnItemError !== false;
+        const callChain = ctx?.callChain || [];
+
+        const results = new Array(items.length);
+        let stop = false;
+
+        for (let start = 0; start < items.length; start += concurrency) {
+          if (stop) break;
+          const chunk = items.slice(start, start + concurrency);
+          const settled = await Promise.allSettled(chunk.map((item) => this.execute(inputs.workflowId, {
+            trigger: 'workflow',
+            data: { item },
+            _subWorkflowChain: callChain,
+          })));
+
+          for (let i = 0; i < settled.length; i++) {
+            const index = start + i;
+            const outcome = settled[i];
+            if (outcome.status === 'fulfilled' && outcome.value.status !== 'failed') {
+              const exec = outcome.value;
+              results[index] = { item: chunk[i], status: exec.status, executionId: exec._id, nodeResults: exec.nodeResults };
+            } else {
+              const message = outcome.status === 'fulfilled'
+                ? (Object.values(outcome.value.errors)[0] || 'sub-workflow execution failed')
+                : outcome.reason.message;
+              results[index] = { item: chunk[i], status: 'error', error: message };
+              if (!continueOnItemError) stop = true;
+            }
+          }
+        }
+
+        return { results };
       },
     });
 
