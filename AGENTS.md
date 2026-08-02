@@ -1150,8 +1150,9 @@ bun cli.js seed --file seed.json
 ### Content Types
 - GET/POST/PUT/DELETE /api/content-types[/:slug]
 
-### Schema (field management)
-- GET /api/schema/:slug/fields
+### Schema
+- GET /api/schema - full REST API discovery catalog (all resource groups, endpoints, auth, body schemas) — the REST counterpart to MCP's `tools/list`
+- GET /api/schema/:slug/fields - field management for one content type
 - POST /api/schema/:slug/fields - add field
 - PUT /api/schema/:slug/fields/:name - update field
 - DELETE /api/schema/:slug/fields/:name - remove field
@@ -2249,14 +2250,19 @@ running HTTP API cold, the same way any other agent integrating with this system
 system always responded correctly, just not always ergonomically) — a prioritized list of what would
 make the API easier for an agent to use correctly on the first try, none of it built yet.
 
-1. **No self-describing endpoint for the REST surface, unlike the MCP surface.** `tools/list` (MCP) is
-   fully self-describing with real JSON schemas — an agent never has to guess a tool's argument shape.
-   The plain REST API (`/api/entries`, `/api/projects`, `/api/workflows`, `/api/db`) has no equivalent;
-   `GET /api/workflows/nodes/list` covers node input shapes specifically, but nothing covers the CMS/
-   projects/credentials routes' expected request bodies. Live-tested consequence: guessed
-   `{contentType: ...}` for entry creation over HTTP and via the MCP tool, both times the real field is
-   `contentTypeSlug` — two failed calls before getting it right, on both surfaces independently, at
-   different points in the same test run.
+1. **RESOLVED (2026-08-02).** No self-describing endpoint for the REST surface, unlike the MCP surface.
+   `tools/list` (MCP) is fully self-describing with real JSON schemas — an agent never has to guess a
+   tool's argument shape. The plain REST API (`/api/entries`, `/api/projects`, `/api/workflows`,
+   `/api/db`) had no equivalent; `GET /api/workflows/nodes/list` covered node input shapes
+   specifically, but nothing covered the CMS/projects/credentials routes' expected request bodies.
+   Live-tested consequence: guessed `{contentType: ...}` for entry creation over HTTP and via the MCP
+   tool, both times the real field is `contentTypeSlug` — two failed calls before getting it right, on
+   both surfaces independently, at different points in the same test run. Fixed: `GET /api/schema` now
+   returns a full catalog of every resource group's endpoints, reusing the exact schema objects each
+   route already passes to `validateBody()` — same single-source-of-truth guarantee `tools/list` has —
+   so an entry-creation caller now sees `contentTypeSlug` directly instead of guessing. Routes with no
+   formal schema (manual body checks) are described by hand and explicitly flagged as such (`bodyDescription`
+   instead of `bodySchema`), rather than presented with false precision.
 2. **`title` is ambiguous.** CMS entries have a universal top-level `title`, and a content type can
    *also* define its own field literally named `title` inside `content`. Providing only the top-level
    one is not enough if the content type has one too, and the resulting error (`"Field 'title' is
@@ -2277,5 +2283,7 @@ make the API easier for an agent to use correctly on the first try, none of it b
    aborting"` — naming exactly what failed and why. Others are generic (see #2). Worth a pass to bring
    every validation error up to the same "what failed, where, why" bar.
 5. **`/api/shell/help` is the right pattern; it's not applied anywhere else.** One compact, dense,
-   agent-oriented endpoint an agent reads once to operate the whole command gateway. The rest of the
-   REST surface has nothing equivalent — closing #1 well would effectively generalize this pattern.
+   agent-oriented endpoint an agent reads once to operate the whole command gateway. #1's fix
+   (`GET /api/schema`) now covers the request-body-shape half of this for every other resource group,
+   but it's a data catalog, not `/api/shell/help`'s prose-style walkthrough — the two styles still
+   coexist rather than one generalizing the other.
