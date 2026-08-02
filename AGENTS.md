@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1033 tests | 0 deps | 26 core modules
+By automators.work | 1038 tests | 0 deps | 26 core modules
 
 ## Architecture
 
@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook)
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach)
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -1350,6 +1350,38 @@ corrupt it) — re-entering a workflow id already in the chain throws
 `Circular sub-workflow reference` instead of recursing forever, catching
 both direct self-calls and indirect cycles (`A -> B -> A`).
 
+### Per-item Processing
+
+`loop.forEach` — same per-instance-registration reason as `workflow.execute`, and built entirely on
+top of it. **Not** a real items-array data model (`context[nodeId]` is still a single value everywhere
+else in the engine, and none of the 21 built-in nodes gain implicit per-item behavior) — the one
+additive, opt-in place per-item processing exists, for when you need it:
+
+```javascript
+const perItem = engine.create({
+  name: 'Process One Order',
+  nodes: [{ id: 'charge', type: 'http.request', inputs: { url: '...', body: '{{_trigger.item}}' } }],
+});
+engine.create({
+  name: 'Process Batch',
+  nodes: [{
+    id: 'batch', type: 'loop.forEach',
+    inputs: { items: '{{_trigger.orders}}', workflowId: perItem._id, concurrency: 5 },
+  }],
+});
+```
+
+Runs the `workflowId` sub-workflow once per item, chunked to `concurrency` (default 5) items at a
+time (`Promise.allSettled` per chunk, not an unbounded `Promise.all`) — each item arrives inside its
+sub-workflow as `{{_trigger.item}}`, the exact same trigger-data shape `workflow.execute` already
+uses, no new template syntax. Returns `{ results }`: one entry per item, `{ item, status, executionId,
+nodeResults }` on success or `{ item, status: 'error', error }` on failure. `continueOnItemError`
+(default `true`) controls whether one item failing stops queuing further chunks — already-dispatched
+items in the same chunk always finish either way, same "in-flight work isn't aborted" precedent as
+the `if`/`onFalse: 'skip'` barrier. Cycle detection is free: a `loop.forEach` whose per-item workflow
+re-enters a workflow already in the call chain hits the exact same `_subWorkflowChain` check, surfaced
+as that item's own `error` rather than aborting the whole batch.
+
 ### Persisted Wait
 
 Two nodes pause an execution, surviving process restarts — unlike the
@@ -2057,6 +2089,27 @@ app — 10 more over real HTTP covering the routes and the shadowing fix). Verif
 server and a real mock OAuth2 provider communicating over real `curl` calls: wrong state rejected
 (400), correct state completes a real PKCE code exchange confirmed in the mock provider's own
 independent log.
+
+**`workflow.js` `loop.forEach` added (2026-08-01):** closes the last item from this session's n8n
+comparison — the biggest one on the list. n8n's execution model passes an array of items through every
+node; `workflow.js` is "one value per node" everywhere, and there was no per-item iteration construct
+at all. A real items-array rewrite means changing what every node receives and what `{{ref}}`
+resolution means, engine-wide — the same scale as the `db.js`/`Collection` redesign this session
+already scoped down rather than attempted directly. This does NOT attempt that rewrite. New
+`loop.forEach` node (registered per-instance, same reason `workflow.execute` is, and built entirely on
+top of it): runs an already-defined sub-workflow once per item in an input array via the exact
+`execute()`/sub-workflow mechanism, chunked to `concurrency` (default 5) items at a time
+(`Promise.allSettled` per chunk, not unbounded `Promise.all`). Each item arrives as
+`{{_trigger.item}}` — no new template syntax. Collects `{ item, status, nodeResults }` (or `{ item,
+status: 'error', error }`) per item into `results`; `continueOnItemError` (default `true`) controls
+whether one item failing stops queuing further chunks. Cycle detection is free — same
+`_subWorkflowChain` check `execute()` already has, no new code. `context[nodeId]` is still a single
+value everywhere else in the engine; none of the 21 built-in nodes gain implicit per-item behavior —
+this is the one additive, opt-in place per-item processing exists. 5 new regression tests (result
+shape/ordering, real bounded concurrency measured via actual overlapping in-flight calls, partial
+failure doesn't abort the batch by default, `continueOnItemError: false` stops queuing further chunks,
+induced cycles caught by the existing detection). Verified: 20 isolated runs and 2 full-suite runs, all
+clean.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
