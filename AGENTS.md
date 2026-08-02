@@ -2241,3 +2241,41 @@ Current posture:
 - Session auto-cleanup
 - Webhook HMAC-SHA256 signing + optional per-webhook secret
 - Rate limiting in triggers
+
+## Known Agent-UX Friction Points
+
+Found via a real, live, end-to-end system test (2026-08-02) — an agent (this one) driving the actual
+running HTTP API cold, the same way any other agent integrating with this system would. Not bugs (the
+system always responded correctly, just not always ergonomically) — a prioritized list of what would
+make the API easier for an agent to use correctly on the first try, none of it built yet.
+
+1. **No self-describing endpoint for the REST surface, unlike the MCP surface.** `tools/list` (MCP) is
+   fully self-describing with real JSON schemas — an agent never has to guess a tool's argument shape.
+   The plain REST API (`/api/entries`, `/api/projects`, `/api/workflows`, `/api/db`) has no equivalent;
+   `GET /api/workflows/nodes/list` covers node input shapes specifically, but nothing covers the CMS/
+   projects/credentials routes' expected request bodies. Live-tested consequence: guessed
+   `{contentType: ...}` for entry creation over HTTP and via the MCP tool, both times the real field is
+   `contentTypeSlug` — two failed calls before getting it right, on both surfaces independently, at
+   different points in the same test run.
+2. **`title` is ambiguous.** CMS entries have a universal top-level `title`, and a content type can
+   *also* define its own field literally named `title` inside `content`. Providing only the top-level
+   one is not enough if the content type has one too, and the resulting error (`"Field 'title' is
+   required"`) doesn't say which layer is missing it.
+3. **The DAG-ordering gotcha is the single biggest correctness risk for an agent authoring a workflow
+   over the API.** `_buildWorkflowDAG` only infers node ordering from literal `{{ref}}` occurrences in
+   `inputs`/`runIf` — a node with no such reference to another node can land in an earlier DAG level
+   than the author intended, with no warning. Live-tested consequence: in a real workflow built during
+   the system test, a `wait.forWebhook` node with no reference to a preceding `switch` node landed in
+   the *same* level and paused the whole execution before the switch-dependent node ever got a chance
+   to run in that pass — deferred to after the resume call instead. The author (this session) already
+   knew this exact gotcha from having documented it repeatedly and still nearly missed it while writing
+   the workflow definition by hand. There is no `POST /api/workflows/:id/validate`-style endpoint (or
+   equivalent lint at create/update time) that would catch "node X references node Y in `runIf` but Y
+   has no corresponding dependency" *before* a real run silently does the wrong thing.
+4. **Error message specificity is inconsistent.** Some are excellent and already agent-legible —
+   `"net-guard: blocked internal destination: 127.0.0.1"`, `"OAuth2 state mismatch — possible CSRF,
+   aborting"` — naming exactly what failed and why. Others are generic (see #2). Worth a pass to bring
+   every validation error up to the same "what failed, where, why" bar.
+5. **`/api/shell/help` is the right pattern; it's not applied anywhere else.** One compact, dense,
+   agent-oriented endpoint an agent reads once to operate the whole command gateway. The rest of the
+   REST surface has nothing equivalent — closing #1 well would effectively generalize this pattern.
