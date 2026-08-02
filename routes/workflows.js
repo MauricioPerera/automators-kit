@@ -34,8 +34,10 @@ export function workflowRoutes(cms, engine) {
   // (id="credentials") instead of ever reaching the real handler. Found
   // live while adding the OAuth2 routes below (same route-shadowing bug
   // class already found once this session in an example's webhook path).
-  r.get('/credentials', auth, requireRole('admin'), async () => {
-    return json({ credentials: engine.vault.list() });
+  r.get('/credentials', auth, requireRole('admin'), async (ctx) => {
+    const opts = {};
+    if (ctx.query.projectId) opts.projectId = ctx.query.projectId;
+    return json({ credentials: engine.vault.list(opts) });
   });
 
   r.get('/:id', auth, async (ctx) => {
@@ -149,7 +151,7 @@ export function workflowRoutes(cms, engine) {
   r.post('/credentials', auth, requireRole('admin'), async (ctx) => {
     const body = await ctx.json();
     if (!body?.name || !body?.values) return error('name and values required', 400);
-    await engine.vault.store(body.name, body.values, { description: body.description, service: body.service });
+    await engine.vault.store(body.name, body.values, { description: body.description, service: body.service, projectId: body.projectId });
     return json({ stored: body.name }, 201);
   });
 

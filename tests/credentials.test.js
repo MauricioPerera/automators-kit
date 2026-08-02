@@ -318,3 +318,40 @@ describe('CredentialVault: OAuth2', () => {
     expect(mock.calls.length).toBe(0); // never touched the token endpoint at all
   });
 });
+
+// ---------------------------------------------------------------------------
+// Project tagging (organizational only, NOT an access boundary)
+// ---------------------------------------------------------------------------
+
+describe('CredentialVault: project tagging', () => {
+  it('store() tags a credential with projectId; list({projectId}) returns that project\'s tagged credentials PLUS every global one', async () => {
+    await vault.store('proj-a-cred', { token: 'a' }, { projectId: 'proj-a' });
+    await vault.store('proj-b-cred', { token: 'b' }, { projectId: 'proj-b' });
+    await vault.store('global-cred', { token: 'g' }); // no projectId -- global
+
+    const forA = vault.list({ projectId: 'proj-a' });
+    const names = forA.map((c) => c.name).sort();
+    expect(names).toEqual(['global-cred', 'proj-a-cred']); // proj-a's own + the global one, NOT proj-b's
+  });
+
+  it('list() with no argument returns everything regardless of tagging (unfiltered/admin view)', async () => {
+    await vault.store('proj-a-cred', { token: 'a' }, { projectId: 'proj-a' });
+    await vault.store('global-cred', { token: 'g' });
+    expect(vault.list().length).toBe(2);
+  });
+
+  it('projectId tagging is organizational only -- get() enforces nothing, any caller who knows the name can still use it', async () => {
+    await vault.store('proj-a-cred', { token: 'secret-a' }, { projectId: 'proj-a' });
+    // No project/membership context passed to get() at all -- it just works,
+    // by design (see store()'s doc comment on this deliberate scoping decision).
+    const creds = await vault.get('proj-a-cred');
+    expect(creds.token).toBe('secret-a');
+  });
+
+  it('a credential\'s projectId can be changed via a later store() call, same update-whitelist pattern as description/service', async () => {
+    await vault.store('movable', { token: 'x' }, { projectId: 'proj-a' });
+    await vault.store('movable', { token: 'x' }, { projectId: 'proj-b' });
+    expect(vault.list({ projectId: 'proj-a' }).some((c) => c.name === 'movable')).toBe(false);
+    expect(vault.list({ projectId: 'proj-b' }).some((c) => c.name === 'movable')).toBe(true);
+  });
+});

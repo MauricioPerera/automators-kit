@@ -6,7 +6,7 @@
  */
 
 import { Router, json, error } from '../core/http.js';
-import { createAuth, requireProjectRole } from './middleware.js';
+import { createAuth, requireProjectRole, requireRole } from './middleware.js';
 import { PROJECT_ROLES } from '../core/projects.js';
 
 /**
@@ -21,6 +21,16 @@ export function projectRoutes(cms, projectManager, workflowEngine) {
   // ─── PROJECTS ─────────────────────────────────────────────
 
   r.get('/', auth, async (ctx) => json({ projects: projectManager.listProjects(ctx.state.user._id) }));
+
+  // Instance-wide listing for CMS admins -- every project, regardless of
+  // membership, so an admin can audit/manage projects they don't belong
+  // to. Registered here, BEFORE the generic `/:id` catch-all below, for
+  // the exact same reason `/api/workflows/credentials` had to move above
+  // its own `/:id` earlier this session: Router matches in registration
+  // order, and `/:id` (a single path segment, same shape as `/all`) would
+  // otherwise shadow this route -- GET /all would 404 as "Project not
+  // found" (id="all") instead of ever reaching the real handler.
+  r.get('/all', auth, requireRole('admin'), async () => json({ projects: projectManager.listProjects() }));
 
   // Any authenticated user can create a project and becomes its owner --
   // no CMS-role gate, same as n8n letting any user own their own projects.

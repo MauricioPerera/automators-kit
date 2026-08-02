@@ -508,6 +508,31 @@ describe('Projects', () => {
     const res = await app.handle(req('DELETE', `/api/projects/${project._id}/members/${adminId}`, null, adminToken));
     expect(res.status).toBe(400);
   });
+
+  it('GET /all is admin-only and lists every project, including ones the caller isn\'t a member of', async () => {
+    await app.handle(req('POST', '/api/projects', { name: 'NotMemberOfThis' }, adminToken));
+
+    const forbiddenRes = await app.handle(req('GET', '/api/projects/all', null, memberToken));
+    expect(forbiddenRes.status).toBe(403); // member has no CMS-global admin role
+
+    const allRes = await app.handle(req('GET', '/api/projects/all', null, adminToken));
+    expect(allRes.status).toBe(200);
+    const { projects: everything } = await json(allRes);
+    const own = await json(await app.handle(req('GET', '/api/projects', null, adminToken)));
+    expect(everything.length).toBeGreaterThanOrEqual(own.projects.length); // /all is a superset
+  });
+
+  it('GET /api/workflows/credentials?projectId= returns that project\'s tagged credentials plus every global one', async () => {
+    const { project } = await json(await app.handle(req('POST', '/api/projects', { name: 'CredScoped' }, adminToken)));
+    await app.handle(req('POST', '/api/workflows/credentials', { name: 'scoped-cred', values: { token: 'x' }, projectId: project._id }, adminToken));
+    await app.handle(req('POST', '/api/workflows/credentials', { name: 'global-cred-http', values: { token: 'y' } }, adminToken));
+
+    const res = await app.handle(req('GET', `/api/workflows/credentials?projectId=${project._id}`, null, adminToken));
+    expect(res.status).toBe(200);
+    const names = (await json(res)).credentials.map((c) => c.name);
+    expect(names).toContain('scoped-cred');
+    expect(names).toContain('global-cred-http');
+  });
 });
 
 // ---------------------------------------------------------------------------

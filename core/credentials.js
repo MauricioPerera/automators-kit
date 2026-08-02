@@ -24,6 +24,14 @@
  *   const creds = await vault.get('github'); // { token: '...', refreshToken: '...' }
  *   // get() transparently refreshes an expiring token before returning it --
  *   // no special handling needed by callers, including node handlers.
+ *
+ * Project tagging: store(name, values, { projectId }) tags a credential
+ * with a core/projects.js project id, for listing purposes
+ * (list({ projectId }) -- "what's available in this project" -- returns
+ * that project's tagged credentials plus every global/untagged one).
+ * Organizational only, NOT an access boundary: get() is unchanged and
+ * enforces nothing, so any workflow that knows a credential's name can
+ * still use it regardless of tagging or the caller's project role.
  */
 
 import { FieldCrypto } from './db.js';
@@ -104,7 +112,15 @@ export class CredentialVault {
    * Store credentials (encrypted).
    * @param {string} name - Credential name (e.g. 'slack', 'openai')
    * @param {object} values - Key-value pairs to encrypt
-   * @param {object} meta - Unencrypted metadata (description, etc)
+   * @param {object} meta - Unencrypted metadata (description, service, projectId)
+   * @param {string} [meta.projectId] - Organizational tag only (see `list()`) --
+   *   NOT enforced against core/projects.js's ProjectManager membership, and
+   *   NOT checked by `get()`. A workflow that knows a credential's NAME can
+   *   still use it via `execute()`'s node dispatch regardless of project
+   *   tagging or the caller's project role -- same "existing execution path
+   *   stays untouched" scoping decision already used for
+   *   `/api/workflows/:id` staying on the global CMS role. `projectId` is
+   *   for listing/organization (`list({ projectId })`), not access control.
    */
   async store(name, values, meta = {}) {
     this._ensureInit();
@@ -116,13 +132,14 @@ export class CredentialVault {
     const existing = this._col.findOne({ name });
     if (existing) {
       // Whitelist metadata fields — never let `meta` overwrite `values`/`name`/`_id`
-      // (same contract as the insert branch: only `description` and `service` are honored).
+      // (same contract as the insert branch: only description/service/projectId are honored).
       const set = {
         values: encrypted,
         updatedAt: Date.now(),
       };
       if (meta.description !== undefined) set.description = meta.description;
       if (meta.service !== undefined) set.service = meta.service;
+      if (meta.projectId !== undefined) set.projectId = meta.projectId;
       this._col.update({ _id: existing._id }, { $set: set });
     } else {
       this._col.insert({
@@ -130,6 +147,7 @@ export class CredentialVault {
         values: encrypted,
         description: meta.description || '',
         service: meta.service || name,
+        projectId: meta.projectId || null,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       });
@@ -174,13 +192,24 @@ export class CredentialVault {
   }
 
   /**
-   * List all credentials (names only, no decryption).
+   * List credentials (names only, no decryption).
+   * @param {object} [opts]
+   * @param {string} [opts.projectId] - When given, returns credentials
+   *   tagged with THIS project plus every global (untagged) credential --
+   *   "what's available to use in this project" -- rather than an exact
+   *   match, since global credentials remain usable everywhere (see
+   *   store()'s doc comment: projectId is organizational, not an access
+   *   boundary). Omit entirely for the full, unfiltered list.
    */
-  list() {
-    return this._col.find({}).toArray().map(doc => ({
+  list(opts = {}) {
+    const filter = opts.projectId !== undefined
+      ? { $or: [{ projectId: opts.projectId }, { projectId: null }, { projectId: { $exists: false } }] }
+      : {};
+    return this._col.find(filter).toArray().map(doc => ({
       name: doc.name,
       service: doc.service,
       description: doc.description,
+      projectId: doc.projectId || null,
       type: doc.type || 'basic',
       ...(doc.type === 'oauth2' ? { expiresAt: doc.expiresAt ?? null, pendingAuthorization: !!doc.pendingState } : {}),
       createdAt: doc.createdAt,
