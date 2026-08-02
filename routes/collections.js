@@ -81,14 +81,14 @@ export function collectionRoutes(cms) {
   r.get('/:col/:id', auth, async (ctx) => {
     const col = cms.db.collection(ctx.params.col);
     const doc = col.findById(ctx.params.id);
-    if (!doc) return error('Not found', 404);
+    if (!doc) return error(`Document '${ctx.params.id}' not found in collection '${ctx.params.col}'`, 404);
     return json({ data: doc });
   });
 
   // Insert
   r.post('/:col', auth, async (ctx) => {
     const body = await ctx.json();
-    if (!body) return error('Body required', 400);
+    if (!body) return error(`Request body is required (missing, empty, or not valid JSON) for POST /api/db/${ctx.params.col}`, 400);
 
     const col = cms.db.collection(ctx.params.col);
 
@@ -107,11 +107,11 @@ export function collectionRoutes(cms) {
   // Update by ID
   r.put('/:col/:id', auth, async (ctx) => {
     const body = await ctx.json();
-    if (!body) return error('Body required', 400);
+    if (!body) return error(`Request body is required (missing, empty, or not valid JSON) for PUT /api/db/${ctx.params.col}/${ctx.params.id}`, 400);
 
     const col = cms.db.collection(ctx.params.col);
     const existing = col.findById(ctx.params.id);
-    if (!existing) return error('Not found', 404);
+    if (!existing) return error(`Document '${ctx.params.id}' not found in collection '${ctx.params.col}'`, 404);
 
     col.update({ _id: ctx.params.id }, { $set: body });
     cms.db.flush();
@@ -122,7 +122,7 @@ export function collectionRoutes(cms) {
   r.delete('/:col/:id', auth, async (ctx) => {
     const col = cms.db.collection(ctx.params.col);
     const existing = col.findById(ctx.params.id);
-    if (!existing) return error('Not found', 404);
+    if (!existing) return error(`Document '${ctx.params.id}' not found in collection '${ctx.params.col}'`, 404);
 
     col.removeById(ctx.params.id);
     cms.db.flush();

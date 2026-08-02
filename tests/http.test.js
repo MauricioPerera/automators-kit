@@ -384,7 +384,7 @@ describe('Malformed path params', () => {
     const res = await r.handle(req('GET', '/users/%zz'));
     expect(res.status).toBe(400);
     const body = await jsonBody(res);
-    expect(body.error).toBe('Bad Request');
+    expect(body.error).toContain('malformed percent-encoding');
   });
 
   it('malformed param in sub-router responds 400, not 500', async () => {

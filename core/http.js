@@ -50,6 +50,7 @@ export function metricsHandler(registry) {
  * from "no match" so the caller can answer 400 instead of 404 or 500.
  */
 const BAD_REQUEST = Symbol('bad-request');
+const BAD_REQUEST_MESSAGE = 'Bad Request: malformed percent-encoding in a URL path segment (e.g. an incomplete %XX escape)';
 
 // ---------------------------------------------------------------------------
 // ROUTE COMPILER
@@ -191,7 +192,7 @@ export class Router {
       } else if (method === 'OPTIONS') {
         // Handle OPTIONS (CORS preflight) — return 204 if no explicit route
         const optRoute = this._match('OPTIONS', path);
-        if (optRoute === BAD_REQUEST) response = error('Bad Request', 400);
+        if (optRoute === BAD_REQUEST) response = error(BAD_REQUEST_MESSAGE, 400);
         else response = optRoute ? await this._executeRoute(optRoute, ctx) : new Response(null, { status: 204 });
       } else {
         // Try sub-routers first
@@ -225,7 +226,7 @@ export class Router {
         // Match own routes
         if (!response) {
           const match = this._match(method, path);
-          if (match === BAD_REQUEST) response = error('Bad Request', 400);
+          if (match === BAD_REQUEST) response = error(BAD_REQUEST_MESSAGE, 400);
           else if (match) response = await this._executeRoute(match, ctx);
           else if (this._notFound) response = this._notFound(ctx);
           else response = notFound();
@@ -323,7 +324,7 @@ export class Router {
 
     // Match own routes
     const match = this._match(ctx.method, path);
-    if (match === BAD_REQUEST) return error('Bad Request', 400);
+    if (match === BAD_REQUEST) return error(BAD_REQUEST_MESSAGE, 400);
     if (match) return this._executeRoute(match, ctx);
 
     return null;

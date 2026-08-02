@@ -151,6 +151,83 @@ describe('Auth flow', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Error message specificity (friction point #4)
+// ---------------------------------------------------------------------------
+
+describe('Error message specificity', () => {
+  let viewerToken;
+
+  beforeAll(async () => {
+    await app.handle(req('POST', '/api/auth/register', {
+      email: 'viewer@test.com', password: 'password1234', name: 'Viewer',
+    }));
+    const col = app.cms.auth._users;
+    col.update({ email: 'viewer@test.com' }, { $set: { role: 'viewer', roles: ['viewer'] } });
+    const loginRes = await app.handle(req('POST', '/api/auth/login', {
+      email: 'viewer@test.com', password: 'password1234',
+    }));
+    viewerToken = (await json(loginRes)).token;
+  });
+
+  it('requireRole names the required role(s) and the caller\'s actual role', async () => {
+    const res = await app.handle(req('POST', '/api/content-types', { name: 'X', slug: 'x' }, viewerToken));
+    expect(res.status).toBe(403);
+    const body = await json(res);
+    expect(body.error).toContain('admin');
+    expect(body.error).toContain("'viewer'");
+  });
+
+  it('requirePermission names the required permission and the caller\'s role', async () => {
+    await app.handle(req('POST', '/api/content-types', {
+      name: 'Note', slug: 'note', fields: [],
+    }, adminToken));
+    const res = await app.handle(req('POST', '/api/entries', {
+      title: 'Nope', contentTypeSlug: 'note', content: {},
+    }, viewerToken));
+    expect(res.status).toBe(403);
+    const body = await json(res);
+    expect(body.error).toContain('entries:write');
+    expect(body.error).toContain("'viewer'");
+  });
+
+  it('requireProjectRole names the required and actual project role', async () => {
+    const { project } = await json(await app.handle(req('POST', '/api/projects', { name: 'Msg Test' }, adminToken)));
+    await app.handle(req('POST', `/api/projects/${project._id}/members`, {
+      userId: (await json(await app.handle(req('GET', '/api/auth/me', null, viewerToken)))).user._id,
+      role: 'viewer',
+    }, adminToken));
+
+    const res = await app.handle(req('PUT', `/api/projects/${project._id}`, { name: 'Hack' }, viewerToken));
+    expect(res.status).toBe(403);
+    const body = await json(res);
+    expect(body.error).toContain('editor');
+    expect(body.error).toContain("'viewer'");
+  });
+
+  it('GET /api/db/:col/:id names the collection and id when not found', async () => {
+    const res = await app.handle(req('GET', '/api/db/widgets/does-not-exist', null, adminToken));
+    expect(res.status).toBe(404);
+    const body = await json(res);
+    expect(body.error).toContain('widgets');
+    expect(body.error).toContain('does-not-exist');
+  });
+
+  it('POST /api/db/:col names the route when the body is missing', async () => {
+    const res = await app.handle(req('POST', '/api/db/widgets', null, adminToken));
+    expect(res.status).toBe(400);
+    const body = await json(res);
+    expect(body.error).toContain('widgets');
+  });
+
+  it('GET /users/%zz names the actual cause (malformed percent-encoding), not a bare "Bad Request"', async () => {
+    const res = await app.handle(req('GET', '/api/db/widgets/%zz', null, adminToken));
+    expect(res.status).toBe(400);
+    const body = await json(res);
+    expect(body.error).toContain('percent-encoding');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Content Types
 // ---------------------------------------------------------------------------
 

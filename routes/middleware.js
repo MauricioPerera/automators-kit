@@ -47,7 +47,9 @@ export function requireRole(...roles) {
   return async (ctx, next) => {
     const user = ctx.state.user;
     if (!user) return error('Authorization required', 401);
-    if (!roles.includes(user.role)) return error('Insufficient permissions', 403);
+    if (!roles.includes(user.role)) {
+      return error(`Insufficient permissions: requires role ${roles.join(' or ')}, you have '${user.role}'`, 403);
+    }
     return next();
   };
 }
@@ -60,7 +62,9 @@ export function requirePermission(permission) {
   return async (ctx, next) => {
     const user = ctx.state.user;
     if (!user) return error('Authorization required', 401);
-    if (!hasPermission(user, permission)) return error('Insufficient permissions', 403);
+    if (!hasPermission(user, permission)) {
+      return error(`Insufficient permissions: requires '${permission}', role '${user.role}' does not grant it`, 403);
+    }
     return next();
   };
 }
@@ -78,7 +82,9 @@ export function requireProjectRole(projectManager, minRole) {
     const user = ctx.state.user;
     if (!user) return error('Authorization required', 401);
     if (!projectManager.hasProjectRole(ctx.params.id, user._id, minRole)) {
-      return error('Insufficient project permissions', 403);
+      const actual = projectManager.getMemberRole(ctx.params.id, user._id);
+      const have = actual ? `'${actual}'` : 'no membership';
+      return error(`Insufficient project permissions: requires '${minRole}' or higher on project '${ctx.params.id}', you have ${have}`, 403);
     }
     return next();
   };
