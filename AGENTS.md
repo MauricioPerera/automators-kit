@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1023 tests | 0 deps | 26 core modules
+By automators.work | 1033 tests | 0 deps | 26 core modules
 
 ## Architecture
 
@@ -22,7 +22,7 @@ workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, hist
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
-credentials.js     Credential vault: AES-256-GCM encrypted storage
+credentials.js     Credential vault: AES-256-GCM encrypted storage, OAuth2 (authorization-code + PKCE + refresh)
 shell.js           Agent shell: command gateway, parser, pipeline, JQ filter, RBAC
 shell-mcp.js       Exposes shell.js over MCP as 2 fixed tools (shell_help/shell_exec)
 queue.js           Job queue: async, retries, backoff, dead letter, concurrency
@@ -1426,6 +1426,43 @@ await engine.vault.store('slack', { webhookUrl: 'https://hooks.slack.com/...' })
 // Encrypted with AES-256-GCM, decrypted only at execution time
 ```
 
+#### OAuth2 (authorization-code + PKCE + refresh)
+
+Generic across any provider (not per-provider presets). A credential acquired this way ends up
+holding a plain `token` field, identical in shape to any hand-entered bearer token — nodes consume
+it exactly the same way (`credentials: 'name'`, `auth: 'bearer'`), no special handling needed.
+
+```javascript
+const authorizeUrl = await engine.vault.startOAuth2('github', {
+  authUrl: 'https://github.com/login/oauth/authorize',
+  tokenUrl: 'https://github.com/login/oauth/access_token',
+  clientId, clientSecret,
+  redirectUri: 'https://your-app/api/workflows/oauth2/github/callback',
+  scope: 'repo',
+});
+// redirect the admin's browser to authorizeUrl; the provider then calls
+// redirectUri with ?code=...&state=..., which the route hands to:
+await engine.vault.completeOAuth2('github', code, state);
+
+const creds = await engine.vault.get('github'); // { token, refreshToken }
+// get() transparently refreshes an expiring token before returning it --
+// no special handling by the caller, including node handlers. A refresh
+// failure logs and falls through (returns the possibly-stale token)
+// rather than throwing; every non-OAuth2 credential is unaffected.
+```
+
+Routes (`routes/workflows.js`): `POST /api/workflows/oauth2/:name/start` (admin-only; `config`
+including `clientSecret` travels in the body, never a query string) returns `{ authorizeUrl }`;
+`GET /api/workflows/oauth2/:name/callback` (**no auth** — the OAuth provider calls this directly and
+cannot present the app's JWT; the `state` parameter is the correct CSRF protection here, standard
+OAuth2 semantics, not a gap) completes the flow.
+
+Deliberate scoping decision: OAuth2 config URLs (`authUrl`/`tokenUrl`/`redirectUri`) are **not** run
+through `net-guard.js`'s `assertPublicUrl`. That SSRF guard exists for outbound requests driven by
+untrusted *workflow* definitions; this config comes from an authenticated admin action (same trust
+level `store()` already extends to arbitrary `values`), and the lockdown would also block legitimate
+internal/on-prem OAuth2 providers with no way to opt out.
+
 ## A2E Workflow Executor
 
 19 operations: SetData, FilterData, TransformData, MergeData, StoreData, ApiCall, ExecuteN8nWorkflow, DateTime, GetCurrentDateTime, ConvertTimezone, DateCalculation, FormatText, ExtractText, ValidateData, Calculate, EncodeDecode, Conditional, Loop, Wait
@@ -1994,6 +2031,32 @@ never caught in this file until now. Fixed the same way `tests/examples-workflow
 already does it correctly: track which execution ids existed BEFORE triggering and wait for one NOT in
 that set, independent of sort order. Verified: 30 isolated runs of the fixed file and 7 full-suite runs,
 all clean — the flake that appeared roughly 1-in-15 to 1-in-30 runs all session has not recurred once.
+
+**`credentials.js` OAuth2 support added; a real route-shadowing bug found and fixed (2026-08-01):**
+closes the last big open item from this session's n8n comparison. `CredentialVault` was a plain
+encrypted key-value store with no way to acquire or refresh an OAuth2 access token. Extended (not
+replaced) with a generic authorization-code + PKCE + refresh flow: `startOAuth2()`/`completeOAuth2()`
+(state-verified, PKCE `code_verifier` included in the real token exchange) and a `get()` that
+transparently refreshes an expiring token before returning it. A credential acquired this way ends up
+holding a plain `token` field, identical in shape to any hand-entered bearer token — zero changes
+needed to `core/nodes.js`'s bearer-auth path. Deliberate scoping decision, documented in the code:
+OAuth2 config URLs are **not** run through `net-guard.js`'s `assertPublicUrl` — that SSRF guard is for
+untrusted workflow-driven requests, not authenticated-admin-supplied config, and would block legitimate
+internal/on-prem providers with no way to opt out. New routes `POST /oauth2/:name/start` (admin-only)
+and `GET /oauth2/:name/callback` (no auth by design — the provider calls it, `state` is the real CSRF
+protection). Real bug found and fixed while writing the HTTP-level tests: `GET
+/api/workflows/credentials` had been shadowed by the earlier-registered `GET /:id` catch-all since it
+was first written (Router matches in registration order; `/:id`, a single path segment, swallowed
+`/credentials`, returning 404 "Workflow not found" instead of the list) — never caught before because
+that route had never been exercised over real HTTP in a test, same route-shadowing bug class already
+found once this session in an example's webhook path. Fixed by moving the route's registration before
+`/:id`. 17 new regression tests (7 at the vault level against a real mock OAuth2 token endpoint —
+`Bun.serve()` on a real port, the normal way to test OAuth2 client code without a real Google/GitHub
+app — 10 more over real HTTP covering the routes and the shadowing fix). Verified: 20 isolated runs and
+2 full-suite runs, all clean. Also verified live over two genuinely separate OS processes — a real app
+server and a real mock OAuth2 provider communicating over real `curl` calls: wrong state rejected
+(400), correct state completes a real PKCE code exchange confirmed in the mock provider's own
+independent log.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
