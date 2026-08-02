@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1038 tests | 0 deps | 26 core modules
+By automators.work | 1043 tests | 0 deps | 26 core modules
 
 ## Architecture
 
@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach)
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -1382,6 +1382,25 @@ the `if`/`onFalse: 'skip'` barrier. Cycle detection is free: a `loop.forEach` wh
 re-enters a workflow already in the call chain hits the exact same `_subWorkflowChain` check, surfaced
 as that item's own `error` rather than aborting the whole batch.
 
+### Per-node Retry
+
+A node can carry `retries: N` (default `0` — no behavior change for any existing workflow) and
+`retryBackoffMs` (default `1000`, doubled per attempt, same exponential formula `core/queue.js`
+already uses):
+
+```javascript
+nodes: [
+  { id: 'flaky', type: 'http.request', inputs: { url: 'https://api.example.com/data' },
+    retries: 3, retryBackoffMs: 500 },
+]
+```
+
+Only wraps the node's own operation — credential resolution and `runIf` evaluation happen before
+`_executeNodeWithRetry` and are never retried, since a missing credential is a config error, not a
+transient one worth retrying. A successful retry records `nodeResults[id].attempts`; an exhausted one
+records it too, on the error result — omitted entirely when there was only 1 attempt, so existing code
+inspecting `nodeResults` shapes sees no difference unless a node actually retried.
+
 ### Persisted Wait
 
 Two nodes pause an execution, surviving process restarts — unlike the
@@ -2110,6 +2129,22 @@ shape/ordering, real bounded concurrency measured via actual overlapping in-flig
 failure doesn't abort the batch by default, `continueOnItemError: false` stops queuing further chunks,
 induced cycles caught by the existing detection). Verified: 20 isolated runs and 2 full-suite runs, all
 clean.
+
+**`workflow.js` generic per-node retry/backoff added (2026-08-01):** closes the last real gap found in
+a final sweep re-reading the full original n8n comparison (both research passes, not just the 4-item
+"hard infra" consolidation this session had been tracking). n8n retries any node natively; `workflow.js`
+only had retry at the `queue.js` job level or HTTP-connector-specific, nothing generic in the workflow
+engine's own dispatch loop — never previously tracked or addressed. A node can carry `retries: N`
+(default `0` — zero behavior change for any existing workflow) and `retryBackoffMs` (default `1000`,
+doubled per attempt, same exponential formula `core/queue.js` already uses). New
+`_executeNodeWithRetry` wraps just the node's own operation — credential resolution and `runIf`
+evaluation happen before it and are never retried, since a missing credential is a config error, not a
+transient one. A successful retry records `nodeResults[id].attempts`; an exhausted one does too, on
+the error result. 5 new regression tests (default behavior completely unaffected, a node recovers on a
+later attempt, a node exhausts all retries and fails, backoff is real and exponential — measured via
+actual elapsed time between attempts, not simulated — and retry does NOT apply to a missing-credential
+error). Verified: 20 isolated runs and 2 full-suite runs, all clean. With this, the full n8n-comparison
+sweep — both research passes, every front, not just workflow.js features — is closed.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
