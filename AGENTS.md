@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1062 tests | 0 deps | 27 core modules
+By automators.work | 1068 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -1542,12 +1542,24 @@ Routes (`routes/projects.js`, mounted at `/api/projects`): full CRUD for project
 `GET /:id/workflows` (project-scoped listing, optional `?folderId=`), and
 `POST /:id/folders/:folderId/workflows` (body `{ workflowId }`) — **the real project-role-gated path**
 for filing a workflow into a project. Any authenticated user can create a project (becomes its owner,
-no CMS-role gate needed — same as n8n letting any user own their own projects).
+no CMS-role gate needed — same as n8n letting any user own their own projects). `GET /all` (admin-only,
+CMS-global role) lists every project regardless of membership, for instance admins auditing projects
+they don't belong to.
 
 **Deliberate scoping decision:** the existing `PUT /api/workflows/:id` route is untouched, still
 gated only by the global CMS role — a global admin/editor can set `projectId`/`folderId` directly on
 any workflow through it, bypassing project membership entirely. That escape hatch is intentional, not
 an oversight; it keeps the already-shipped workflow CRUD route's behavior exactly as it was.
+
+### Credentials and projects
+
+`core/credentials.js`'s `store(name, values, { projectId })` tags a credential with a project id;
+`list({ projectId })` returns that project's tagged credentials plus every global (untagged) one —
+"what's usable in this project." Organizational only, **not** an access boundary: `get()` is
+unchanged and enforces nothing, so any workflow that knows a credential's name can still use it
+regardless of tagging or the caller's project role — same scoping philosophy as the `PUT
+/api/workflows/:id` decision above. Routes: `POST /api/workflows/credentials` accepts `projectId`;
+`GET /api/workflows/credentials?projectId=...` returns the filtered view.
 
 ## A2E Workflow Executor
 
@@ -2200,6 +2212,22 @@ accounts: a genuine non-member gets a real 403, an editor creates a folder and a
 into it, demoting to viewer correctly blocks folder creation, and attempting workflow creation through
 the existing global route without a CMS role is correctly rejected — proving the scoping decision
 works as designed.
+
+**Credential project-tagging and admin-wide project listing added (2026-08-02):** two small gaps
+found on a re-review of the "gestión de proyectos y roles" pillar after Projects/Folders landed:
+credentials had no relationship to projects at all, and there was no way for an instance admin to see
+projects they don't belong to. `core/credentials.js`'s `store(name, values, { projectId })` tags a
+credential with a project id; `list({ projectId })` returns that project's tagged credentials plus
+every global (untagged) one. Deliberately organizational only, not an access boundary — `get()` is
+unchanged and enforces nothing, same "existing execution path stays untouched" scoping philosophy
+used elsewhere this session. `routes/workflows.js`'s `POST`/`GET /credentials` gain `projectId`
+support. `routes/projects.js` gains `GET /all` (admin-only), registered BEFORE the generic `/:id`
+catch-all for the same route-shadowing reason `/api/workflows/credentials` had to move earlier this
+session. 6 new regression tests (4 at the vault level, 2 over real HTTP). Verified: 20 isolated runs
+and 2 full-suite runs, all clean. Also verified live over a real spawned server: a non-admin correctly
+gets 403 on `/all`, an admin sees a project they don't belong to, and credential filtering by project
+returns exactly the tagged + global set, confirmed with three real credentials (project-scoped,
+differently-project-scoped, and global).
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
