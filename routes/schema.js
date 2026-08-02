@@ -155,7 +155,9 @@ function buildApiCatalog() {
         endpoints: [
           { method: 'GET', path: '/api/workflows/', auth: 'bearer', description: 'List workflows' },
           { method: 'GET', path: '/api/workflows/credentials', auth: 'admin', description: 'List vault credentials, optional ?projectId' },
+          { method: 'POST', path: '/api/workflows/validate', auth: 'bearer', bodyDescription: '{ nodes: array }, same shape as workflow creation', description: 'Lint a (possibly unsaved) node list: dangling {{ref}}s, duplicate node ids, dependency cycles, and a DAG level breakdown flagging wait.* pause points' },
           { method: 'GET', path: '/api/workflows/:id', auth: 'bearer', description: 'Get workflow by ID' },
+          { method: 'GET', path: '/api/workflows/:id/validate', auth: 'bearer', description: 'Same lint as POST /api/workflows/validate, run against an already-stored workflow' },
           { method: 'POST', path: '/api/workflows/', auth: 'admin or editor', bodySchema: WorkflowCreateSchema, description: 'Create a workflow' },
           { method: 'PUT', path: '/api/workflows/:id', auth: 'admin or editor', bodyDescription: 'Raw partial update object, no formal schema — passed as-is to engine.update()', description: 'Update a workflow' },
           { method: 'DELETE', path: '/api/workflows/:id', auth: 'admin', description: 'Delete a workflow' },

@@ -4,7 +4,7 @@
 
 import { describe, it, expect, beforeEach } from 'bun:test';
 import { DocStore, MemoryStorageAdapter } from '../core/db.js';
-import { WorkflowEngine } from '../core/workflow.js';
+import { WorkflowEngine, validateWorkflowDefinition } from '../core/workflow.js';
 import { NodeRegistry } from '../core/nodes.js';
 import { CredentialVault } from '../core/credentials.js';
 import { TriggerManager, TriggerType } from '../core/triggers.js';
@@ -486,6 +486,105 @@ describe('Security: node id collision (FIX-39)', () => {
       ],
     });
     expect(updated.nodes.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Authoring-time DAG lint (validateWorkflowDefinition)
+// ---------------------------------------------------------------------------
+
+describe('validateWorkflowDefinition', () => {
+  it('a well-formed workflow with no wait nodes has no errors or warnings', () => {
+    const result = validateWorkflowDefinition([
+      { id: 'a', type: 'set.value', inputs: { value: 1 } },
+      { id: 'b', type: 'set.value', inputs: { value: '{{a}}' } },
+    ]);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+    expect(result.warnings).toEqual([]);
+    expect(result.levels).toEqual([[{ id: 'a', type: 'set.value' }], [{ id: 'b', type: 'set.value' }]]);
+  });
+
+  it('flags a dangling reference to a node id that does not exist (typo)', () => {
+    const result = validateWorkflowDefinition([
+      { id: 'a', type: 'set.value', inputs: { value: 1 } },
+      { id: 'b', type: 'set.value', inputs: { value: '{{ax.data}}' } },
+    ]);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some(e => e.includes("'ax'") && e.includes('never resolve'))).toBe(true);
+  });
+
+  it('flags a dangling reference inside runIf too', () => {
+    const result = validateWorkflowDefinition([
+      { id: 'a', type: 'switch', inputs: {} },
+      { id: 'b', type: 'set.value', inputs: { value: 1 }, runIf: { equals: ['{{typo.matched}}', 'x'] } },
+    ]);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some(e => e.includes("'typo'"))).toBe(true);
+  });
+
+  it('a real {{_trigger...}} reference is never flagged as dangling', () => {
+    const result = validateWorkflowDefinition([
+      { id: 'a', type: 'set.value', inputs: { value: '{{_trigger.foo}}' } },
+    ]);
+    expect(result.valid).toBe(true);
+    expect(result.errors).toEqual([]);
+  });
+
+  it('flags duplicate node ids', () => {
+    const result = validateWorkflowDefinition([
+      { id: 'n1', type: 'set.value', inputs: { value: 1 } },
+      { id: 'n1', type: 'set.value', inputs: { value: 2 } },
+    ]);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some(e => e.includes('duplicated'))).toBe(true);
+  });
+
+  it('flags the reserved _trigger node id', () => {
+    const result = validateWorkflowDefinition([{ id: '_trigger', type: 'set.value', inputs: { value: 1 } }]);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some(e => e.includes('reserved'))).toBe(true);
+  });
+
+  it('flags a circular dependency instead of silently falling back to array order', () => {
+    const result = validateWorkflowDefinition([
+      { id: 'a', type: 'set.value', inputs: { value: '{{b}}' } },
+      { id: 'b', type: 'set.value', inputs: { value: '{{a}}' } },
+    ]);
+    expect(result.valid).toBe(false);
+    expect(result.errors.some(e => e.toLowerCase().includes('circular'))).toBe(true);
+    // Still returns a usable (fallback) level breakdown despite the cycle.
+    expect(result.levels.length).toBe(2);
+  });
+
+  it('warns when a wait node shares a level with nodes that have later-level dependents -- the exact live-tested gotcha', () => {
+    // 'w' (wait.forWebhook) has no ref to anything, lands in level 0 next to
+    // 'sw' (switch, also no deps). 'c' depends on 'sw' via runIf, landing in
+    // level 1 -- which will NOT run until 'w' resumes, even though 'c' has
+    // nothing to do with 'w'. This is the exact scenario from the live
+    // system test that motivated this endpoint.
+    const result = validateWorkflowDefinition([
+      { id: 'sw', type: 'switch', inputs: { value: 'x', cases: ['x'] } },
+      { id: 'w', type: 'wait.forWebhook', inputs: {} },
+      { id: 'c', type: 'set.value', inputs: { value: 1 }, runIf: { equals: ['{{sw.matched}}', 'x'] } },
+    ]);
+    expect(result.valid).toBe(true);
+    expect(result.levels[0].map(n => n.id).sort()).toEqual(['sw', 'w']);
+    expect(result.levels[1].map(n => n.id)).toEqual(['c']);
+    expect(result.warnings.some(w => w.includes("'w'") && w.includes('level 1'))).toBe(true);
+  });
+
+  it('does not warn about a wait node in the LAST level (nothing left to pause)', () => {
+    const result = validateWorkflowDefinition([
+      { id: 'a', type: 'set.value', inputs: { value: 1 } },
+      { id: 'w', type: 'wait.until', inputs: { value: '{{a}}' } },
+    ]);
+    expect(result.warnings).toEqual([]);
+  });
+
+  it('empty node list is valid', () => {
+    const result = validateWorkflowDefinition([]);
+    expect(result).toEqual({ valid: true, errors: [], warnings: [], levels: [] });
   });
 });
 

@@ -6,6 +6,7 @@
 import { Router, json, error } from '../core/http.js';
 import { validateBody } from '../core/validate.js';
 import { createAuth, requireRole } from './middleware.js';
+import { validateWorkflowDefinition } from '../core/workflow.js';
 
 export const CreateSchema = {
   name: { type: 'string', min: 1, max: 128, required: true },
@@ -40,10 +41,28 @@ export function workflowRoutes(cms, engine) {
     return json({ credentials: engine.vault.list(opts) });
   });
 
+  // Authoring-time lint (see core/workflow.js's validateWorkflowDefinition
+  // doc comment): dangling {{ref}}s, duplicate node ids, dependency
+  // cycles, and a laid-out DAG level breakdown flagging any wait.* node's
+  // pause point. Registered here, BEFORE the generic `/:id` catch-all
+  // below, for the same route-shadowing reason `/credentials` above is.
+  r.post('/validate', auth, async (ctx) => {
+    const body = await ctx.json() || {};
+    return json(validateWorkflowDefinition(body.nodes || []));
+  });
+
   r.get('/:id', auth, async (ctx) => {
     const wf = engine.get(ctx.params.id);
     if (!wf) return error('Workflow not found', 404);
     return json({ workflow: wf });
+  });
+
+  // Same lint as POST /validate above, run against an already-stored
+  // workflow's own nodes instead of a raw unsaved body.
+  r.get('/:id/validate', auth, async (ctx) => {
+    const wf = engine.get(ctx.params.id);
+    if (!wf) return error('Workflow not found', 404);
+    return json(validateWorkflowDefinition(wf.nodes || []));
   });
 
   r.post('/', auth, requireRole('admin', 'editor'), validateBody(CreateSchema), async (ctx) => {

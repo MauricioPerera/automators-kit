@@ -263,6 +263,53 @@ describe('Taxonomies API', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Workflow DAG lint (validateWorkflowDefinition over real HTTP)
+// ---------------------------------------------------------------------------
+
+describe('Workflow validate endpoint', () => {
+  it('POST /api/workflows/validate lints a raw, unsaved node list', async () => {
+    const res = await app.handle(req('POST', '/api/workflows/validate', {
+      nodes: [
+        { id: 'a', type: 'set.value', inputs: { value: 1 } },
+        { id: 'b', type: 'set.value', inputs: { value: '{{typo.data}}' } },
+      ],
+    }, adminToken));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.valid).toBe(false);
+    expect(body.errors.some(e => e.includes("'typo'"))).toBe(true);
+  });
+
+  it('GET /api/workflows/:id/validate lints an already-stored workflow', async () => {
+    const createRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'Lint me',
+      nodes: [
+        { id: 'sw', type: 'switch', inputs: { value: 'x', cases: ['x'] } },
+        { id: 'w', type: 'wait.forWebhook', inputs: {} },
+        { id: 'c', type: 'set.value', inputs: { value: 1 }, runIf: { equals: ['{{sw.matched}}', 'x'] } },
+      ],
+    }, adminToken));
+    const wfId = (await json(createRes)).workflow._id;
+
+    const res = await app.handle(req('GET', `/api/workflows/${wfId}/validate`, null, adminToken));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.valid).toBe(true);
+    expect(body.warnings.some(w => w.includes("'w'"))).toBe(true);
+  });
+
+  it('GET /api/workflows/:id/validate 404s for an unknown workflow', async () => {
+    const res = await app.handle(req('GET', '/api/workflows/does-not-exist/validate', null, adminToken));
+    expect(res.status).toBe(404);
+  });
+
+  it('requires auth', async () => {
+    const res = await app.handle(req('POST', '/api/workflows/validate', { nodes: [] }));
+    expect(res.status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Webhook trigger (secret enforcement over real HTTP — FIX-10 wiring)
 // ---------------------------------------------------------------------------
 

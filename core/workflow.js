@@ -937,21 +937,119 @@ export class WorkflowEngine {
  * @returns {string[][]|null} Array of levels (each an array of node ids), or
  *   `null` if the inputs describe a cycle (caller falls back to sequential).
  */
+/**
+ * Extracts the set of node ids referenced via `{{ref...}}` in a node's
+ * `inputs`/`runIf` (excluding `{{_trigger...}}` and self-references, same
+ * exclusions `_buildWorkflowDAG` always applied inline). Factored out so
+ * `_buildWorkflowDAG` (runtime scheduling) and `validateWorkflowDefinition`
+ * (authoring-time lint, below) share exactly one definition of what counts
+ * as a `{{ref}}` — including references to ids that don't exist in the
+ * workflow, which the caller decides how to treat (silently dropped for
+ * scheduling, flagged as an error for linting).
+ * @param {{id: string, inputs?: object, runIf?: object}} node
+ * @returns {Set<string>}
+ */
+function _extractNodeRefs(node) {
+  const str = JSON.stringify({ inputs: node.inputs || {}, runIf: node.runIf || null });
+  const refs = str.match(/\{\{([^}]+)\}\}/g) || [];
+  const ids = new Set();
+  for (const ref of refs) {
+    const depId = ref.slice(2, -2).split('.')[0];
+    if (depId !== '_trigger' && depId !== node.id) ids.add(depId);
+  }
+  return ids;
+}
+
 function _buildWorkflowDAG(nodes) {
   const ids = nodes.map((n) => n.id);
   const idSet = new Set(ids);
   const deps = new Map(ids.map((id) => [id, new Set()]));
 
   for (const node of nodes) {
-    const str = JSON.stringify({ inputs: node.inputs || {}, runIf: node.runIf || null });
-    const refs = str.match(/\{\{([^}]+)\}\}/g) || [];
-    for (const ref of refs) {
-      const depId = ref.slice(2, -2).split('.')[0];
-      if (depId !== '_trigger' && depId !== node.id && idSet.has(depId)) {
-        deps.get(node.id).add(depId);
-      }
+    for (const depId of _extractNodeRefs(node)) {
+      if (idSet.has(depId)) deps.get(node.id).add(depId);
     }
   }
 
   return buildLevels(ids, deps);
+}
+
+/**
+ * Authoring-time lint for a workflow's node list — the counterpart to
+ * `_buildWorkflowDAG`'s runtime scheduling, meant to be run BEFORE a real
+ * execution instead of discovering these the hard way mid-run. Catches
+ * classes of mistake `_buildWorkflowDAG` silently tolerates today:
+ *
+ *  - A `{{ref}}` pointing at a node id that doesn't exist in this workflow
+ *    (typo, or a node that got deleted) — silently ignored by
+ *    `_buildWorkflowDAG` (never becomes a real dependency), and the
+ *    templated value never resolves at runtime either.
+ *  - Two nodes sharing the same `id` — `nodeMap`/`context` are keyed by
+ *    id, so one silently shadows the other at execution time.
+ *  - A dependency cycle — `_buildWorkflowDAG` returns `null` on a cycle
+ *    and the engine silently falls back to a one-node-per-level, strictly
+ *    sequential order, with no indication anything was wrong.
+ *
+ * Also surfaces, as warnings (not errors, since it may be intentional),
+ * every `wait.*` node's computed DAG level and which later levels it will
+ * pause — the exact ordering gotcha found in a real live-tested workflow:
+ * a `wait.forWebhook`/`wait.until` node pauses ALL levels after its own
+ * once it actually waits, regardless of whether those levels are
+ * logically related to it, so an agent needs to see this laid out before
+ * running the workflow for real, not discover it after a run pauses
+ * somewhere unexpected.
+ *
+ * @param {Array<{id:string, type:string, inputs?:object, runIf?:object}>} nodes
+ * @returns {{ valid: boolean, errors: string[], warnings: string[], levels: Array<Array<{id:string,type:string}>> }}
+ */
+export function validateWorkflowDefinition(nodes) {
+  nodes = nodes || [];
+  const errors = [];
+  const warnings = [];
+  const ids = nodes.map((n) => n.id);
+  const idSet = new Set(ids);
+
+  // Duplicate ids and the reserved `_trigger` id are also hard-blocked by
+  // `_validateNodeIds` at create()/update() time (same wording) -- surfaced
+  // here too so POST /api/workflows/validate gives the same signal on a
+  // raw, not-yet-created definition instead of only failing on submit.
+  const seenIds = new Set();
+  for (const id of ids) {
+    if (id === '_trigger') {
+      errors.push(`Workflow node id '_trigger' is reserved (collides with trigger data context key)`);
+    } else if (seenIds.has(id)) {
+      errors.push(`Workflow node id '${id}' is duplicated — node ids must be unique`);
+    }
+    seenIds.add(id);
+  }
+
+  const deps = new Map(ids.map((id) => [id, new Set()]));
+  for (const node of nodes) {
+    for (const depId of _extractNodeRefs(node)) {
+      if (idSet.has(depId)) {
+        deps.get(node.id).add(depId);
+      } else {
+        errors.push(`Node '${node.id}' references '{{${depId}...}}' but no node with id '${depId}' exists in this workflow — this reference will never resolve`);
+      }
+    }
+  }
+
+  const builtLevels = buildLevels(ids, deps);
+  if (builtLevels === null) {
+    errors.push('Circular dependency detected among node references — the engine would silently fall back to running every node one at a time in array order instead of the intended dependency order');
+  }
+
+  const typeById = new Map(nodes.map((n) => [n.id, n.type]));
+  const levels = (builtLevels || nodes.map((n) => [n.id])).map((level) =>
+    level.map((id) => ({ id, type: typeById.get(id) }))
+  );
+
+  levels.forEach((level, levelIndex) => {
+    const waitNode = level.find((n) => n.type === 'wait.until' || n.type === 'wait.forWebhook');
+    if (waitNode && levelIndex < levels.length - 1) {
+      warnings.push(`Node '${waitNode.id}' (${waitNode.type}) is in DAG level ${levelIndex} — if it actually pauses at runtime, every node in level ${levelIndex + 1} onward will NOT run until the execution is resumed, even if they're unrelated to this wait`);
+    }
+  });
+
+  return { valid: errors.length === 0, errors, warnings, levels };
 }
