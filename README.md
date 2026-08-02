@@ -2,13 +2,13 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-1043 tests | 0 deps | 26 modules | Bun + Deno + Node.js
+1062 tests | 0 deps | 27 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
 ## What it is
 
-A full-stack automation toolkit in vanilla JavaScript with zero npm dependencies. 26 core modules covering: document database, vector search (HNSW), HTTP router, CMS, n8n-style workflow engine, A2E executor, agent shell (command gateway), job queue, cron scheduler, agent memory, and more.
+A full-stack automation toolkit in vanilla JavaScript with zero npm dependencies. 27 core modules covering: document database, vector search (HNSW), HTTP router, CMS, n8n-style workflow engine, A2E executor, agent shell (command gateway), job queue, cron scheduler, agent memory, and more.
 
 Born from merging and distilling ideas from 10+ repos (lokiCMS, js-doc-store, js-vector-store, a2e, minimemory, Agent-Shell, php-agent-memory, EasyDB, RepoMemory, EmDash, ATDF) into a single portable project.
 
@@ -23,7 +23,7 @@ bun server-bun.js  # start at http://localhost:3000
 
 No `npm install`. Zero dependencies.
 
-## 26 Core Modules
+## 27 Core Modules
 
 | Module | What it does |
 |--------|-------------|
@@ -42,6 +42,7 @@ No `npm install`. Zero dependencies.
 | **nodes.js** | Node registry: 21 built-in nodes (core, communication, data, AI) + ARDF export |
 | **triggers.js** | Trigger system: manual, webhook, cron, polling with change detection (see [`examples/trigger-hub`](examples/trigger-hub/)) |
 | **credentials.js** | Credential vault: AES-256-GCM encrypted API keys and tokens, OAuth2 (authorization-code + PKCE + refresh) |
+| **projects.js** | Projects → Folders → Workflows: project-scoped roles (`owner`/`editor`/`viewer`), separate from CMS's global roles |
 | **shell.js** | Agent shell: command gateway, parser, pipeline, JQ filter, RBAC |
 | **shell-mcp.js** | Exposes `shell.js` over MCP as exactly 2 fixed tools (`shell_help`/`shell_exec`), ~600 constant tokens regardless of registry size — port of [Agent-Shell](https://github.com/MauricioPerera/Agent-Shell)'s `McpServer` |
 | **queue.js** | Job queue: async processing, retries with exponential backoff, dead letter, stuck-job lease reclaim |
@@ -1090,11 +1091,11 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 1043 tests across 82 files, ~34 seconds
+bun test tests/    # 1062 tests across 83 files, ~35 seconds
 ```
 
-82 test files covering all core modules (including `log.js`/`metrics.js`/
-`csv.js`) plus the `examples/content-pipeline`,
+83 test files covering all core modules (including `log.js`/`metrics.js`/
+`csv.js`/`projects.js`) plus the `examples/content-pipeline`,
 `examples/command-gateway`, `examples/agent-memory-backend`,
 `examples/vector-memory`, `examples/integrations`, `examples/scheduled-sync`,
 `examples/provider-fanout`, `examples/large-catalog-search`,
@@ -1198,6 +1199,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-08-01 (`credentials.js` OAuth2 support added; a real route-shadowing bug found and fixed)**: closes the last big open item from this session's n8n comparison. `CredentialVault` was a plain encrypted key-value store with no way to acquire or refresh an OAuth2 access token. Extended (not replaced) with a generic authorization-code + PKCE + refresh flow: `startOAuth2()`/`completeOAuth2()` (state-verified, PKCE `code_verifier` included in the real token exchange) and a `get()` that transparently refreshes an expiring token before returning it. A credential acquired this way ends up holding a plain `token` field, identical in shape to any hand-entered bearer token — zero changes needed to `core/nodes.js`'s bearer-auth path. Deliberate scoping decision, documented in the code: OAuth2 config URLs are **not** run through `net-guard.js`'s `assertPublicUrl` — that SSRF guard is for untrusted workflow-driven requests, not authenticated-admin-supplied config, and would block legitimate internal/on-prem providers with no way to opt out. New routes `POST /oauth2/:name/start` (admin-only) and `GET /oauth2/:name/callback` (no auth by design — the provider calls it, `state` is the real CSRF protection). Real bug found and fixed while writing the HTTP-level tests: `GET /api/workflows/credentials` had been shadowed by the earlier-registered `GET /:id` catch-all since it was first written (Router matches in registration order; `/:id`, a single path segment, swallowed `/credentials`, returning 404 "Workflow not found" instead of the list) — never caught before because that route had never been exercised over real HTTP in a test, same route-shadowing bug class already found once this session in an example's webhook path. Fixed by moving the route's registration before `/:id`. 17 new regression tests (7 at the vault level against a real mock OAuth2 token endpoint — `Bun.serve()` on a real port, the normal way to test OAuth2 client code without a real Google/GitHub app — 10 more over real HTTP covering the routes and the shadowing fix). Verified: 20 isolated runs and 2 full-suite runs, all clean. Also verified live over two genuinely separate OS processes — a real app server and a real mock OAuth2 provider communicating over real `curl` calls: wrong state rejected (400), correct state completes a real PKCE code exchange confirmed in the mock provider's own independent log.
 - **2026-08-01 (`workflow.js` `loop.forEach` added)**: closes the last item from this session's n8n comparison — the biggest one on the list. n8n's execution model passes an array of items through every node; `workflow.js` is "one value per node" everywhere, and there was no per-item iteration construct at all. A real items-array rewrite means changing what every node receives and what `{{ref}}` resolution means, engine-wide — the same scale as the `db.js`/`Collection` redesign this session already scoped down rather than attempted directly. This does NOT attempt that rewrite. New `loop.forEach` node (registered per-instance, same reason `workflow.execute` is, and built entirely on top of it): runs an already-defined sub-workflow once per item in an input array via the exact `execute()`/sub-workflow mechanism, chunked to `concurrency` (default 5) items at a time (`Promise.allSettled` per chunk, not unbounded `Promise.all`). Each item arrives as `{{_trigger.item}}` — no new template syntax. Collects `{ item, status, nodeResults }` (or `{ item, status: 'error', error }`) per item into `results`; `continueOnItemError` (default `true`) controls whether one item failing stops queuing further chunks. Cycle detection is free — same `_subWorkflowChain` check `execute()` already has, no new code. `context[nodeId]` is still a single value everywhere else in the engine; none of the 21 built-in nodes gain implicit per-item behavior — this is the one additive, opt-in place per-item processing exists. 5 new regression tests (result shape/ordering, real bounded concurrency measured via actual overlapping in-flight calls, partial failure doesn't abort the batch by default, `continueOnItemError: false` stops queuing further chunks, induced cycles caught by the existing detection). Verified: 20 isolated runs and 2 full-suite runs, all clean.
 - **2026-08-01 (`workflow.js` generic per-node retry/backoff)**: closes the last real gap found in a final sweep re-reading the full original n8n comparison (both research passes, not just the 4-item "hard infra" consolidation this session had been tracking). n8n retries any node natively; `workflow.js` only had retry at the `queue.js` job level or HTTP-connector-specific, nothing generic in the workflow engine's own dispatch loop — never previously tracked or addressed. A node can carry `retries: N` (default `0` — zero behavior change for any existing workflow) and `retryBackoffMs` (default `1000`, doubled per attempt, same exponential formula `core/queue.js` already uses). New `_executeNodeWithRetry` wraps just the node's own operation — credential resolution and `runIf` evaluation happen before it and are never retried, since a missing credential is a config error, not a transient one. A successful retry records `nodeResults[id].attempts`; an exhausted one does too, on the error result. 5 new regression tests (default behavior completely unaffected, a node recovers on a later attempt, a node exhausts all retries and fails, backoff is real and exponential — measured via actual elapsed time between attempts, not simulated — and retry does NOT apply to a missing-credential error). Verified: 20 isolated runs and 2 full-suite runs, all clean. With this, the full n8n-comparison sweep — both research passes, every front, not just workflow.js features — is closed.
+- **2026-08-02 (Projects -> Folders -> Workflows)**: closes the platform-level gap found comparing against n8n at the platform (not engine) level — roles were global to the whole instance (`core/cms.js`'s `ROLE_PERMISSIONS`), no isolated "project" concept with its own membership. New `core/projects.js` (`ProjectManager`, mirrors the existing module style): 3 ranked project roles (`owner` > `editor` > `viewer`, separate from CMS's global roles), flat Folders (no nesting), creating a project auto-owns the creator, `removeMember` refuses to strip the last remaining owner, `removeFolder`/`removeProject` unassign (never delete) affected workflows via a direct update on the shared `_workflows` collection — kept decoupled from `WorkflowEngine`'s class. `core/workflow.js` gains `projectId`/`folderId` on `create()`/`update()` (opaque, unvalidated, same pattern `errorWorkflow` uses) and `list()` filtering. New `routes/projects.js` at `/api/projects`; deliberate scoping decision: the existing `/api/workflows/:id` CRUD stays gated only by the global CMS role, untouched — the new `POST /:id/folders/:folderId/workflows` is the real project-role-gated path for filing a workflow into a project. 19 new regression tests (15 at the `ProjectManager` level, 4 over real HTTP with two real registered users). Verified: 20 isolated runs and 2 full-suite runs, all clean. Also verified live over a real spawned server with real `curl` calls and two real user accounts: a genuine non-member gets a real 403, an editor creates a folder and assigns a real workflow into it, demoting to viewer correctly blocks folder creation, and attempting workflow creation through the existing global route without a CMS role is correctly rejected — proving the scoping decision works as designed.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:

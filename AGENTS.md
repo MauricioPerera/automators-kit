@@ -1,12 +1,12 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1043 tests | 0 deps | 26 core modules
+By automators.work | 1062 tests | 0 deps | 27 core modules
 
 ## Architecture
 
 ```
-Core (26 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
+Core (27 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
 
 db.js              Document DB: MongoDB queries, indices, JWT auth, AES-256-GCM encryption
 vector.js          Vector DB: Float32/Int8/Polar3bit/Binary, IVF, Matryoshka, BM25
@@ -23,6 +23,7 @@ dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workf
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
 credentials.js     Credential vault: AES-256-GCM encrypted storage, OAuth2 (authorization-code + PKCE + refresh)
+projects.js        Projects -> Folders -> Workflows: project-scoped roles (owner/editor/viewer), separate from CMS's global roles
 shell.js           Agent shell: command gateway, parser, pipeline, JQ filter, RBAC
 shell-mcp.js       Exposes shell.js over MCP as 2 fixed tools (shell_help/shell_exec)
 queue.js           Job queue: async, retries, backoff, dead letter, concurrency
@@ -1514,6 +1515,40 @@ untrusted *workflow* definitions; this config comes from an authenticated admin 
 level `store()` already extends to arbitrary `values`), and the lockdown would also block legitimate
 internal/on-prem OAuth2 providers with no way to opt out.
 
+## Projects
+
+`core/projects.js`'s `ProjectManager` — an organizational layer above `workflow.js`: Projects contain
+Folders, Folders contain Workflows, flat (no folder-in-folder nesting). Project roles (`owner` >
+`editor` > `viewer`, ranked) are separate from CMS's global, instance-wide `ROLE_PERMISSIONS` — a
+project is its own membership list, not tied to CMS roles at all.
+
+```javascript
+import { ProjectManager } from './core/projects.js';
+const projects = new ProjectManager(db);
+
+const project = projects.createProject('Marketing', userId); // creator becomes owner
+const folder = projects.createFolder(project._id, 'Campaigns');
+projects.addMember(project._id, otherUserId, 'editor');
+projects.hasProjectRole(project._id, otherUserId, 'viewer'); // true -- editor outranks viewer
+```
+
+A workflow gets filed into a folder via `workflowEngine.update(workflowId, { projectId, folderId })`
+(`core/workflow.js`'s `create()`/`update()` accept both as plain opaque strings, unvalidated against
+`ProjectManager` — same pattern `errorWorkflow` already uses — and `list()` accepts
+`filters.projectId`/`filters.folderId`). Removing a folder or project never deletes workflows, only
+unassigns them.
+
+Routes (`routes/projects.js`, mounted at `/api/projects`): full CRUD for projects/members/folders,
+`GET /:id/workflows` (project-scoped listing, optional `?folderId=`), and
+`POST /:id/folders/:folderId/workflows` (body `{ workflowId }`) — **the real project-role-gated path**
+for filing a workflow into a project. Any authenticated user can create a project (becomes its owner,
+no CMS-role gate needed — same as n8n letting any user own their own projects).
+
+**Deliberate scoping decision:** the existing `PUT /api/workflows/:id` route is untouched, still
+gated only by the global CMS role — a global admin/editor can set `projectId`/`folderId` directly on
+any workflow through it, bypassing project membership entirely. That escape hatch is intentional, not
+an oversight; it keeps the already-shipped workflow CRUD route's behavior exactly as it was.
+
 ## A2E Workflow Executor
 
 19 operations: SetData, FilterData, TransformData, MergeData, StoreData, ApiCall, ExecuteN8nWorkflow, DateTime, GetCurrentDateTime, ConvertTimezone, DateCalculation, FormatText, ExtractText, ValidateData, Calculate, EncodeDecode, Conditional, Loop, Wait
@@ -2145,6 +2180,26 @@ later attempt, a node exhausts all retries and fails, backoff is real and expone
 actual elapsed time between attempts, not simulated — and retry does NOT apply to a missing-credential
 error). Verified: 20 isolated runs and 2 full-suite runs, all clean. With this, the full n8n-comparison
 sweep — both research passes, every front, not just workflow.js features — is closed.
+
+**Projects -> Folders -> Workflows added (2026-08-02):** closes the platform-level gap found comparing
+against n8n at the platform (not engine) level — roles were global to the whole instance
+(`core/cms.js`'s `ROLE_PERMISSIONS`), no isolated "project" concept with its own membership. New
+`core/projects.js` (`ProjectManager`, mirrors the existing module style): 3 ranked project roles
+(`owner` > `editor` > `viewer`, separate from CMS's global roles), flat Folders (no nesting), creating
+a project auto-owns the creator, `removeMember` refuses to strip the last remaining owner,
+`removeFolder`/`removeProject` unassign (never delete) affected workflows via a direct update on the
+shared `_workflows` collection — kept decoupled from `WorkflowEngine`'s class. `core/workflow.js`
+gains `projectId`/`folderId` on `create()`/`update()` (opaque, unvalidated, same pattern
+`errorWorkflow` uses) and `list()` filtering. New `routes/projects.js` at `/api/projects`; deliberate
+scoping decision: the existing `/api/workflows/:id` CRUD stays gated only by the global CMS role,
+untouched — the new `POST /:id/folders/:folderId/workflows` is the real project-role-gated path for
+filing a workflow into a project. 19 new regression tests (15 at the `ProjectManager` level, 4 over
+real HTTP with two real registered users). Verified: 20 isolated runs and 2 full-suite runs, all
+clean. Also verified live over a real spawned server with real `curl` calls and two real user
+accounts: a genuine non-member gets a real 403, an editor creates a folder and assigns a real workflow
+into it, demoting to viewer correctly blocks folder creation, and attempting workflow creation through
+the existing global route without a CMS role is correctly rejected — proving the scoping decision
+works as designed.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
