@@ -292,6 +292,12 @@ export class WorkflowEngine {
       // workflow's execution ends with status 'failed'. Falls back to the
       // engine's opts.defaultErrorWorkflow when unset -- see execute().
       errorWorkflow: definition.errorWorkflow || null,
+      // Organizational only (core/projects.js's ProjectManager owns the
+      // actual Project/Folder records and role enforcement) -- opaque
+      // strings here, not validated against ProjectManager, same as
+      // `errorWorkflow` isn't validated against another workflow existing.
+      projectId: definition.projectId || null,
+      folderId: definition.folderId || null,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -312,6 +318,8 @@ export class WorkflowEngine {
   list(filters = {}) {
     const filter = {};
     if (filters.active !== undefined) filter.active = filters.active;
+    if (filters.projectId !== undefined) filter.projectId = filters.projectId;
+    if (filters.folderId !== undefined) filter.folderId = filters.folderId;
     return this._workflows.find(filter).sort({ updatedAt: -1 }).toArray();
   }
 
@@ -328,7 +336,7 @@ export class WorkflowEngine {
     this._triggers.unregister(id);
 
     const updates = {};
-    for (const k of ['name', 'description', 'trigger', 'nodes', 'active', 'settings', 'errorWorkflow']) {
+    for (const k of ['name', 'description', 'trigger', 'nodes', 'active', 'settings', 'errorWorkflow', 'projectId', 'folderId']) {
       if (changes[k] !== undefined) updates[k] = changes[k];
     }
     updates.updatedAt = Date.now();

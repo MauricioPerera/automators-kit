@@ -19,6 +19,8 @@ import { WorkflowEngine } from './core/workflow.js';
 import { Shell } from './core/shell.js';
 import { shellRoutes } from './routes/shell.js';
 import { collectionRoutes } from './routes/collections.js';
+import { ProjectManager } from './core/projects.js';
+import { projectRoutes } from './routes/projects.js';
 
 /**
  * Create a fully configured CMS application.
@@ -85,6 +87,10 @@ export async function createApp(opts = {}) {
   await workflowEngine.init();
   router.route('/api/workflows', workflowRoutes(cms, workflowEngine));
 
+  // Projects -> Folders -> Workflows, project-scoped roles
+  const projectManager = new ProjectManager(cms.db);
+  router.route('/api/projects', projectRoutes(cms, projectManager, workflowEngine));
+
   // Agent Shell (command gateway)
   const shell = new Shell({ profile: opts.shellProfile || 'admin' });
   router.route('/api/shell', shellRoutes(shell));
@@ -131,7 +137,7 @@ export async function createApp(opts = {}) {
   // Start workflow triggers
   workflowEngine.start();
 
-  return { handle: router.handle, cms, router, workflowEngine, shell };
+  return { handle: router.handle, cms, router, workflowEngine, shell, projectManager };
 }
 
 // Re-export core modules for library usage
@@ -156,3 +162,4 @@ export { TriggerManager, TriggerType } from './core/triggers.js';
 export { CredentialVault } from './core/credentials.js';
 export { Shell, CommandRegistry, parse, applyFilter, AGENT_PROFILES } from './core/shell.js';
 export { parallelMerge, parallelRace } from './core/parallel.js';
+export { ProjectManager, PROJECT_ROLES } from './core/projects.js';

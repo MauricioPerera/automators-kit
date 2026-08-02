@@ -425,6 +425,92 @@ describe('OAuth2', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Projects -> Folders -> Workflows (project-scoped roles, separate from
+// the CMS-global roles every other describe block above uses)
+// ---------------------------------------------------------------------------
+
+describe('Projects', () => {
+  let memberId, memberToken;
+
+  beforeAll(async () => {
+    await app.handle(req('POST', '/api/auth/register', { email: 'member@test.com', password: 'member12345678', name: 'Member' }));
+    const loginRes = await app.handle(req('POST', '/api/auth/login', { email: 'member@test.com', password: 'member12345678' }));
+    const body = await json(loginRes);
+    memberToken = body.token;
+    memberId = body.user._id;
+  });
+
+  it('POST / creates a project; the caller becomes its owner and it shows up in their own list', async () => {
+    const createRes = await app.handle(req('POST', '/api/projects', { name: 'Marketing' }, adminToken));
+    expect(createRes.status).toBe(201);
+    const { project } = await json(createRes);
+    expect(project.name).toBe('Marketing');
+
+    const listRes = await app.handle(req('GET', '/api/projects', null, adminToken));
+    const { projects } = await json(listRes);
+    expect(projects.some((p) => p._id === project._id)).toBe(true);
+  });
+
+  it('a non-member gets 403 on the project; adding them as viewer lets them read but not write', async () => {
+    const { project } = await json(await app.handle(req('POST', '/api/projects', { name: 'Restricted' }, adminToken)));
+
+    const forbiddenRes = await app.handle(req('GET', `/api/projects/${project._id}`, null, memberToken));
+    expect(forbiddenRes.status).toBe(403);
+
+    const addRes = await app.handle(req('POST', `/api/projects/${project._id}/members`, { userId: memberId, role: 'viewer' }, adminToken));
+    expect(addRes.status).toBe(200);
+
+    const readRes = await app.handle(req('GET', `/api/projects/${project._id}`, null, memberToken));
+    expect(readRes.status).toBe(200);
+
+    const writeRes = await app.handle(req('PUT', `/api/projects/${project._id}`, { name: 'Renamed' }, memberToken));
+    expect(writeRes.status).toBe(403); // viewer can't edit
+
+    const deleteRes = await app.handle(req('DELETE', `/api/projects/${project._id}`, null, memberToken));
+    expect(deleteRes.status).toBe(403); // and definitely can't delete, that needs owner
+  });
+
+  it('an editor member can create folders and organize workflows into them; a viewer cannot', async () => {
+    const { project } = await json(await app.handle(req('POST', '/api/projects', { name: 'Engineering' }, adminToken)));
+    await app.handle(req('POST', `/api/projects/${project._id}/members`, { userId: memberId, role: 'editor' }, adminToken));
+
+    const folderRes = await app.handle(req('POST', `/api/projects/${project._id}/folders`, { name: 'Pipelines' }, memberToken));
+    expect(folderRes.status).toBe(201);
+    const { folder } = await json(folderRes);
+
+    const wfRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'Nightly Sync', nodes: [{ id: 'n1', type: 'set.value', inputs: { value: 1 } }],
+    }, adminToken));
+    const { workflow } = await json(wfRes);
+
+    const assignRes = await app.handle(req('POST', `/api/projects/${project._id}/folders/${folder._id}/workflows`, { workflowId: workflow._id }, memberToken));
+    expect(assignRes.status).toBe(200);
+    expect((await json(assignRes)).workflow.folderId).toBe(folder._id);
+
+    const listRes = await app.handle(req('GET', `/api/projects/${project._id}/workflows`, null, memberToken));
+    const { workflows } = await json(listRes);
+    expect(workflows.some((w) => w._id === workflow._id)).toBe(true);
+
+    const unassignRes = await app.handle(req('DELETE', `/api/projects/${project._id}/folders/${folder._id}/workflows/${workflow._id}`, null, memberToken));
+    expect(unassignRes.status).toBe(200);
+    expect((await json(unassignRes)).workflow.folderId).toBeNull();
+
+    // Now demote to viewer -- can no longer create folders.
+    await app.handle(req('POST', `/api/projects/${project._id}/members`, { userId: memberId, role: 'viewer' }, adminToken));
+    const deniedRes = await app.handle(req('POST', `/api/projects/${project._id}/folders`, { name: 'Should Fail' }, memberToken));
+    expect(deniedRes.status).toBe(403);
+  });
+
+  it('removing the last owner is rejected over real HTTP too', async () => {
+    const { project } = await json(await app.handle(req('POST', '/api/projects', { name: 'SoleOwner' }, adminToken)));
+    const adminId = (await json(await app.handle(req('GET', `/api/projects/${project._id}`, null, adminToken)))).project.members[0].userId;
+
+    const res = await app.handle(req('DELETE', `/api/projects/${project._id}/members/${adminId}`, null, adminToken));
+    expect(res.status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 404
 // ---------------------------------------------------------------------------
 

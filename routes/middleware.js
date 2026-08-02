@@ -64,3 +64,22 @@ export function requirePermission(permission) {
     return next();
   };
 }
+
+/**
+ * Creates project-role check middleware (core/projects.js's ProjectManager
+ * -- ranked owner > editor > viewer, separate from CMS's global,
+ * instance-wide roles above). Must run AFTER auth middleware, and the
+ * route must have a `:id` param holding the project id.
+ * @param {import('../core/projects.js').ProjectManager} projectManager
+ * @param {'owner'|'editor'|'viewer'} minRole
+ */
+export function requireProjectRole(projectManager, minRole) {
+  return async (ctx, next) => {
+    const user = ctx.state.user;
+    if (!user) return error('Authorization required', 401);
+    if (!projectManager.hasProjectRole(ctx.params.id, user._id, minRole)) {
+      return error('Insufficient project permissions', 403);
+    }
+    return next();
+  };
+}
