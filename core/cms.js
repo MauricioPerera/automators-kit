@@ -111,55 +111,60 @@ function validateContent(content, contentType) {
   const errors = [];
   for (const field of contentType.fields || []) {
     const value = content[field.name];
+    // Prefixed with "content." because a content type's own field can share
+    // a name with a top-level entry field (most commonly `title`) -- an
+    // unprefixed "Field 'title' is required" doesn't say whether the
+    // top-level entry.title or this nested content.title is the one missing.
+    const label = `content.${field.name}`;
 
     if (field.required && (value === undefined || value === null || value === '')) {
-      errors.push(`Field '${field.name}' is required`);
+      errors.push(`Field '${label}' is required`);
       continue;
     }
     if (value === undefined || value === null) continue;
 
     switch (field.type) {
       case 'text': case 'textarea': case 'richtext': case 'markdown': case 'slug':
-        if (typeof value !== 'string') errors.push(`Field '${field.name}' must be a string`);
+        if (typeof value !== 'string') errors.push(`Field '${label}' must be a string`);
         else {
-          if (field.validation?.min && value.length < field.validation.min) errors.push(`Field '${field.name}' min ${field.validation.min} chars`);
-          if (field.validation?.max && value.length > field.validation.max) errors.push(`Field '${field.name}' max ${field.validation.max} chars`);
+          if (field.validation?.min && value.length < field.validation.min) errors.push(`Field '${label}' min ${field.validation.min} chars`);
+          if (field.validation?.max && value.length > field.validation.max) errors.push(`Field '${label}' max ${field.validation.max} chars`);
         }
         break;
       case 'number':
         // typeof NaN === 'number' is true in JS -- a bare typeof check lets
         // NaN (e.g. from Number('not-a-number')) through as "valid".
-        if (typeof value !== 'number' || !Number.isFinite(value)) errors.push(`Field '${field.name}' must be a number`);
+        if (typeof value !== 'number' || !Number.isFinite(value)) errors.push(`Field '${label}' must be a number`);
         break;
       case 'boolean':
-        if (typeof value !== 'boolean') errors.push(`Field '${field.name}' must be a boolean`);
+        if (typeof value !== 'boolean') errors.push(`Field '${label}' must be a boolean`);
         break;
       case 'email':
         if (typeof value !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value))
-          errors.push(`Field '${field.name}' must be a valid email`);
+          errors.push(`Field '${label}' must be a valid email`);
         break;
       case 'url':
         if (typeof value !== 'string' || !/^https?:\/\/.+/.test(value))
-          errors.push(`Field '${field.name}' must be a valid URL`);
+          errors.push(`Field '${label}' must be a valid URL`);
         break;
       case 'select':
         if (field.validation?.options && !field.validation.options.includes(value))
-          errors.push(`Field '${field.name}' must be one of: ${field.validation.options.join(', ')}`);
+          errors.push(`Field '${label}' must be one of: ${field.validation.options.join(', ')}`);
         break;
       case 'multiselect':
-        if (!Array.isArray(value)) errors.push(`Field '${field.name}' must be an array`);
+        if (!Array.isArray(value)) errors.push(`Field '${label}' must be an array`);
         else if (field.validation?.options && !value.every(v => field.validation.options.includes(v)))
-          errors.push(`Field '${field.name}' contains invalid options`);
+          errors.push(`Field '${label}' contains invalid options`);
         break;
       case 'json':
         // Any value is valid
         break;
       case 'date': case 'datetime':
         if (typeof value !== 'string' && typeof value !== 'number')
-          errors.push(`Field '${field.name}' must be a date`);
+          errors.push(`Field '${label}' must be a date`);
         break;
       case 'relation': case 'media':
-        if (typeof value !== 'string') errors.push(`Field '${field.name}' must be a string ID`);
+        if (typeof value !== 'string') errors.push(`Field '${label}' must be a string ID`);
         break;
     }
   }

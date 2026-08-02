@@ -166,6 +166,20 @@ describe('Entries', () => {
     }
   });
 
+  it('disambiguates a missing content.title from the top-level entry title in the error message', async () => {
+    // The content type's own `title` field (required, set up in beforeEach)
+    // is a different thing from the entry's top-level `title` -- providing
+    // only the latter must not be mistaken for satisfying the former, and
+    // the error must say which one is missing.
+    try {
+      await cms.entries.create({ title: 'Has top-level title only', contentTypeSlug: 'post', content: {} }, authorId);
+      expect(true).toBe(false);
+    } catch (e) {
+      expect(e.message).toContain("content.title");
+      expect(e.message).not.toContain("Field 'title'");
+    }
+  });
+
   it('rejects NaN for a number field instead of silently accepting it (typeof NaN === "number" in JS)', async () => {
     await cms.contentTypes.create({
       name: 'Product', slug: 'product', fields: [{ name: 'price', type: 'number', required: true }],
