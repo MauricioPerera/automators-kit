@@ -9,6 +9,13 @@
  * `_buildWorkflowDAG` / `execute()`). Dependencies are inferred from
  * `{{nodeId.field}}` references in `inputs` — no explicit edges to declare.
  *
+ * Per-node retry: a node can carry `retries: N` (default 0, no behavior
+ * change) and `retryBackoffMs` (default 1000, doubled per attempt) --
+ * `_executeNodeWithRetry` retries just that node's own operation on
+ * failure, not credential resolution or `runIf`. A successful retry
+ * records `nodeResults[id].attempts`; an exhausted one does too, on the
+ * error result.
+ *
  * N-way branching: a node can carry `runIf: { equals: [a, b] }` (each side
  * resolved the same way `inputs` values are, so `a`/`b` can be `{{ref}}`
  * template strings or literals). When it evaluates false the node is
@@ -403,6 +410,38 @@ export class WorkflowEngine {
   }
 
   /**
+   * Executes one node, retrying on failure per `node.retries` (default 0 --
+   * no behavior change for any existing workflow) with exponential backoff
+   * (`node.retryBackoffMs`, default 1000, doubled per attempt -- same
+   * formula `core/queue.js` already uses). Only wraps the node's actual
+   * operation, not surrounding config resolution (credential lookup/runIf
+   * already happened by the time this is called) -- a missing credential
+   * is a config error, not a transient one worth retrying. On final
+   * failure, attaches `attempts` onto the thrown error so the caller can
+   * record how many were made; on eventual success after >1 attempt,
+   * records it into `retryAttempts` (keyed by nodeId) for the same reason.
+   */
+  async _executeNodeWithRetry(nodeId, node, resolvedInputs, creds, ctx, retryAttempts) {
+    const maxAttempts = 1 + (node.retries || 0);
+    let lastErr;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const result = await this._nodeRegistry.execute(node.type, resolvedInputs, creds, ctx);
+        if (attempt > 1) retryAttempts.set(nodeId, attempt);
+        return result;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < maxAttempts) {
+          const backoff = (node.retryBackoffMs ?? 1000) * Math.pow(2, attempt - 1);
+          await new Promise((r) => setTimeout(r, backoff));
+        }
+      }
+    }
+    lastErr.attempts = maxAttempts;
+    throw lastErr;
+  }
+
+  /**
    * Runs `levels[startIndex..]` against `context`, mutating `execution` in
    * place (nodeResults/errors/status). Factored out of execute() so a
    * fresh run (startIndex 0) and _resumeExecution() (startIndex ==
@@ -433,6 +472,11 @@ export class WorkflowEngine {
         if (skipRemaining || stopped) break;
         const level = levels[levelIndex];
 
+        // Populated by _executeNodeWithRetry when a node needed more than
+        // one attempt -- read back below to attach `attempts` to that
+        // node's nodeResults entry (only when it actually retried).
+        const retryAttempts = new Map();
+
         const settled = await Promise.allSettled(level.map(async (nodeId) => {
           const node = nodeMap.get(nodeId);
           if (node.runIf && !this._evalRunIf(node.runIf, context)) return SKIPPED;
@@ -442,7 +486,7 @@ export class WorkflowEngine {
             creds = await this._vault.get(node.credentials);
             if (!creds) throw new Error(`Credential '${node.credentials}' not found`);
           }
-          return this._nodeRegistry.execute(node.type, resolvedInputs, creds, { callChain: subWorkflowChain });
+          return this._executeNodeWithRetry(nodeId, node, resolvedInputs, creds, { callChain: subWorkflowChain }, retryAttempts);
         }));
 
         // A `wait.until`/`wait.forWebhook` node in this level pauses the
@@ -470,6 +514,7 @@ export class WorkflowEngine {
             const nodeResult = (result != null && result.data !== undefined) ? result.data : result;
             context[nodeId] = nodeResult;
             execution.nodeResults[nodeId] = { status: 'success', data: nodeResult, duration: null };
+            if (retryAttempts.has(nodeId)) execution.nodeResults[nodeId].attempts = retryAttempts.get(nodeId);
 
             if (node.type === 'if' && result === false && node.onFalse === 'skip') {
               skipRemaining = true;
@@ -484,6 +529,7 @@ export class WorkflowEngine {
             const err = outcome.reason;
             execution.errors[nodeId] = err.message;
             execution.nodeResults[nodeId] = { status: 'error', error: err.message };
+            if (err.attempts > 1) execution.nodeResults[nodeId].attempts = err.attempts;
 
             // Stop before the NEXT level unless this node has continueOnError.
             // Siblings already running in this same level are not aborted.

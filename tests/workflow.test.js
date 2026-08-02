@@ -1264,3 +1264,86 @@ describe('Per-item processing (loop.forEach node)', () => {
     expect(exec.nodeResults.run.data.results[0].error).toContain('Circular sub-workflow reference');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Per-node retry
+// ---------------------------------------------------------------------------
+
+describe('Per-node retry', () => {
+  it('a node with no `retries` set fails immediately on the first error -- default behavior is completely unchanged', async () => {
+    let calls = 0;
+    engine.nodes.add({ type: 'test.alwaysFails', name: 'AlwaysFails', category: 'test', handler: async () => { calls++; throw new Error('nope'); } });
+    const wf = engine.create({ name: 'NoRetry', nodes: [{ id: 'n', type: 'test.alwaysFails', inputs: {} }] });
+
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('failed');
+    expect(calls).toBe(1);
+    expect(exec.nodeResults.n.attempts).toBeUndefined(); // never even mentioned when there was only 1 attempt
+  });
+
+  it('a node that fails twice then succeeds recovers, with `attempts` recorded on the success result', async () => {
+    let calls = 0;
+    engine.nodes.add({
+      type: 'test.failsTwice',
+      name: 'FailsTwice',
+      category: 'test',
+      handler: async () => { calls++; if (calls < 3) throw new Error(`fail ${calls}`); return 'recovered'; },
+    });
+    const wf = engine.create({
+      name: 'RetrySucceeds',
+      nodes: [{ id: 'n', type: 'test.failsTwice', inputs: {}, retries: 3, retryBackoffMs: 5 }],
+    });
+
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    expect(calls).toBe(3);
+    expect(exec.nodeResults.n.data).toBe('recovered');
+    expect(exec.nodeResults.n.attempts).toBe(3);
+  });
+
+  it('a node that never recovers exhausts all retries, `attempts` recorded on the final error result', async () => {
+    let calls = 0;
+    engine.nodes.add({ type: 'test.neverRecovers', name: 'NeverRecovers', category: 'test', handler: async () => { calls++; throw new Error('still broken'); } });
+    const wf = engine.create({
+      name: 'RetryExhausted',
+      nodes: [{ id: 'n', type: 'test.neverRecovers', inputs: {}, retries: 2, retryBackoffMs: 5 }],
+    });
+
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('failed');
+    expect(calls).toBe(3); // 1 initial + 2 retries
+    expect(exec.nodeResults.n.status).toBe('error');
+    expect(exec.nodeResults.n.error).toContain('still broken');
+    expect(exec.nodeResults.n.attempts).toBe(3);
+  });
+
+  it('backoff is real -- retries actually wait, doubling each time, not fired back-to-back', async () => {
+    const timestamps = [];
+    engine.nodes.add({ type: 'test.timedFail', name: 'TimedFail', category: 'test', handler: async () => { timestamps.push(Date.now()); throw new Error('boom'); } });
+    const wf = engine.create({
+      name: 'BackoffTiming',
+      nodes: [{ id: 'n', type: 'test.timedFail', inputs: {}, retries: 2, retryBackoffMs: 40 }],
+    });
+
+    await engine.run(wf._id);
+    expect(timestamps.length).toBe(3);
+    const gap1 = timestamps[1] - timestamps[0];
+    const gap2 = timestamps[2] - timestamps[1];
+    expect(gap1).toBeGreaterThanOrEqual(35); // ~40ms (1st backoff)
+    expect(gap2).toBeGreaterThanOrEqual(gap1); // 2nd backoff (~80ms) is longer than the 1st -- real exponential growth
+  });
+
+  it('retry does NOT apply to a missing-credential config error -- fails immediately, no wasted attempts', async () => {
+    let calls = 0;
+    engine.nodes.add({ type: 'test.needsCreds', name: 'NeedsCreds', category: 'test', handler: async () => { calls++; return 'ok'; } });
+    const wf = engine.create({
+      name: 'BadCredential',
+      nodes: [{ id: 'n', type: 'test.needsCreds', inputs: {}, credentials: 'does-not-exist', retries: 3, retryBackoffMs: 5 }],
+    });
+
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('failed');
+    expect(exec.errors.n).toContain("Credential 'does-not-exist' not found");
+    expect(calls).toBe(0); // the node handler itself was never even invoked
+  });
+});
