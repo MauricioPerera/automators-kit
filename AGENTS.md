@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1094 tests | 0 deps | 27 core modules
+By automators.work | 1103 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table)
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -1389,6 +1389,38 @@ the `if`/`onFalse: 'skip'` barrier. Cycle detection is free: a `loop.forEach` wh
 re-enters a workflow already in the call chain hits the exact same `_subWorkflowChain` check, surfaced
 as that item's own `error` rather than aborting the whole batch.
 
+### Data Table Node
+
+`data.table` — same per-instance-registration reason as `workflow.execute`/`loop.forEach` (it needs
+live DB access, not one of the 21 engine-agnostic `core/nodes.js` `BUILTIN_NODES`). Reads/writes any
+DB collection directly — the same data exposed at `/api/db/:col` — without a workflow having to loop
+back through its own HTTP API (an `http.request` node hitting `/api/db/:col`) just to touch a "data
+table" from within a run:
+
+```javascript
+engine.create({
+  name: 'Hot leads digest',
+  nodes: [
+    { id: 'query', type: 'data.table',
+      inputs: { collection: 'leads', operation: 'find', filter: { score: { $gt: 50 } }, sort: { score: -1 } } },
+    { id: 'summary', type: 'set.value',
+      inputs: { value: 'found {{query.length}} hot leads, top is {{query.0.name}}' } },
+  ],
+});
+```
+
+`operation`: `find` / `insert` / `update` / `delete` / `count`, mirroring `/api/db/:col`'s
+filter/sort/limit/offset shape and `$`-operator filter convention (e.g. `{ field: { $gt: 5 } }`).
+Output shape depends on operation and deliberately respects `_runLevels`' existing `data`-key
+auto-unwrap convention (the same one every other node relies on for `{{nodeId}}` to resolve directly
+to the useful payload):
+- `find`/`insert` return `{ data }` — unwrapped, so `{{nodeId}}` IS the doc or array directly.
+  Deliberately does **not** also return `total`/`limit`/`offset`/`hasMore` for `find`, since those
+  would be silently discarded by that same unwrap (only the `data` key survives) — a worse trap than
+  simply not offering them. Use `operation: 'count'` for a total.
+- `update`/`delete`/`count` return `{ count }` with **no** `data` key — the unwrap only triggers when
+  `result.data !== undefined`, so this object survives intact and `{{nodeId.count}}` works as expected.
+
 ### Per-node Retry
 
 A node can carry `retries: N` (default `0` — no behavior change for any existing workflow) and
@@ -2234,6 +2266,21 @@ and 2 full-suite runs, all clean. Also verified live over a real spawned server:
 gets 403 on `/all`, an admin sees a project they don't belong to, and credential filtering by project
 returns exactly the tagged + global set, confirmed with three real credentials (project-scoped,
 differently-project-scoped, and global).
+
+**`data.table` workflow node added (2026-08-03):** a fresh re-review of the "ejecución de flujos" ×
+"data tables" pillars found that a workflow had no way to read/write a data table (any DB collection,
+the same data exposed at `/api/db/:col`) without looping back through its own HTTP API via an
+`http.request` node. New `data.table` node, registered per-instance in `WorkflowEngine` (needs live DB
+access, same reason `workflow.execute`/`loop.forEach` are registered there instead of `core/nodes.js`'s
+engine-agnostic `BUILTIN_NODES`): `find`/`insert`/`update`/`delete`/`count`, mirroring `/api/db/:col`'s
+filter/sort/limit/offset shape and `$`-operator filter convention. Output design deliberately respects
+`_runLevels`' existing `data`-key auto-unwrap convention: `find`/`insert` return `{ data }` so
+`{{nodeId}}` resolves directly to the doc(s); `update`/`delete`/`count` return `{ count }` with no
+`data` key so it survives intact as `{{nodeId.count}}` instead of being silently discarded by that same
+unwrap. 9 new regression tests. Verified: 20 isolated runs and 2 full-suite runs, all clean. Also
+verified live over a real spawned server: seeded rows via the REST route, then a workflow's `data.table`
+node queried them and a downstream node correctly referenced the unwrapped result via
+`{{query.length}}`/`{{query.0.name}}`.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
