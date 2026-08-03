@@ -529,9 +529,73 @@ export class WorkflowEngine {
     // old strictly-sequential order, rather than throwing.
     const levels = _buildWorkflowDAG(nodes) || nodes.map((n) => [n.id]);
 
-    await this._runLevels(wf, execution, context, nodeMap, levels, 0, subWorkflowChain);
+    const result = await this._runLevelsWithTimeout(wf, execution, context, nodeMap, levels, 0, subWorkflowChain);
 
-    return this._finalizeExecution(wf, execution, triggerData);
+    return this._finalizeExecution(wf, result, triggerData);
+  }
+
+  /**
+   * Wraps `_runLevels` with an optional workflow-level execution timeout
+   * (`wf.settings.executionTimeoutMs`, default off — zero behavior change
+   * for every existing workflow, since `settings` was already a stored but
+   * completely unused field). Found live (2026-08-03, n8n comparison): a
+   * hung node handler (e.g. a custom node awaiting something that never
+   * resolves) blocked the whole execution forever, with no engine-level
+   * guard anywhere — `http.request`'s own 30s fetch timeout only covers
+   * that one built-in node, nothing else.
+   *
+   * On timeout, this does NOT (cannot) truly cancel the in-flight
+   * `_runLevels` call — JS has no real task cancellation, and forcing every
+   * node handler to accept and honor an AbortSignal would be a much larger,
+   * invasive contract change to every built-in and custom node. Instead:
+   * from the CALLER's perspective the execution genuinely IS cut off —
+   * `execute()`/`_resumeExecution()`/`retryExecution()` all return
+   * immediately with a failed result — by racing a timer against the real
+   * call and, if the timer wins, building a fully decoupled
+   * `structuredClone` snapshot marked failed/`timedOut` instead of
+   * mutating the shared `execution` object in place. The orphaned real
+   * call keeps running in the background (unstoppable) and may keep
+   * mutating the ORIGINAL `execution` object as it eventually finishes
+   * levels, but nothing ever reads or re-persists that object again, so
+   * the snapshot already handed to `_finalizeExecution` can't be corrupted
+   * by it. Not retryable via `retryExecution()` afterward — no `failedAt`
+   * level boundary was ever recorded, since the timeout didn't come from
+   * `_runLevels`' own node-failure commit path.
+   */
+  async _runLevelsWithTimeout(wf, execution, context, nodeMap, levels, startIndex, subWorkflowChain) {
+    const timeoutMs = wf.settings?.executionTimeoutMs;
+    if (!(timeoutMs > 0)) {
+      await this._runLevels(wf, execution, context, nodeMap, levels, startIndex, subWorkflowChain);
+      return execution;
+    }
+
+    let timedOut = false;
+    // Deliberately NOT unref()'d. Tried that first and it caused a genuine
+    // hang, not just a harmless "don't keep the process alive" hint: when
+    // this timer is the only thing pending (a bare `Promise.race` against a
+    // truly-never-settling promise, e.g. an isolated script or a bun test
+    // with nothing else scheduled), Bun treats an unref'd timer as nothing
+    // to wait for and simply never fires its callback -- the exact
+    // opposite of what an execution timeout must do. A normal ref'd timer
+    // is safe here: it's short-lived (bounded by `timeoutMs`) and, in the
+    // real running engine, plenty of other things (the wait-poller
+    // setInterval, autosave) already keep the process alive regardless.
+    const timeoutPromise = new Promise((resolve) => {
+      setTimeout(() => { timedOut = true; resolve(); }, timeoutMs);
+    });
+
+    await Promise.race([
+      this._runLevels(wf, execution, context, nodeMap, levels, startIndex, subWorkflowChain),
+      timeoutPromise,
+    ]);
+
+    if (!timedOut) return execution;
+
+    const snapshot = structuredClone(execution);
+    snapshot.status = 'failed';
+    snapshot.errors._engine = `Execution timed out after ${timeoutMs}ms (workflow settings.executionTimeoutMs)`;
+    snapshot.timedOut = true;
+    return snapshot;
   }
 
   /**
@@ -720,6 +784,12 @@ export class WorkflowEngine {
         const unset = { waitState: 1 };
         if (execution.status === 'failed' && execution.failedAt) updates.failedAt = execution.failedAt;
         else unset.failedAt = 1;
+        // Same explicit set/clear reasoning as failedAt above, for a
+        // _runLevelsWithTimeout() snapshot's `timedOut` flag on a
+        // resume()/retryExecution() outcome (an execute()-path timeout
+        // always inserts fresh, carrying the field along automatically).
+        if (execution.timedOut) updates.timedOut = true;
+        else unset.timedOut = 1;
         this._executions.update({ _id: execution._id }, { $set: updates, $unset: unset });
       }
     } else {
@@ -802,8 +872,8 @@ export class WorkflowEngine {
       execution.nodeResults[waitNodeId] = { status: 'success', data: resumedValue, duration: null };
     }
 
-    await this._runLevels(wf, execution, context, nodeMap, levels, remainingLevelIndex, subWorkflowChain || []);
-    this._finalizeExecution(wf, execution, executionDoc.trigger);
+    const result = await this._runLevelsWithTimeout(wf, execution, context, nodeMap, levels, remainingLevelIndex, subWorkflowChain || []);
+    this._finalizeExecution(wf, result, executionDoc.trigger);
   }
 
   /**
@@ -853,9 +923,9 @@ export class WorkflowEngine {
     const execution = { ...executionDoc, status: 'running', errors };
     delete execution.failedAt;
 
-    await this._runLevels(wf, execution, context, nodeMap, levels, levelIndex, subWorkflowChain || []);
-    this._finalizeExecution(wf, execution, executionDoc.trigger);
-    return execution;
+    const result = await this._runLevelsWithTimeout(wf, execution, context, nodeMap, levels, levelIndex, subWorkflowChain || []);
+    this._finalizeExecution(wf, result, executionDoc.trigger);
+    return result;
   }
 
   /**

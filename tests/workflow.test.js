@@ -1812,3 +1812,92 @@ describe('Retry a failed execution (retryExecution)', () => {
     expect(calls).toBe(3);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Execution timeout (settings.executionTimeoutMs) -- found live during a
+// fresh n8n comparison pass: `settings` was already a stored-but-unused
+// field, and no engine-level guard bounded a hung node handler at all.
+// ---------------------------------------------------------------------------
+
+describe('Execution timeout (settings.executionTimeoutMs)', () => {
+  it('a node slower than the timeout: execution fails as timedOut, and returns well before the node would have finished', async () => {
+    let nodeFinished = false;
+    engine.nodes.add({
+      type: 'test.slow200ms',
+      name: 'Slow200ms',
+      category: 'test',
+      handler: async () => { await new Promise((r) => setTimeout(r, 200)); nodeFinished = true; return 'done'; },
+    });
+    const wf = engine.create({
+      name: 'TimeoutTest',
+      nodes: [{ id: 'n', type: 'test.slow200ms', inputs: {} }],
+      settings: { executionTimeoutMs: 40 },
+    });
+
+    const start = Date.now();
+    const exec = await engine.run(wf._id);
+    const elapsed = Date.now() - start;
+
+    expect(exec.status).toBe('failed');
+    expect(exec.timedOut).toBe(true);
+    expect(exec.errors._engine).toContain('timed out after 40ms');
+    expect(elapsed).toBeLessThan(150); // returned near the 40ms timeout, not the node's real 200ms
+    expect(nodeFinished).toBe(false); // the real handler hadn't finished yet when we gave up on it
+  });
+
+  it('a node faster than the timeout succeeds normally -- the timeout never fires', async () => {
+    const wf = engine.create({
+      name: 'FastEnough',
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 'quick' } }],
+      settings: { executionTimeoutMs: 5000 },
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    expect(exec.timedOut).toBeUndefined();
+    expect(exec.nodeResults.n.data).toBe('quick');
+  });
+
+  it('no settings.executionTimeoutMs (default) never times out, even for a genuinely slow node -- zero behavior change', async () => {
+    engine.nodes.add({
+      type: 'test.slow80ms',
+      name: 'Slow80ms',
+      category: 'test',
+      handler: async () => { await new Promise((r) => setTimeout(r, 80)); return 'eventually done'; },
+    });
+    const wf = engine.create({ name: 'NoTimeoutConfigured', nodes: [{ id: 'n', type: 'test.slow80ms', inputs: {} }] });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.n.data).toBe('eventually done');
+  });
+
+  it('a timed-out execution fires the error workflow, same as any other failure', async () => {
+    engine.nodes.add({ type: 'test.hangs', name: 'Hangs', category: 'test', handler: async () => new Promise(() => {}) });
+    const errorHandler = engine.create({
+      name: 'TimeoutErrorHandler',
+      nodes: [{ id: 'log', type: 'set.value', inputs: { value: '{{_trigger.error.message}}' } }],
+    });
+    const wf = engine.create({
+      name: 'TimesOutWithHandler',
+      nodes: [{ id: 'n', type: 'test.hangs', inputs: {} }],
+      settings: { executionTimeoutMs: 30 },
+      errorWorkflow: errorHandler._id,
+    });
+    await engine.run(wf._id);
+    await new Promise((r) => setTimeout(r, 50)); // error workflow fires fire-and-forget
+    const errorExecs = engine.getExecutions(errorHandler._id, 5);
+    expect(errorExecs.length).toBe(1);
+    expect(errorExecs[0].nodeResults.log.data).toContain('timed out');
+  });
+
+  it('a timed-out execution is not retryable -- no failedAt level boundary was ever recorded', async () => {
+    engine.nodes.add({ type: 'test.hangs2', name: 'Hangs2', category: 'test', handler: async () => new Promise(() => {}) });
+    const wf = engine.create({
+      name: 'TimeoutNotRetryable',
+      nodes: [{ id: 'n', type: 'test.hangs2', inputs: {} }],
+      settings: { executionTimeoutMs: 30 },
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('failed');
+    await expect(engine.retryExecution(exec._id)).rejects.toThrow(/no recorded failure point/);
+  });
+});
