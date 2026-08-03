@@ -64,6 +64,17 @@ describe('Health', () => {
     const body = await json(res);
     expect(body.status).toBe('ok');
   });
+
+  it('GET /api/help returns a dense prose walkthrough, public, mirroring /api/shell/help\'s pattern', async () => {
+    const res = await app.handle(req('GET', '/api/help'));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(typeof body.help).toBe('string');
+    expect(body.help).toContain('/api/auth/login');
+    expect(body.help).toContain('/api/schema');
+    expect(body.help).toContain('content.title');
+    expect(body.help).toContain('/api/workflows/validate');
+  });
 });
 
 // ---------------------------------------------------------------------------

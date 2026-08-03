@@ -23,6 +23,67 @@ import { ProjectManager } from './core/projects.js';
 import { projectRoutes } from './routes/projects.js';
 
 /**
+ * Dense, single-read, agent-oriented walkthrough of the REST API surface --
+ * the same pattern `core/shell.js`'s `help()` already uses for the command
+ * gateway (one compact block an agent reads once instead of guessing), now
+ * generalized to the rest of the system. Complements, rather than
+ * duplicates, `GET /api/schema`: that endpoint is a structured per-route
+ * DATA catalog (method/path/auth/body schema); this is PROSE -- the auth
+ * flow, where to look things up, and the specific gotchas an agent would
+ * otherwise only discover by hitting them live (see AGENTS.md's "Known
+ * Agent-UX Friction Points" for how each one was actually found).
+ * @returns {string}
+ */
+export function apiHelp() {
+  return `Automators Kit — REST API Quick Reference
+
+== Auth ==
+  POST /api/auth/register   { email, password, name } -> { user }
+  POST /api/auth/login      { email, password } -> { token, user }
+  Every other route that needs auth: header Authorization: Bearer <token>
+
+== Discover the full API ==
+  GET /api/schema                 Full catalog: every route, its auth
+                                   requirement, and its real request body
+                                   schema (the same objects used to validate
+                                   requests -- can't drift from behavior).
+                                   The REST counterpart to the MCP surface's
+                                   tools/list.
+  GET /api/workflows/nodes/list   Per-node input/output shapes for the
+                                   workflow engine's 21 built-in nodes.
+  GET /api/shell/help             Same "read once" pattern, scoped to the
+                                   agent shell / command gateway.
+
+== Known gotchas ==
+  - A CMS entry has a top-level \`title\` AND, separately, its content type
+    can define its own field literally named \`title\` inside \`content\`.
+    Validation errors for the latter are prefixed \`content.title\` to
+    disambiguate -- read the exact field name in the error, not just
+    "title".
+  - Workflow node ordering is inferred ONLY from literal {{ref}} occurrences
+    in a node's \`inputs\`/\`runIf\` -- a node with no such reference runs
+    alongside everything else at that DAG level, not "after" it just
+    because it comes later in the array. Before running a workflow for
+    real: POST /api/workflows/validate (raw node list) or
+    GET /api/workflows/:id/validate (a stored one) to see the actual
+    computed DAG levels, catch dangling {{ref}}s / duplicate ids / cycles,
+    and get warned if a wait.* node's pause point blocks a level you
+    didn't expect it to.
+
+== Conventions ==
+  - List endpoints: ?page=&limit= (max 100 per page), most also take
+    ?search=.
+  - No dedicated resource route for something? /api/db/:col is a generic
+    collection API over any DB collection (filters via field__op=val, e.g.
+    ?status__ne=draft).
+  - Errors: { "error": "<message>" }, 4xx for client mistakes, always
+    naming the actual field/resource/value involved.
+
+Same functionality is also exposed as MCP tools (mcp.js), self-describing
+via the standard tools/list method.`;
+}
+
+/**
  * Create a fully configured CMS application.
  *
  * @param {object} opts
@@ -69,6 +130,8 @@ export async function createApp(opts = {}) {
     timestamp: Date.now(),
     uptime: Math.floor(process.uptime()),
   }));
+
+  router.get('/api/help', async () => json({ help: apiHelp() }));
 
   // Mount core routes
   router.route('/api/auth', authRoutes(cms));

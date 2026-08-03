@@ -59,6 +59,7 @@ function buildApiCatalog() {
         endpoints: [
           { method: 'GET', path: '/', auth: 'none', description: 'Instance name/version/status' },
           { method: 'GET', path: '/health', auth: 'none', description: 'Health check with uptime' },
+          { method: 'GET', path: '/api/help', auth: 'none', description: 'Dense, single-read, agent-oriented prose walkthrough of the whole REST API — auth flow, where to look things up, known gotchas. Complements this data catalog, mirrors the GET /api/shell/help pattern' },
           { method: 'GET', path: '/api/plugins', auth: 'none', description: 'Lists registered plugins' },
           { method: 'GET', path: '/api/schema/', auth: 'none', description: 'This catalog' },
         ],
