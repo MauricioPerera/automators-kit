@@ -452,6 +452,66 @@ describe('Webhook trigger', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Retry a failed execution (POST /api/workflows/executions/:execId/retry)
+// ---------------------------------------------------------------------------
+
+describe('Execution retry', () => {
+  it('retries from the failed node, re-using earlier results, over real HTTP', async () => {
+    let calls = 0;
+    app.workflowEngine.nodes.add({
+      type: 'test.httpFailsOnce',
+      name: 'HttpFailsOnce',
+      category: 'test',
+      handler: async () => { calls++; if (calls === 1) throw new Error('transient http failure'); return 'recovered'; },
+    });
+
+    const createRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'HTTP retry test',
+      nodes: [
+        { id: 'a', type: 'set.value', inputs: { value: 'seed' } },
+        { id: 'b', type: 'test.httpFailsOnce', inputs: { value: '{{a}}' } },
+      ],
+    }, adminToken));
+    const wfId = (await json(createRes)).workflow._id;
+
+    const runRes = await app.handle(req('POST', `/api/workflows/${wfId}/run`, {}, adminToken));
+    const firstExec = (await json(runRes)).execution;
+    expect(firstExec.status).toBe('failed');
+
+    const retryRes = await app.handle(req('POST', `/api/workflows/executions/${firstExec._id}/retry`, {}, adminToken));
+    expect(retryRes.status).toBe(200);
+    const retried = (await json(retryRes)).execution;
+    expect(retried.status).toBe('success');
+    expect(retried.nodeResults.b.data).toBe('recovered');
+    expect(retried._id).toBe(firstExec._id);
+  });
+
+  it('404s for an unknown execution id', async () => {
+    const res = await app.handle(req('POST', '/api/workflows/executions/does-not-exist/retry', {}, adminToken));
+    expect(res.status).toBe(404);
+  });
+
+  it('400s when retrying an execution that did not fail', async () => {
+    const createRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'HTTP retry non-failed',
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }],
+    }, adminToken));
+    const wfId = (await json(createRes)).workflow._id;
+    const runRes = await app.handle(req('POST', `/api/workflows/${wfId}/run`, {}, adminToken));
+    const exec = (await json(runRes)).execution;
+    expect(exec.status).toBe('success');
+
+    const retryRes = await app.handle(req('POST', `/api/workflows/executions/${exec._id}/retry`, {}, adminToken));
+    expect(retryRes.status).toBe(400);
+  });
+
+  it('requires auth', async () => {
+    const res = await app.handle(req('POST', '/api/workflows/executions/anything/retry', {}));
+    expect(res.status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Webhook resume (wait.forWebhook -- the counterpart to the trigger webhook
 // above, resuming an already-running execution instead of starting one)
 // ---------------------------------------------------------------------------
@@ -597,6 +657,44 @@ describe('OAuth2', () => {
     const res = await app.handle(req('GET', '/api/workflows/oauth2/wrong-state-test/callback?code=valid-code&state=totally-wrong'));
     expect(res.status).toBe(400);
     expect(mock.calls.length).toBe(0); // rejected before ever reaching the token endpoint
+  });
+
+  it('POST /credentials/:name/test verifies a plain credential (admin-only)', async () => {
+    await app.handle(req('POST', '/api/workflows/credentials', { name: 'plain-test-cred', values: { token: 'x' } }, adminToken));
+
+    const noAuthRes = await app.handle(req('POST', '/api/workflows/credentials/plain-test-cred/test', {}));
+    expect(noAuthRes.status).toBe(401);
+
+    const res = await app.handle(req('POST', '/api/workflows/credentials/plain-test-cred/test', {}, adminToken));
+    expect(res.status).toBe(200);
+    expect(await json(res)).toEqual({ ok: true, refreshed: false });
+  });
+
+  it('POST /credentials/:name/test reports ok:false with a reason for an unknown credential', async () => {
+    const res = await app.handle(req('POST', '/api/workflows/credentials/does-not-exist/test', {}, adminToken));
+    expect(res.status).toBe(200); // the test itself ran fine -- ok:false carries the verdict
+    const body = await json(res);
+    expect(body.ok).toBe(false);
+    expect(body.reason).toContain('not found');
+  });
+
+  it('POST /credentials/:name/test surfaces an OAuth2 refresh failure as ok:false (this local mock has no refresh_token grant, same as a provider rejecting a dead refresh token)', async () => {
+    const startRes = await app.handle(req('POST', '/api/workflows/oauth2/test-endpoint-oauth/start', {
+      authUrl: mock.authUrl, tokenUrl: mock.tokenUrl,
+      clientId: 'cid', clientSecret: 'csecret', redirectUri: 'https://app.example/cb',
+    }, adminToken));
+    const state = new URL((await json(startRes)).authorizeUrl).searchParams.get('state');
+    await app.handle(req('GET', `/api/workflows/oauth2/test-endpoint-oauth/callback?code=valid-code&state=${state}`));
+
+    // Force expiry directly via the engine's vault (no HTTP surface for this -- same as the unit tests).
+    const doc = app.workflowEngine.vault._col.findOne({ name: 'test-endpoint-oauth' });
+    app.workflowEngine.vault._col.update({ _id: doc._id }, { $set: { expiresAt: Date.now() - 1000 } });
+
+    const res = await app.handle(req('POST', '/api/workflows/credentials/test-endpoint-oauth/test', {}, adminToken));
+    expect(res.status).toBe(200); // the test itself ran fine -- ok:false carries the verdict
+    const body = await json(res);
+    expect(body.ok).toBe(false);
+    expect(body.reason).toContain('refresh');
   });
 });
 

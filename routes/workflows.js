@@ -121,6 +121,18 @@ export function workflowRoutes(cms, engine) {
     return json({ execution: exec });
   });
 
+  // Retries a failed execution from the DAG level where it failed instead
+  // of re-triggering the whole workflow from scratch (see
+  // WorkflowEngine.retryExecution's doc comment).
+  r.post('/executions/:execId/retry', auth, async (ctx) => {
+    try {
+      const exec = await engine.retryExecution(ctx.params.execId);
+      return json({ execution: exec });
+    } catch (err) {
+      return error(err.message, err.message.includes('not found') ? 404 : 400);
+    }
+  });
+
   // ─── WEBHOOK TRIGGER ──────────────────────────────────────
 
   r.post('/webhook/:path', async (ctx) => {
@@ -177,6 +189,15 @@ export function workflowRoutes(cms, engine) {
   r.delete('/credentials/:name', auth, requireRole('admin'), async (ctx) => {
     engine.vault.remove(ctx.params.name);
     return json({ deleted: true });
+  });
+
+  // Verifies a credential is usable without running a whole workflow (see
+  // CredentialVault.testCredential's doc comment for exactly what this
+  // can and can't confirm). 200 either way -- the *test* succeeded in
+  // running; `ok`/`reason` in the body carry the actual verdict.
+  r.post('/credentials/:name/test', auth, requireRole('admin'), async (ctx) => {
+    const result = await engine.vault.testCredential(ctx.params.name);
+    return json(result);
   });
 
   // ─── OAUTH2 ───────────────────────────────────────────────

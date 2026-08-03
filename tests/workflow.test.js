@@ -1553,3 +1553,107 @@ describe('Per-node retry', () => {
     expect(calls).toBe(0); // the node handler itself was never even invoked
   });
 });
+
+describe('Retry a failed execution (retryExecution)', () => {
+  it('re-dispatches from the failed level only -- earlier nodes are not re-run, downstream nodes proceed once the retry succeeds', async () => {
+    let aCalls = 0;
+    let bCalls = 0;
+    engine.nodes.add({ type: 'test.countA', name: 'CountA', category: 'test', handler: async () => { aCalls++; return 'a-result'; } });
+    engine.nodes.add({
+      type: 'test.failsOnceThenB',
+      name: 'FailsOnceThenB',
+      category: 'test',
+      handler: async () => { bCalls++; if (bCalls === 1) throw new Error('transient'); return 'b-result'; },
+    });
+
+    const wf = engine.create({
+      name: 'RetryChain',
+      nodes: [
+        { id: 'a', type: 'test.countA', inputs: {} },
+        { id: 'b', type: 'test.failsOnceThenB', inputs: { value: '{{a}}' } },
+        { id: 'c', type: 'set.value', inputs: { value: 'after {{b}}' } },
+      ],
+    });
+
+    const first = await engine.run(wf._id);
+    expect(first.status).toBe('failed');
+    expect(first.errors.b).toContain('transient');
+    expect(first.nodeResults.c).toBeUndefined(); // never reached
+    expect(aCalls).toBe(1);
+    expect(bCalls).toBe(1);
+
+    const retried = await engine.retryExecution(first._id);
+    expect(retried.status).toBe('success');
+    expect(retried.nodeResults.a.data).toBe('a-result');
+    expect(retried.nodeResults.b.data).toBe('b-result');
+    expect(retried.nodeResults.c.data).toBe('after b-result');
+    expect(aCalls).toBe(1); // 'a' was NOT re-run -- only the failed level onward
+    expect(bCalls).toBe(2); // 'b' WAS re-run (it's the failed level)
+    expect(retried.errors.b).toBeUndefined(); // the stale error is cleared on success
+
+    // Same execution id, updated in place -- not a new execution row.
+    expect(retried._id).toBe(first._id);
+  });
+
+  it('retrying an execution that is not \'failed\' throws a specific error', async () => {
+    const wf = engine.create({ name: 'AlwaysOk', nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }] });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    await expect(engine.retryExecution(exec._id)).rejects.toThrow(/not 'failed'/);
+  });
+
+  it('retrying an unknown execution id throws', async () => {
+    await expect(engine.retryExecution('does-not-exist')).rejects.toThrow(/not found/);
+  });
+
+  it('preserves an unrelated continueOnError error from an earlier level instead of wiping it', async () => {
+    let cCalls = 0;
+    engine.nodes.add({ type: 'test.softFail', name: 'SoftFail', category: 'test', handler: async () => { throw new Error('soft'); } });
+    engine.nodes.add({
+      type: 'test.hardFailsOnce',
+      name: 'HardFailsOnce',
+      category: 'test',
+      handler: async () => { cCalls++; if (cCalls === 1) throw new Error('hard'); return 'ok'; },
+    });
+
+    const wf = engine.create({
+      name: 'MixedFailures',
+      nodes: [
+        { id: 'soft', type: 'test.softFail', inputs: {}, continueOnError: true },
+        { id: 'hard', type: 'test.hardFailsOnce', inputs: { value: '{{soft}}' } },
+      ],
+    });
+
+    const first = await engine.run(wf._id);
+    expect(first.status).toBe('failed');
+    expect(first.errors.soft).toContain('soft');
+    expect(first.errors.hard).toContain('hard');
+
+    const retried = await engine.retryExecution(first._id);
+    expect(retried.status).toBe('partial'); // 'soft' still recorded as an error, 'hard' now succeeded
+    expect(retried.errors.soft).toContain('soft'); // preserved, not wiped by the retry
+    expect(retried.errors.hard).toBeUndefined();
+    expect(retried.nodeResults.hard.data).toBe('ok');
+  });
+
+  it('a second failure on retry records a fresh failedAt and can be retried again', async () => {
+    let calls = 0;
+    engine.nodes.add({
+      type: 'test.failsTwiceThenOk',
+      name: 'FailsTwiceThenOk',
+      category: 'test',
+      handler: async () => { calls++; if (calls < 3) throw new Error(`fail ${calls}`); return 'ok'; },
+    });
+    const wf = engine.create({ name: 'DoubleRetry', nodes: [{ id: 'n', type: 'test.failsTwiceThenOk', inputs: {} }] });
+
+    const first = await engine.run(wf._id);
+    expect(first.status).toBe('failed');
+    const secondAttempt = await engine.retryExecution(first._id);
+    expect(secondAttempt.status).toBe('failed');
+    expect(secondAttempt.errors.n).toContain('fail 2');
+    const thirdAttempt = await engine.retryExecution(first._id);
+    expect(thirdAttempt.status).toBe('success');
+    expect(thirdAttempt.nodeResults.n.data).toBe('ok');
+    expect(calls).toBe(3);
+  });
+});

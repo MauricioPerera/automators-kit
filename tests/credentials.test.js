@@ -320,6 +320,75 @@ describe('CredentialVault: OAuth2', () => {
 });
 
 // ---------------------------------------------------------------------------
+// testCredential -- verify a credential without running a workflow
+// ---------------------------------------------------------------------------
+
+describe('CredentialVault: testCredential', () => {
+  let mock;
+  beforeEach(() => { mock = startMockOAuth2Server(); });
+  afterEach(() => { mock.stop(); });
+
+  it('reports ok:true for a plain, non-OAuth2 credential that decrypts fine', async () => {
+    await vault.store('plain', { token: 'static-token-xyz' });
+    const result = await vault.testCredential('plain');
+    expect(result).toEqual({ ok: true, refreshed: false });
+  });
+
+  it('reports ok:false with a reason for an unknown credential', async () => {
+    const result = await vault.testCredential('nope');
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain("'nope'");
+    expect(result.reason).toContain('not found');
+  });
+
+  it('reports ok:true, refreshed:false for a non-expiring OAuth2 credential (does not force an unnecessary refresh)', async () => {
+    const authorizeUrl = await vault.startOAuth2('github', oauthConfig(mock));
+    const state = new URL(authorizeUrl).searchParams.get('state');
+    await vault.completeOAuth2('github', 'valid-code', state);
+
+    const result = await vault.testCredential('github');
+    expect(result).toEqual({ ok: true, refreshed: false });
+    expect(mock.calls.length).toBe(1); // only the original code exchange -- no refresh call made
+  });
+
+  it('reports ok:true, refreshed:true for an OAuth2 credential at/near expiry that refreshes successfully', async () => {
+    const authorizeUrl = await vault.startOAuth2('github', oauthConfig(mock));
+    const state = new URL(authorizeUrl).searchParams.get('state');
+    await vault.completeOAuth2('github', 'valid-code', state);
+
+    const doc = vault._col.findOne({ name: 'github' });
+    vault._col.update({ _id: doc._id }, { $set: { expiresAt: Date.now() - 1000 } });
+
+    const result = await vault.testCredential('github');
+    expect(result).toEqual({ ok: true, refreshed: true });
+    expect(mock.calls.length).toBe(2); // code exchange + refresh
+    // Unlike get(), the refresh is genuinely persisted -- confirmed by the stored doc.
+    expect(vault._col.findOne({ name: 'github' }).expiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it('reports ok:false with the real reason when an OAuth2 refresh genuinely fails -- unlike get(), which silently swallows this', async () => {
+    const authorizeUrl = await vault.startOAuth2('github', oauthConfig(mock));
+    const state = new URL(authorizeUrl).searchParams.get('state');
+    await vault.completeOAuth2('github', 'valid-code', state);
+
+    const doc = vault._col.findOne({ name: 'github' });
+    // Force expiry AND wipe the refresh token -- _refreshOAuth2 has no way
+    // to succeed without one (deterministic failure, no mock server changes needed).
+    vault._col.update({ _id: doc._id }, { $set: { expiresAt: Date.now() - 1000 }, $unset: { 'values.refreshToken': 1 } });
+
+    const result = await vault.testCredential('github');
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('refresh');
+
+    // get() on the same broken credential does NOT surface this -- it logs
+    // and falls back to the stale token instead of throwing or reporting
+    // failure. testCredential's whole point is to surface what get() hides.
+    const stillGettable = await vault.get('github');
+    expect(stillGettable).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Project tagging (organizational only, NOT an access boundary)
 // ---------------------------------------------------------------------------
 

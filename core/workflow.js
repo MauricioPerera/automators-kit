@@ -629,6 +629,10 @@ export class WorkflowEngine {
             if (!node.continueOnError) {
               execution.status = 'failed';
               stopped = true;
+              // Recorded so retryExecution() knows where to resume -- the
+              // level never fully committed, so `levelIndex` (not +1, unlike
+              // waitState) is where a retry must re-dispatch from.
+              execution.failedAt = { levelIndex, subWorkflowChain };
             }
           }
         }
@@ -675,7 +679,16 @@ export class WorkflowEngine {
       } else {
         updates.finishedAt = execution.finishedAt;
         updates.duration = execution.duration;
-        this._executions.update({ _id: execution._id }, { $set: updates, $unset: { waitState: 1 } });
+        // failedAt is set/cleared explicitly (rather than left to whatever
+        // was already on the stored doc) because this branch runs on every
+        // retryExecution() outcome too: a retry that fails again needs a
+        // fresh failedAt (a later level may now be the failure point), and
+        // a retry that finally succeeds must not leave a stale failedAt
+        // behind implying the execution is still retryable.
+        const unset = { waitState: 1 };
+        if (execution.status === 'failed' && execution.failedAt) updates.failedAt = execution.failedAt;
+        else unset.failedAt = 1;
+        this._executions.update({ _id: execution._id }, { $set: updates, $unset: unset });
       }
     } else {
       // Store execution history. insert() returns a CLONE with `_id`
@@ -759,6 +772,58 @@ export class WorkflowEngine {
 
     await this._runLevels(wf, execution, context, nodeMap, levels, remainingLevelIndex, subWorkflowChain || []);
     this._finalizeExecution(wf, execution, executionDoc.trigger);
+  }
+
+  /**
+   * Retries a FAILED execution, re-dispatching from the DAG level where it
+   * failed (`executionDoc.failedAt`, recorded by `_runLevels` at the moment
+   * a node failure stops the run) instead of re-triggering the whole
+   * workflow from scratch. Re-runs that WHOLE level, including any sibling
+   * node in it that had already succeeded -- the same level-boundary
+   * granularity `_resumeExecution` already uses for a paused wait, not a
+   * per-node cherry-pick. Context is rebuilt from every already-successful
+   * `nodeResults` entry, same as `_resumeExecution`; only the failed
+   * level's own error entries are cleared, so an unrelated `continueOnError`
+   * failure recorded in an earlier level is preserved rather than silently
+   * dropped by the retry.
+   * @param {string} execId
+   * @returns {Promise<object>} the updated execution
+   */
+  async retryExecution(execId) {
+    const executionDoc = this._executions.findById(execId);
+    if (!executionDoc) throw new Error(`Execution '${execId}' not found`);
+    if (executionDoc.status !== 'failed') {
+      throw new Error(`Execution '${execId}' has status '${executionDoc.status}', not 'failed' -- only a failed execution can be retried`);
+    }
+    if (!executionDoc.failedAt) {
+      throw new Error(`Execution '${execId}' has no recorded failure point to retry from (an internal engine error, not a node failure, likely stopped it)`);
+    }
+
+    const wf = this._workflows.findById(executionDoc.workflowId);
+    if (!wf) throw new Error(`Workflow '${executionDoc.workflowId}' no longer exists`);
+
+    const nodes = wf.nodes || [];
+    const nodeMap = new Map(nodes.map((n) => [n.id, n]));
+    const levels = _buildWorkflowDAG(nodes) || nodes.map((n) => [n.id]);
+
+    const context = { _trigger: executionDoc.trigger?.data || executionDoc.trigger };
+    for (const [nodeId, result] of Object.entries(executionDoc.nodeResults || {})) {
+      if (result.status === 'success') context[nodeId] = result.data;
+    }
+
+    const { levelIndex, subWorkflowChain } = executionDoc.failedAt;
+    const failedLevelNodeIds = new Set(levels[levelIndex] || []);
+    const errors = {};
+    for (const [nodeId, message] of Object.entries(executionDoc.errors || {})) {
+      if (!failedLevelNodeIds.has(nodeId)) errors[nodeId] = message;
+    }
+
+    const execution = { ...executionDoc, status: 'running', errors };
+    delete execution.failedAt;
+
+    await this._runLevels(wf, execution, context, nodeMap, levels, levelIndex, subWorkflowChain || []);
+    this._finalizeExecution(wf, execution, executionDoc.trigger);
+    return execution;
   }
 
   /**

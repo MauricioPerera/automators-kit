@@ -183,6 +183,51 @@ export class CredentialVault {
     return this._decryptValues(doc.values);
   }
 
+  /**
+   * Verifies a credential is usable WITHOUT running a workflow -- the
+   * generic counterpart to n8n's per-credential "test" button. Unlike
+   * `get()`, an OAuth2 refresh failure here is reported back (`ok: false`,
+   * `reason`) instead of being logged and swallowed; `get()` intentionally
+   * hides that failure from node handlers (falling back to the possibly-
+   * stale token so the real API call can fail naturally on a genuine 401),
+   * but an agent proactively checking a credential wants to know NOW that
+   * a refresh token was revoked or expired, not discover it mid-workflow.
+   *
+   * The vault has no notion of what service a credential is for beyond a
+   * free-text label, so this can only verify what's generically knowable:
+   * the credential exists, its ciphertext decrypts, and -- for OAuth2, only
+   * when the access token is actually at/near expiry (the same 60s window
+   * `get()` uses; a still-valid token is not force-refreshed, since some
+   * providers invalidate the previous refresh token on use) -- that a
+   * refresh genuinely succeeds. It cannot confirm the credential is
+   * accepted by the actual third-party API.
+   * @param {string} name
+   * @returns {Promise<{ ok: boolean, reason?: string, refreshed?: boolean }>}
+   */
+  async testCredential(name) {
+    this._ensureInit();
+    let doc = this._col.findOne({ name });
+    if (!doc) return { ok: false, reason: `Credential '${name}' not found` };
+
+    let refreshed = false;
+    if (doc.type === 'oauth2' && typeof doc.expiresAt === 'number' && doc.expiresAt - Date.now() < 60_000) {
+      try {
+        await this._refreshOAuth2(doc);
+        doc = this._col.findOne({ name });
+        refreshed = true;
+      } catch (err) {
+        return { ok: false, reason: `OAuth2 refresh failed: ${err.message}` };
+      }
+    }
+
+    try {
+      await this._decryptValues(doc.values);
+      return { ok: true, refreshed };
+    } catch (err) {
+      return { ok: false, reason: `Failed to decrypt credential: ${err.message}` };
+    }
+  }
+
   async _decryptValues(values) {
     const decrypted = {};
     for (const [k, v] of Object.entries(values || {})) {
