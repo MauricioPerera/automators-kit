@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1068 tests | 0 deps | 27 core modules
+By automators.work | 1094 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -1142,6 +1142,9 @@ bun cli.js seed --file seed.json
 
 ## REST API
 
+### General
+- GET /api/help - dense, single-read, agent-oriented prose walkthrough of the whole REST API (auth flow, where to discover things, known gotchas) — mirrors GET /api/shell/help's pattern, complements GET /api/schema's structured data catalog
+
 ### Auth
 - POST /api/auth/register - { email, password, name }
 - POST /api/auth/login - { email, password } returns { token, user }
@@ -1184,6 +1187,8 @@ bun cli.js seed --file seed.json
 - GET /api/workflows - list
 - PUT /api/workflows/:id - update
 - DELETE /api/workflows/:id - delete
+- POST /api/workflows/validate - lint a raw, unsaved node list (dangling {{ref}}s, duplicate ids, cycles, DAG level breakdown + wait.* pause-point warnings)
+- GET /api/workflows/:id/validate - same lint, run against an already-stored workflow
 - POST /api/workflows/:id/run - execute manually
 - POST /api/workflows/:id/toggle - activate/deactivate
 - GET /api/workflows/:id/executions - execution history
@@ -2263,27 +2268,42 @@ make the API easier for an agent to use correctly on the first try, none of it b
    so an entry-creation caller now sees `contentTypeSlug` directly instead of guessing. Routes with no
    formal schema (manual body checks) are described by hand and explicitly flagged as such (`bodyDescription`
    instead of `bodySchema`), rather than presented with false precision.
-2. **`title` is ambiguous.** CMS entries have a universal top-level `title`, and a content type can
-   *also* define its own field literally named `title` inside `content`. Providing only the top-level
-   one is not enough if the content type has one too, and the resulting error (`"Field 'title' is
-   required"`) doesn't say which layer is missing it.
-3. **The DAG-ordering gotcha is the single biggest correctness risk for an agent authoring a workflow
-   over the API.** `_buildWorkflowDAG` only infers node ordering from literal `{{ref}}` occurrences in
-   `inputs`/`runIf` — a node with no such reference to another node can land in an earlier DAG level
-   than the author intended, with no warning. Live-tested consequence: in a real workflow built during
-   the system test, a `wait.forWebhook` node with no reference to a preceding `switch` node landed in
-   the *same* level and paused the whole execution before the switch-dependent node ever got a chance
-   to run in that pass — deferred to after the resume call instead. The author (this session) already
-   knew this exact gotcha from having documented it repeatedly and still nearly missed it while writing
-   the workflow definition by hand. There is no `POST /api/workflows/:id/validate`-style endpoint (or
-   equivalent lint at create/update time) that would catch "node X references node Y in `runIf` but Y
-   has no corresponding dependency" *before* a real run silently does the wrong thing.
-4. **Error message specificity is inconsistent.** Some are excellent and already agent-legible —
-   `"net-guard: blocked internal destination: 127.0.0.1"`, `"OAuth2 state mismatch — possible CSRF,
-   aborting"` — naming exactly what failed and why. Others are generic (see #2). Worth a pass to bring
-   every validation error up to the same "what failed, where, why" bar.
-5. **`/api/shell/help` is the right pattern; it's not applied anywhere else.** One compact, dense,
-   agent-oriented endpoint an agent reads once to operate the whole command gateway. #1's fix
-   (`GET /api/schema`) now covers the request-body-shape half of this for every other resource group,
-   but it's a data catalog, not `/api/shell/help`'s prose-style walkthrough — the two styles still
-   coexist rather than one generalizing the other.
+2. **RESOLVED (2026-08-02).** `title` is ambiguous. CMS entries have a universal top-level `title`, and
+   a content type can *also* define its own field literally named `title` inside `content`. Providing
+   only the top-level one is not enough if the content type has one too, and the resulting error
+   (`"Field 'title' is required"`) doesn't say which layer is missing it. Fixed: `validateContent()`
+   (`core/cms.js`) now prefixes every content-validation error with `content.` — e.g. `"Field
+   'content.title' is required"` — unambiguously pointing at the nested field, distinct from the
+   entry's own top-level `title`.
+3. **RESOLVED (2026-08-02).** The DAG-ordering gotcha is the single biggest correctness risk for an
+   agent authoring a workflow over the API. `_buildWorkflowDAG` only infers node ordering from literal
+   `{{ref}}` occurrences in `inputs`/`runIf` — a node with no such reference to another node can land in
+   an earlier DAG level than the author intended, with no warning. Live-tested consequence: in a real
+   workflow built during the system test, a `wait.forWebhook` node with no reference to a preceding
+   `switch` node landed in the *same* level and paused the whole execution before the switch-dependent
+   node ever got a chance to run in that pass — deferred to after the resume call instead. Fixed: new
+   `POST /api/workflows/validate` (raw, unsaved node list) and `GET /api/workflows/:id/validate` (an
+   already-stored workflow) run a new `validateWorkflowDefinition()` (`core/workflow.js`) that catches
+   dangling `{{ref}}`s (typos pointing at a node id that doesn't exist), duplicate node ids, and
+   dependency cycles as errors, and returns the actual computed DAG level breakdown plus a warning for
+   any `wait.*` node whose pause point will block a later level — the exact scenario above, surfaced
+   before a real run instead of during one.
+4. **RESOLVED (2026-08-02).** Error message specificity is inconsistent. Some are excellent and already
+   agent-legible — `"net-guard: blocked internal destination: 127.0.0.1"`, `"OAuth2 state mismatch —
+   possible CSRF, aborting"` — naming exactly what failed and why. Others are generic. Fixed: audited
+   every `throw`/`error()` call in `core/*.js` and `routes/*.js`; found 9 genuinely vague messages
+   across 3 files (the rest were already specific). `routes/middleware.js`'s `requireRole`/
+   `requirePermission`/`requireProjectRole` now name the required role/permission and the caller's
+   actual one instead of a bare `"Insufficient permissions"`; `routes/collections.js`'s generic
+   `/api/db` CRUD routes now name the collection + id on a 404 and the method/path on a missing-body
+   400 instead of bare `"Not found"`/`"Body required"`; `core/http.js`'s router `"Bad Request"`
+   (malformed percent-encoding in a path param) now says so explicitly.
+5. **RESOLVED (2026-08-03).** `/api/shell/help` is the right pattern; it wasn't applied anywhere else.
+   One compact, dense, agent-oriented endpoint an agent reads once to operate the whole command gateway.
+   #1's fix (`GET /api/schema`) covers the request-body-shape half of this for every other resource
+   group, but as a data catalog, not `/api/shell/help`'s prose-style walkthrough. Fixed: new
+   `GET /api/help` (`apiHelp()` in `index.js`) — a dense, single-read prose walkthrough covering the
+   auth flow, where to discover the rest of the API, and the concrete gotchas from points #2/#3 above —
+   complementing `GET /api/schema`'s structured data rather than duplicating it.
+
+With this, all 5 friction points found in the 2026-08-02 live system test are closed.
