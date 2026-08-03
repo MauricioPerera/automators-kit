@@ -2394,6 +2394,35 @@ Current posture:
 - Webhook HMAC-SHA256 signing + optional per-webhook secret
 - Rate limiting in triggers
 
+## Known Security Gaps (unresolved)
+
+Found 2026-08-03 by an independent, no-prior-context audit (a fresh GLM instance given only the repo + this
+file, no knowledge of any work done in the session that built the features around it), then independently
+re-verified against the source by the session that requested the audit — both confirmed by reading the
+exact code paths below, not taken on the auditor's word alone. **Not fixed yet — documented on request,
+before any code change.**
+
+1. **Unauthenticated privilege escalation via registration.** `POST /api/auth/register`'s `RegisterSchema`
+   (`routes/auth.js`) allows the caller to set `role` to any of `admin`/`editor`/`author`/`viewer` —
+   `role: { type: 'string', enum: [...] }`, no `required`, no restriction — and the route has no `auth`
+   middleware at all (it's the public signup endpoint by design). `UserService.register()`
+   (`core/cms.js`) passes it straight through: `role: profile.role || 'viewer'`, with zero server-side
+   gate anywhere in between. Reproducible with a single unauthenticated request:
+   `POST /api/auth/register { email, password, name, role: 'admin' }` → the new user IS an admin,
+   immediately, no promotion step needed. No "first user becomes admin" gate, no config flag to disable
+   self-assigned roles or disable public registration entirely.
+2. **Workflow execution and read are not gated by project membership.** `GET /api/workflows/:id` and
+   `POST /api/workflows/:id/run` (`routes/workflows.js`) require only `auth` (any authenticated user of
+   the instance) — no `requireProjectRole`, no project-membership check at all. Any authenticated user
+   can run or read the full definition of ANY workflow in the instance, regardless of which project it
+   belongs to or whether they're a member of it. This is a narrower, undocumented instance of the
+   already-known, deliberately-scoped escape hatch on `PUT /api/workflows/:id` (that one IS documented,
+   in the Projects/Folders section above, as an intentional "global CMS role can still edit any workflow"
+   decision) — but run/read were never explicitly called out as intentional, and letting any instance
+   user trigger execution of an unrelated project's workflow (potentially touching that project's tagged
+   credentials, since credential `projectId` tagging is organizational only, not an access boundary
+   either — see Credentials and projects above) is a materially larger exposure than just editing.
+
 ## Known Agent-UX Friction Points
 
 Found via a real, live, end-to-end system test (2026-08-02) — an agent (this one) driving the actual
