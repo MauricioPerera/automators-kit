@@ -1179,6 +1179,95 @@ describe('Data Table node (data.table)', () => {
   });
 });
 
+describe('Workflow Static Data (engine methods + workflow.staticData node)', () => {
+  it('engine: getStaticData defaults to {} for a workflow that never set any', async () => {
+    const wf = engine.create({ name: 'Fresh', nodes: [] });
+    expect(engine.getStaticData(wf._id)).toEqual({});
+  });
+
+  it('engine: setStaticData replaces entirely, mergeStaticData shallow-merges', async () => {
+    const wf = engine.create({ name: 'SD', nodes: [] });
+    engine.setStaticData(wf._id, { cursor: 1, keep: 'no' });
+    expect(engine.getStaticData(wf._id)).toEqual({ cursor: 1, keep: 'no' });
+
+    engine.mergeStaticData(wf._id, { cursor: 2 });
+    expect(engine.getStaticData(wf._id)).toEqual({ cursor: 2, keep: 'no' });
+
+    engine.setStaticData(wf._id, { onlyThis: true });
+    expect(engine.getStaticData(wf._id)).toEqual({ onlyThis: true });
+  });
+
+  it('engine: get/set/merge on a nonexistent workflow id throws a specific error', () => {
+    expect(() => engine.getStaticData('nope')).toThrow("Workflow 'nope' not found");
+    expect(() => engine.setStaticData('nope', {})).toThrow("Workflow 'nope' not found");
+    expect(() => engine.mergeStaticData('nope', {})).toThrow("Workflow 'nope' not found");
+  });
+
+  it('node: action "get" returns the current static data (default {})', async () => {
+    const wf = engine.create({
+      name: 'NodeGet',
+      nodes: [{ id: 'g', type: 'workflow.staticData', inputs: { action: 'get' } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.g.data).toEqual({});
+  });
+
+  it('node: action "set" replaces static data, persisted onto the workflow document', async () => {
+    const wf = engine.create({
+      name: 'NodeSet',
+      nodes: [{ id: 's', type: 'workflow.staticData', inputs: { action: 'set', data: { seen: [1, 2, 3] } } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.nodeResults.s.data).toEqual({ seen: [1, 2, 3] });
+    expect(engine.getStaticData(wf._id)).toEqual({ seen: [1, 2, 3] });
+  });
+
+  it('node: action "merge" shallow-merges into existing static data', async () => {
+    const wf = engine.create({
+      name: 'NodeMerge',
+      nodes: [{ id: 'm', type: 'workflow.staticData', inputs: { action: 'merge', data: { b: 2 } } }],
+    });
+    engine.setStaticData(wf._id, { a: 1 });
+    const exec = await engine.run(wf._id);
+    expect(exec.nodeResults.m.data).toEqual({ a: 1, b: 2 });
+  });
+
+  it('node: rejects an unknown action with a specific error', async () => {
+    const wf = engine.create({
+      name: 'NodeBadAction',
+      nodes: [{ id: 'x', type: 'workflow.staticData', inputs: { action: 'wipe' } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('failed');
+    expect(exec.errors.x).toContain("unknown action 'wipe'");
+  });
+
+  it('survives across two separate executions -- the whole point (e.g. a poll trigger dedup cursor)', async () => {
+    const wf = engine.create({
+      name: 'Survives',
+      nodes: [{ id: 'm', type: 'workflow.staticData', inputs: { action: 'merge', data: { runCount: 1 } } }],
+    });
+    // Each run merges { runCount: 1 } -- not additive, just confirms the
+    // second run sees what the first run left behind rather than a fresh {}.
+    await engine.run(wf._id);
+    engine.mergeStaticData(wf._id, { seenIds: ['a'] });
+    const exec2 = await engine.run(wf._id);
+    expect(exec2.nodeResults.m.data).toEqual({ runCount: 1, seenIds: ['a'] });
+  });
+
+  it('is NOT settable through create()/update()\'s field whitelist -- engine/node-managed only', async () => {
+    const wf = engine.create({ name: 'NotWhitelisted', nodes: [], staticData: { hacked: true } });
+    expect(engine.getStaticData(wf._id)).toEqual({});
+  });
+
+  it('is listed in GET-equivalent node registry lookup with its declared shape', () => {
+    const def = engine.nodes.get('workflow.staticData');
+    expect(def.category).toBe('core');
+    expect(def.inputs.some(i => i.name === 'action' && i.required)).toBe(true);
+  });
+});
+
 describe('Sub-workflows (workflow.execute node)', () => {
   it("declares its real output fields (executionId/status/nodeResults) -- not the old wrong 'result' placeholder", () => {
     const def = engine.nodes.get('workflow.execute');

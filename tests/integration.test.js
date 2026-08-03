@@ -212,6 +212,108 @@ describe('Auth flow', () => {
 });
 
 // ---------------------------------------------------------------------------
+// API keys (long-lived tokens, separate from a login session)
+// ---------------------------------------------------------------------------
+
+describe('API keys', () => {
+  let apiKeyUserToken;
+
+  beforeAll(async () => {
+    await app.handle(req('POST', '/api/auth/register', {
+      email: 'apikeyuser@test.com', password: 'password1234', name: 'API Key User',
+    }));
+    const loginRes = await app.handle(req('POST', '/api/auth/login', {
+      email: 'apikeyuser@test.com', password: 'password1234',
+    }));
+    apiKeyUserToken = (await json(loginRes)).token;
+  });
+
+  it('requires an existing session to create one -- no bootstrap-from-nothing path', async () => {
+    const res = await app.handle(req('POST', '/api/auth/api-keys', { name: 'x' }));
+    expect(res.status).toBe(401);
+  });
+
+  it('create returns the raw key once; it authenticates a request exactly like a JWT would', async () => {
+    const createRes = await app.handle(req('POST', '/api/auth/api-keys', { name: 'my ci key' }, apiKeyUserToken));
+    expect(createRes.status).toBe(201);
+    const { apiKey } = await json(createRes);
+    expect(apiKey.key.startsWith('akit_')).toBe(true);
+    expect(apiKey.name).toBe('my ci key');
+
+    const meRes = await app.handle(req('GET', '/api/auth/me', null, apiKey.key));
+    expect(meRes.status).toBe(200);
+    expect((await json(meRes)).user.email).toBe('apikeyuser@test.com');
+  });
+
+  it('list returns metadata only, scoped to the caller -- never the raw key or its hash', async () => {
+    await app.handle(req('POST', '/api/auth/api-keys', { name: 'listed-key' }, apiKeyUserToken));
+    const res = await app.handle(req('GET', '/api/auth/api-keys', null, apiKeyUserToken));
+    expect(res.status).toBe(200);
+    const { apiKeys } = await json(res);
+    expect(apiKeys.length).toBeGreaterThan(0);
+    for (const k of apiKeys) {
+      expect(k.key).toBeUndefined();
+      expect(k.keyHash).toBeUndefined();
+    }
+  });
+
+  it('revoke invalidates the key; a revoked key no longer authenticates', async () => {
+    const createRes = await app.handle(req('POST', '/api/auth/api-keys', { name: 'to-revoke' }, apiKeyUserToken));
+    const { apiKey } = await json(createRes);
+
+    const delRes = await app.handle(req('DELETE', `/api/auth/api-keys/${apiKey.id}`, null, apiKeyUserToken));
+    expect(delRes.status).toBe(200);
+
+    const meRes = await app.handle(req('GET', '/api/auth/me', null, apiKey.key));
+    expect(meRes.status).toBe(401);
+  });
+
+  it('cannot revoke another user\'s key', async () => {
+    await app.handle(req('POST', '/api/auth/register', {
+      email: 'apikeyother@test.com', password: 'password1234', name: 'Other',
+    }));
+    const otherLogin = await app.handle(req('POST', '/api/auth/login', {
+      email: 'apikeyother@test.com', password: 'password1234',
+    }));
+    const otherToken = (await json(otherLogin)).token;
+
+    const createRes = await app.handle(req('POST', '/api/auth/api-keys', { name: 'owned-by-apikeyuser' }, apiKeyUserToken));
+    const { apiKey } = await json(createRes);
+
+    const delRes = await app.handle(req('DELETE', `/api/auth/api-keys/${apiKey.id}`, null, otherToken));
+    expect(delRes.status).toBe(404);
+
+    // Still valid -- the cross-user delete attempt didn't actually revoke it.
+    const meRes = await app.handle(req('GET', '/api/auth/me', null, apiKey.key));
+    expect(meRes.status).toBe(200);
+  });
+
+  it('an API key carries the same live role as its owning user, not a snapshot taken at creation', async () => {
+    await app.handle(req('POST', '/api/auth/register', {
+      email: 'apikeyrole@test.com', password: 'password1234', name: 'Role',
+    }));
+    const loginRes = await app.handle(req('POST', '/api/auth/login', {
+      email: 'apikeyrole@test.com', password: 'password1234',
+    }));
+    const token = (await json(loginRes)).token;
+    const createRes = await app.handle(req('POST', '/api/auth/api-keys', { name: 'role-key' }, token));
+    const { apiKey } = await json(createRes);
+
+    // Still viewer -- blocked from an admin-only action.
+    let res = await app.handle(req('POST', '/api/content-types', { name: 'X', slug: 'x' }, apiKey.key));
+    expect(res.status).toBe(403);
+
+    // Promote the user directly, then the SAME already-issued key reflects it immediately.
+    const col = app.cms.auth._users;
+    const user = col.findOne({ email: 'apikeyrole@test.com' });
+    col.update({ _id: user._id }, { $set: { role: 'admin' } });
+
+    res = await app.handle(req('POST', '/api/content-types', { name: 'Y', slug: 'y-role-test' }, apiKey.key));
+    expect(res.status).toBe(201);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Error message specificity (friction point #4)
 // ---------------------------------------------------------------------------
 

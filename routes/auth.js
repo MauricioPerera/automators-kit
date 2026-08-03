@@ -19,6 +19,10 @@ export const LoginSchema = {
   password: { type: 'string', required: true },
 };
 
+export const ApiKeyCreateSchema = {
+  name: { type: 'string', min: 1, max: 128 },
+};
+
 /**
  * @param {import('../core/cms.js').CMS} cms
  */
@@ -68,6 +72,28 @@ export function authRoutes(cms) {
 
   r.get('/me', auth, async (ctx) => {
     return json({ user: ctx.state.user });
+  });
+
+  // API keys: long-lived tokens for programmatic/CI callers, separate from
+  // a login session (no expiry, revocation is deletion). A caller must
+  // already be authenticated (JWT or an existing key) to create one --
+  // there is no bootstrap-from-nothing path, by design.
+  r.post('/api-keys', auth, validateBody(ApiKeyCreateSchema), async (ctx) => {
+    const apiKey = await cms.users.createApiKey(ctx.state.user._id, ctx.state.body.name);
+    return json({ apiKey }, 201);
+  });
+
+  r.get('/api-keys', auth, async (ctx) => {
+    return json({ apiKeys: cms.users.listApiKeys(ctx.state.user._id) });
+  });
+
+  r.delete('/api-keys/:id', auth, async (ctx) => {
+    try {
+      const result = cms.users.revokeApiKey(ctx.state.user._id, ctx.params.id);
+      return json(result);
+    } catch (err) {
+      return error(err.message, 404);
+    }
   });
 
   return r;

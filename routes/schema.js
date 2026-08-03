@@ -7,7 +7,7 @@
 import { Router, json, error } from '../core/http.js';
 import { validateBody } from '../core/validate.js';
 import { createAuth, requireRole } from './middleware.js';
-import { RegisterSchema, LoginSchema } from './auth.js';
+import { RegisterSchema, LoginSchema, ApiKeyCreateSchema } from './auth.js';
 import { CreateSchema as ContentTypeCreateSchema, UpdateSchema as ContentTypeUpdateSchema } from './content-types.js';
 import { CreateSchema as EntryCreateSchema, UpdateSchema as EntryUpdateSchema } from './entries.js';
 import { CreateSchema as TaxonomyCreateSchema, UpdateSchema as TaxonomyUpdateSchema } from './taxonomies.js';
@@ -72,6 +72,9 @@ function buildApiCatalog() {
           { method: 'POST', path: '/api/auth/register', auth: 'none', bodySchema: RegisterSchema, description: 'Register a new user' },
           { method: 'POST', path: '/api/auth/login', auth: 'none', bodySchema: LoginSchema, description: 'Log in, returns a JWT' },
           { method: 'GET', path: '/api/auth/me', auth: 'bearer', description: 'Current authenticated user' },
+          { method: 'POST', path: '/api/auth/api-keys', auth: 'bearer', bodySchema: ApiKeyCreateSchema, description: 'Create a long-lived API key for the caller; the raw key is returned once and never stored' },
+          { method: 'GET', path: '/api/auth/api-keys', auth: 'bearer', description: 'List the caller\'s own API keys (metadata only)' },
+          { method: 'DELETE', path: '/api/auth/api-keys/:id', auth: 'bearer', description: 'Revoke one of the caller\'s own API keys' },
         ],
       },
       {

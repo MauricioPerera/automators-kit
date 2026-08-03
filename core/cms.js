@@ -883,9 +883,24 @@ class UserService {
     return { token: result.token, user: this.safeUser(result.user) };
   }
 
-  /** Verify a JWT token */
+  /** Verify a JWT token (or an API key -- see createApiKey) */
   async verify(token) {
     return this.cms.auth.verify(token);
+  }
+
+  /** Create a long-lived API key for `userId`. Returns the raw key ONCE. */
+  async createApiKey(userId, name) {
+    return this.cms.auth.createApiKey(userId, name);
+  }
+
+  /** List `userId`'s own API keys (metadata only). */
+  listApiKeys(userId) {
+    return this.cms.auth.listApiKeys(userId);
+  }
+
+  /** Revoke one of `userId`'s own API keys. */
+  revokeApiKey(userId, keyId) {
+    return this.cms.auth.revokeApiKey(userId, keyId);
   }
 
   findAll(filters = {}) {

@@ -369,6 +369,49 @@ export class WorkflowEngine {
       },
     });
 
+    // 'workflow.staticData' node -- registered here (not in core/nodes.js's
+    // engine-agnostic BUILTIN_NODES) for the same "needs a live engine"
+    // reason as 'workflow.execute'/'loop.forEach'/'data.table' above, plus
+    // one more thing none of those need: knowing WHICH workflow is
+    // currently running, with no id passed as an input. That id is the
+    // last entry of ctx.callChain -- execute() always seeds
+    // subWorkflowChain as `[...callChain, id]` (core/workflow.js's own
+    // execute(), see its comment), so the last element is always the
+    // current execution's own workflow id, root-triggered or not.
+    // Persistent per-workflow scratch space -- e.g. a poll trigger's own
+    // dedup cursor -- surviving across executions without a data.table
+    // row. Stored directly on the workflow doc's `staticData` field
+    // (default {}), deliberately NOT reachable through create()/update()'s
+    // field whitelist -- this is engine/node-managed runtime state, not a
+    // user-editable workflow property.
+    this._nodeRegistry.add({
+      type: 'workflow.staticData',
+      name: 'Workflow Static Data',
+      category: 'core',
+      description: 'Read or write a small JSON scratch space tied to the current workflow, persisted across executions',
+      inputs: [
+        { name: 'action', type: 'string', required: true }, // get | set | merge
+        { name: 'data', type: 'object' }, // set: replaces entirely. merge: shallow-merged in
+      ],
+      outputs: [{ name: 'data', type: 'object' }],
+      handler: async (inputs, _credentials, ctx) => {
+        const callChain = ctx?.callChain || [];
+        const workflowId = callChain[callChain.length - 1];
+        if (!workflowId) throw new Error('workflow.staticData: no current workflow id available');
+
+        switch (inputs.action) {
+          case 'get':
+            return { data: this.getStaticData(workflowId) };
+          case 'set':
+            return { data: this.setStaticData(workflowId, inputs.data || {}) };
+          case 'merge':
+            return { data: this.mergeStaticData(workflowId, inputs.data || {}) };
+          default:
+            throw new Error(`workflow.staticData: unknown action '${inputs.action}' -- expected one of: get, set, merge`);
+        }
+      },
+    });
+
     // Trigger manager
     this._triggers = new TriggerManager({
       onTrigger: (workflowId, triggerData) => {
@@ -1104,6 +1147,34 @@ export class WorkflowEngine {
   /** Webhook trigger (called from HTTP route) */
   webhookTrigger(path, data, secret, method) {
     return this._triggers.fireWebhook(path, data, secret, method);
+  }
+
+  // ─── STATIC DATA ─────────────────────────────────────────
+  //
+  // Small persistent JSON scratch space tied to a workflow, surviving
+  // across executions -- e.g. a poll trigger's own dedup cursor, without
+  // needing a separate data.table row. Stored directly on the workflow
+  // document; last-write-wins, no locking, same concurrency guarantee an
+  // in-process single-writer trigger/node already has in practice. Also
+  // reachable from inside a run via the 'workflow.staticData' node.
+
+  getStaticData(workflowId) {
+    const wf = this._workflows.findById(workflowId);
+    if (!wf) throw new Error(`Workflow '${workflowId}' not found`);
+    return wf.staticData || {};
+  }
+
+  setStaticData(workflowId, data) {
+    if (!this._workflows.findById(workflowId)) throw new Error(`Workflow '${workflowId}' not found`);
+    const next = data || {};
+    this._workflows.update({ _id: workflowId }, { $set: { staticData: next } });
+    this.db.flush();
+    return next;
+  }
+
+  mergeStaticData(workflowId, partial) {
+    const current = this.getStaticData(workflowId);
+    return this.setStaticData(workflowId, { ...current, ...(partial || {}) });
   }
 
   // ─── HISTORY ─────────────────────────────────────────────

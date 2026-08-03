@@ -462,6 +462,71 @@ describe('Auth', () => {
     expect(auth.hasRole(user._id, 'admin')).toBe(false);
   });
 
+  it('API keys: create returns a raw key once, verify resolves to the owning user', async () => {
+    const user = await auth.register('apikey@test.com', 'pass1234567');
+    const created = await auth.createApiKey(user._id, 'CI key');
+    expect(created.key.startsWith('akit_')).toBe(true);
+    expect(created.name).toBe('CI key');
+    expect(created.prefix.length).toBeGreaterThan(0);
+
+    const payload = await auth.verify(created.key);
+    expect(payload).not.toBeNull();
+    expect(payload.sub).toBe(user._id);
+    expect(payload.apiKey).toBe(true);
+  });
+
+  it('API keys: creating for a nonexistent user throws', async () => {
+    try {
+      await auth.createApiKey('nope', 'x');
+      expect(true).toBe(false);
+    } catch (err) {
+      expect(err.message).toContain('not found');
+    }
+  });
+
+  it('API keys: listApiKeys never exposes the hash or raw key, scoped to the owner', async () => {
+    const alice = await auth.register('akalice@test.com', 'pass1234567');
+    const bob = await auth.register('akbob@test.com', 'pass1234567');
+    await auth.createApiKey(alice._id, 'alice-1');
+    await auth.createApiKey(bob._id, 'bob-1');
+
+    const aliceKeys = auth.listApiKeys(alice._id);
+    expect(aliceKeys.length).toBe(1);
+    expect(aliceKeys[0].name).toBe('alice-1');
+    expect(aliceKeys[0].keyHash).toBeUndefined();
+    expect(aliceKeys[0].key).toBeUndefined();
+  });
+
+  it('API keys: revoke invalidates the key and refuses another user\'s key', async () => {
+    const alice = await auth.register('akrevalice@test.com', 'pass1234567');
+    const bob = await auth.register('akrevbob@test.com', 'pass1234567');
+    const created = await auth.createApiKey(alice._id, 'to-revoke');
+
+    try {
+      auth.revokeApiKey(bob._id, created.id);
+      expect(true).toBe(false);
+    } catch (err) {
+      expect(err.message).toContain('not found');
+    }
+
+    auth.revokeApiKey(alice._id, created.id);
+    const payload = await auth.verify(created.key);
+    expect(payload).toBeNull();
+  });
+
+  it('API keys: a garbage token that starts with the prefix but matches nothing verifies as null', async () => {
+    const payload = await auth.verify('akit_totally-made-up-not-a-real-key');
+    expect(payload).toBeNull();
+  });
+
+  it('API keys: deleteUser cascades and revokes all of that user\'s keys', async () => {
+    const user = await auth.register('akdelete@test.com', 'pass1234567');
+    const created = await auth.createApiKey(user._id, 'gone-with-user');
+    auth.deleteUser(user._id);
+    const payload = await auth.verify(created.key);
+    expect(payload).toBeNull();
+  });
+
   it('a second Auth.init() against already-persisted data does not throw, and logs only the message (not the whole Error) when an index already exists', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'auth-restart-'));
     try {
@@ -482,11 +547,12 @@ describe('Auth', () => {
         console.error = originalError;
       }
 
-      // _ensureLoaded() already restored the persisted indexes, so all 3
-      // createIndex() calls throw "already exists" and get caught -- each
+      // _ensureLoaded() already restored the persisted indexes, so all 5
+      // createIndex() calls (email, token, sessions.userId, keyHash,
+      // apiKeys.userId) throw "already exists" and get caught -- each
       // logged call's error argument must be the message string, not the
       // raw Error object (which Bun renders with a full stack trace).
-      expect(errors.length).toBe(3);
+      expect(errors.length).toBe(5);
       for (const [, errArg] of errors) {
         expect(typeof errArg).toBe('string');
         expect(errArg).toContain('Index already exists');

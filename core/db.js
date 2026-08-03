@@ -2033,6 +2033,14 @@ class FieldCrypto {
 //   const { token, user } = await auth.login('alice@test.com', 'password123');
 //   const verified = await auth.verify(token);
 //   await auth.assignRole(user._id, 'admin');
+//
+// API keys: long-lived tokens for programmatic/CI callers that shouldn't
+// have to hold a user's password. createApiKey() returns the raw key ONCE
+// (only its SHA-256 hash is ever stored); verify() accepts it exactly like
+// a JWT -- same return shape, same `sub`, so every existing auth-middleware
+// caller works unchanged. Not session-backed (no expiry, no _sessions row)
+// -- revocation is deletion, not a timeout.
+const API_KEY_PREFIX = 'akit_';
 
 class Auth {
   /**
@@ -2041,6 +2049,7 @@ class Auth {
    * @param {string} opts.secret              JWT signing secret
    * @param {string} [opts.usersCollection]   Default: '_users'
    * @param {string} [opts.sessionsCollection] Default: '_sessions'
+   * @param {string} [opts.apiKeysCollection] Default: '_api_keys'
    * @param {number} [opts.tokenExpiry]       JWT expiry in seconds (default: 86400 = 24h)
    * @param {number} [opts.hashIterations]    PBKDF2 iterations (default: 100000)
    * @param {string[]} [opts.defaultRoles]    Roles for new users (default: ['user'])
@@ -2050,6 +2059,7 @@ class Auth {
     this.secret          = opts.secret;
     this.usersCol        = opts.usersCollection || '_users';
     this.sessionsCol     = opts.sessionsCollection || '_sessions';
+    this.apiKeysCol      = opts.apiKeysCollection || '_api_keys';
     this.tokenExpiry     = opts.tokenExpiry || 86400;
     this.hashIterations  = opts.hashIterations || 100000;
     this.defaultRoles    = opts.defaultRoles || ['user'];
@@ -2058,12 +2068,14 @@ class Auth {
 
     this._users    = null;
     this._sessions = null;
+    this._apiKeys  = null;
   }
 
   /** Inicializa colecciones e indices. Llamar una vez al inicio. */
   async init() {
     this._users = this.db.collection(this.usersCol);
     this._sessions = this.db.collection(this.sessionsCol);
+    this._apiKeys = this.db.collection(this.apiKeysCol);
 
     // Indices. createIndex() throws "Index already exists" on a restart
     // against already-persisted data (the index was already restored from
@@ -2077,6 +2089,10 @@ class Auth {
     catch (err) { console.error('Auth.init: token index failed:', err.message); }
     try { this._sessions.createIndex('userId'); }
     catch (err) { console.error('Auth.init: userId index failed:', err.message); }
+    try { this._apiKeys.createIndex('keyHash', { unique: true }); }
+    catch (err) { console.error('Auth.init: keyHash index failed:', err.message); }
+    try { this._apiKeys.createIndex('userId'); }
+    catch (err) { console.error('Auth.init: apiKeys userId index failed:', err.message); }
 
     // Auto-cleanup expired sessions every hour
     this.cleanExpiredSessions();
@@ -2269,11 +2285,15 @@ class Auth {
   }
 
   /**
-   * Verifica un JWT y retorna el payload.
-   * @returns {Promise<object|null>}  Payload o null si invalido/expirado
+   * Verifica un JWT (o un API key, ver createApiKey) y retorna el payload.
+   * @returns {Promise<object|null>}  Payload o null si invalido/expirado/revocado
    */
   async verify(token) {
     this._ensureInit();
+    if (typeof token === 'string' && token.startsWith(API_KEY_PREFIX)) {
+      return this._verifyApiKey(token);
+    }
+
     const payload = await this._verifyJWT(token);
     if (!payload) return null;
 
@@ -2282,6 +2302,70 @@ class Auth {
     if (!session) return null;
 
     return payload;
+  }
+
+  // ── API keys ─────────────────────────────────────────────
+
+  async _hashApiKey(rawKey) {
+    const crypto = Auth._getCrypto();
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawKey));
+    return _uint8ToBase64(new Uint8Array(digest));
+  }
+
+  async _verifyApiKey(rawKey) {
+    const keyHash = await this._hashApiKey(rawKey);
+    const doc = this._apiKeys.findOne({ keyHash });
+    if (!doc) return null;
+    this._apiKeys.update({ _id: doc._id }, { $set: { lastUsedAt: Date.now() } });
+    // Shaped like a JWT payload (`sub` = userId) so every existing
+    // auth-middleware caller (which only ever reads `.sub`) works
+    // unchanged regardless of which kind of token it received.
+    return { sub: doc.userId, apiKeyId: doc._id, apiKey: true };
+  }
+
+  /**
+   * Genera un API key de larga duracion para `userId`. Retorna el key
+   * crudo UNA sola vez -- solo se persiste su hash SHA-256. El key
+   * hereda los permisos del usuario en el momento de cada request (se
+   * resuelve via `sub` igual que un JWT), no un snapshot fijo al crearlo.
+   * @returns {Promise<{ id: string, key: string, prefix: string, name: string, createdAt: number }>}
+   */
+  async createApiKey(userId, name) {
+    this._ensureInit();
+    const user = this._users.findById(userId);
+    if (!user) throw new Error(`User '${userId}' not found`);
+
+    const crypto = Auth._getCrypto();
+    const raw = API_KEY_PREFIX + _uint8ToBase64url(crypto.getRandomValues(new Uint8Array(24)));
+    const keyHash = await this._hashApiKey(raw);
+    const prefix = raw.slice(0, API_KEY_PREFIX.length + 8);
+
+    const doc = this._apiKeys.insert({
+      userId,
+      name: name || 'API Key',
+      keyHash,
+      prefix,
+      createdAt: Date.now(),
+      lastUsedAt: null,
+    });
+
+    return { id: doc._id, key: raw, prefix, name: doc.name, createdAt: doc.createdAt };
+  }
+
+  /** Lists `userId`'s own API keys (metadata only -- never the hash or raw key). */
+  listApiKeys(userId) {
+    this._ensureInit();
+    return this._apiKeys.find({ userId }).toArray()
+      .map(({ keyHash, ...safe }) => safe);
+  }
+
+  /** Revokes (deletes) one of `userId`'s own API keys. Refuses another user's key. */
+  revokeApiKey(userId, keyId) {
+    this._ensureInit();
+    const doc = this._apiKeys.findById(keyId);
+    if (!doc || doc.userId !== userId) throw new Error(`API key '${keyId}' not found`);
+    this._apiKeys.removeById(keyId);
+    return { id: keyId };
   }
 
   /**
@@ -2399,6 +2483,7 @@ class Auth {
   deleteUser(userId) {
     this._users.removeById(userId);
     this._sessions.removeMany({ userId });
+    this._apiKeys.removeMany({ userId });
   }
 
   /**
