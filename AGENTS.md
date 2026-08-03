@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1127 tests | 0 deps | 27 core modules
+By automators.work | 1165 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -1185,11 +1185,12 @@ bun cli.js seed --file seed.json
 ### Workflow Engine (n8n-style)
 - POST /api/workflows - create workflow
 - GET /api/workflows - list
-- PUT /api/workflows/:id - update
+- GET /api/workflows/:id - get one (project-gated: viewer+ if the workflow has a projectId, open to any authenticated user if unassigned)
+- PUT /api/workflows/:id - update (deliberate escape hatch: global CMS role only, no project gate)
 - DELETE /api/workflows/:id - delete
 - POST /api/workflows/validate - lint a raw, unsaved node list (dangling {{ref}}s, duplicate ids, cycles, DAG level breakdown + wait.* pause-point warnings)
 - GET /api/workflows/:id/validate - same lint, run against an already-stored workflow
-- POST /api/workflows/:id/run - execute manually
+- POST /api/workflows/:id/run - execute manually (project-gated: editor+ if the workflow has a projectId, open to any authenticated user if unassigned)
 - POST /api/workflows/:id/toggle - activate/deactivate
 - GET /api/workflows/:id/executions - execution history
 - POST /api/workflows/executions/:execId/retry - retry a FAILED execution from the DAG level where it failed
@@ -2393,35 +2394,55 @@ Current posture:
 - Session auto-cleanup
 - Webhook HMAC-SHA256 signing + optional per-webhook secret
 - Rate limiting in triggers
+- Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
+- Workflow read/run gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (unresolved)
+## Known Security Gaps (both resolved)
 
 Found 2026-08-03 by an independent, no-prior-context audit (a fresh GLM instance given only the repo + this
 file, no knowledge of any work done in the session that built the features around it), then independently
 re-verified against the source by the session that requested the audit — both confirmed by reading the
-exact code paths below, not taken on the auditor's word alone. **Not fixed yet — documented on request,
-before any code change.**
+exact code paths, not taken on the auditor's word alone. Documented first, on request, before any code
+change; both fixed shortly after in separate, explicitly-requested passes.
 
-1. **Unauthenticated privilege escalation via registration.** `POST /api/auth/register`'s `RegisterSchema`
-   (`routes/auth.js`) allows the caller to set `role` to any of `admin`/`editor`/`author`/`viewer` —
-   `role: { type: 'string', enum: [...] }`, no `required`, no restriction — and the route has no `auth`
-   middleware at all (it's the public signup endpoint by design). `UserService.register()`
-   (`core/cms.js`) passes it straight through: `role: profile.role || 'viewer'`, with zero server-side
-   gate anywhere in between. Reproducible with a single unauthenticated request:
-   `POST /api/auth/register { email, password, name, role: 'admin' }` → the new user IS an admin,
-   immediately, no promotion step needed. No "first user becomes admin" gate, no config flag to disable
-   self-assigned roles or disable public registration entirely.
-2. **Workflow execution and read are not gated by project membership.** `GET /api/workflows/:id` and
-   `POST /api/workflows/:id/run` (`routes/workflows.js`) require only `auth` (any authenticated user of
-   the instance) — no `requireProjectRole`, no project-membership check at all. Any authenticated user
-   can run or read the full definition of ANY workflow in the instance, regardless of which project it
-   belongs to or whether they're a member of it. This is a narrower, undocumented instance of the
-   already-known, deliberately-scoped escape hatch on `PUT /api/workflows/:id` (that one IS documented,
+1. **RESOLVED (2026-08-03).** Unauthenticated privilege escalation via registration. `POST
+   /api/auth/register`'s `RegisterSchema` (`routes/auth.js`) allowed the caller to set `role` to any of
+   `admin`/`editor`/`author`/`viewer` — `role: { type: 'string', enum: [...] }`, no `required`, no
+   restriction — and the route has no `auth` middleware at all (it's the public signup endpoint by
+   design). `UserService.register()` (`core/cms.js`) passed it straight through: `role: profile.role ||
+   'viewer'`, with zero server-side gate anywhere in between. Reproducible with a single unauthenticated
+   request: `POST /api/auth/register { email, password, name, role: 'admin' }` → the new user WAS an
+   admin, immediately, no promotion step needed. Fixed: the route now rejects any `role` other than
+   `'viewer'` with a clear 400, **before** `register()` ever runs — no orphaned account left behind.
+   `UserService.register()` itself is untouched and still accepts a role for trusted, server-side/
+   programmatic callers (seed scripts, etc.); only the public HTTP surface is closed. Defense in depth:
+   even if the route-level check were bypassed, `register()`'s own default is already `'viewer'`. 7 new
+   regression tests, including one reproducing the exact exploit and confirming no account is created.
+2. **RESOLVED (2026-08-03).** Workflow execution and read were not gated by project membership. `GET
+   /api/workflows/:id` and `POST /api/workflows/:id/run` (`routes/workflows.js`) required only `auth`
+   (any authenticated user of the instance) — no `requireProjectRole`, no project-membership check at
+   all. Any authenticated user could run or read the full definition of ANY workflow in the instance,
+   regardless of which project it belonged to or whether they were a member of it. Narrower than, but
+   related to, the already-known, deliberately-scoped escape hatch on `PUT /api/workflows/:id` (documented
    in the Projects/Folders section above, as an intentional "global CMS role can still edit any workflow"
-   decision) — but run/read were never explicitly called out as intentional, and letting any instance
-   user trigger execution of an unrelated project's workflow (potentially touching that project's tagged
+   decision) — run/read were never explicitly called out as intentional, and letting any instance user
+   trigger execution of an unrelated project's workflow (potentially touching that project's tagged
    credentials, since credential `projectId` tagging is organizational only, not an access boundary
-   either — see Credentials and projects above) is a materially larger exposure than just editing.
+   either — see Credentials and projects above) was a materially larger exposure than just editing.
+   Fixed: new `requireWorkflowProjectRole(engine, projectManager, minRole)` middleware
+   (`routes/middleware.js`) resolves the route's `:id` as a workflow (not a project id directly) and
+   gates on that workflow's own `projectId` — a workflow with no `projectId` (unassigned/global) stays
+   open to any authenticated user, unchanged, same "project scoping is additive" pattern used elsewhere.
+   Applied to `GET /:id` (viewer+) and `POST /:id/run` (editor+ — running has real side effects, matching
+   the existing view=viewer/act=editor convention already used by the project routes). `PUT /:id` is left
+   untouched — the separate, already-documented escape hatch. `DELETE`/`toggle`/`executions` share the
+   same underlying gap but weren't part of this finding; noted, not bundled into this fix. 8 new
+   regression tests covering non-member/viewer/editor/owner access levels, the unassigned-workflow
+   no-regression case, and confirming the `PUT` escape hatch stays intact.
+
+Both verified: 2 full-suite runs + 20 isolated runs of `integration.test.js` each, all clean. Also
+verified live over real spawned servers, each reproducing the exact exploit before the fix and confirming
+it's blocked after.
 
 ## Known Agent-UX Friction Points
 
