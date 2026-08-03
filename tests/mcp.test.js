@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { buildTools, handleMCPRequest, buildAllTools } from '../core/mcp.js';
+import { buildTools, handleMCPRequest, buildAllTools, createLineProcessor } from '../core/mcp.js';
 
 // ---------------------------------------------------------------------------
 // Fake CMS + spies
@@ -314,5 +314,86 @@ describe('buildAllTools: opts.includeCmsTools', () => {
 
     const callRes = await handleMCPRequest({ id: 2, method: 'tools/call', params: { name: 'echo', arguments: { msg: 'hi' } } }, allTools);
     expect(parseContentText(callRes)).toEqual({ echoed: 'hi' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// createLineProcessor -- ordered stdio dispatch (2026-08-03)
+//
+// Found live during an independent audit: readline's 'line' event does NOT
+// await an async listener, so wiring `async (line) => {...}` straight onto
+// `rl.on('line', ...)` let requests run concurrently and let responses land
+// out of order for a client that pipelines multiple requests without
+// waiting for each response (valid per JSON-RPC). createLineProcessor
+// chains each line's work onto a single promise so this is directly
+// testable without spawning a real stdio process.
+// ---------------------------------------------------------------------------
+
+describe('createLineProcessor (ordered stdio dispatch)', () => {
+  const req = (id, name, args = {}) => JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } });
+
+  it('a line enqueued first fully finishes before a later, faster line even starts -- not just "sends its response first"', async () => {
+    const events = [];
+    const tools = {
+      slow: {
+        description: 'slow', inputSchema: { type: 'object', properties: {} },
+        handler: async () => {
+          events.push('slow:start');
+          await new Promise((r) => setTimeout(r, 30));
+          events.push('slow:end');
+          return 'slow-result';
+        },
+      },
+      fast: {
+        description: 'fast', inputSchema: { type: 'object', properties: {} },
+        handler: async () => {
+          events.push('fast:start');
+          return 'fast-result';
+        },
+      },
+    };
+    const sent = [];
+    const processor = createLineProcessor(tools, (msg) => sent.push(JSON.parse(msg)));
+
+    processor.enqueue(req(1, 'slow'));
+    processor.enqueue(req(2, 'fast')); // enqueued immediately after, without waiting -- the exact "pipelined" scenario
+
+    await new Promise((r) => setTimeout(r, 100)); // long enough for both to have genuinely finished
+
+    // If the two handlers had raced (the pre-fix bug), 'fast:start' would
+    // land BEFORE 'slow:end' -- fast has nothing to await, slow sleeps 30ms.
+    expect(events).toEqual(['slow:start', 'slow:end', 'fast:start']);
+    expect(sent.map((r) => r.id)).toEqual([1, 2]); // responses sent in enqueue order too
+  });
+
+  it('a JSON parse error on one line does not corrupt or block subsequent lines', async () => {
+    const tools = { echo: { description: 'echo', inputSchema: { type: 'object', properties: {} }, handler: async (args) => args } };
+    const sent = [];
+    const processor = createLineProcessor(tools, (msg) => sent.push(JSON.parse(msg)));
+
+    processor.enqueue('not valid json{{{');
+    processor.enqueue(req(5, 'echo', { x: 1 }));
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(sent[0].error.code).toBe(-32700);
+    expect(sent[1].id).toBe(5);
+  });
+
+  it('a tool handler throwing does not break the queue for subsequent lines (processLine never rejects)', async () => {
+    const tools = {
+      boom: { description: 'boom', inputSchema: { type: 'object', properties: {} }, handler: async () => { throw new Error('kaboom'); } },
+      echo: { description: 'echo', inputSchema: { type: 'object', properties: {} }, handler: async (args) => args },
+    };
+    const sent = [];
+    const processor = createLineProcessor(tools, (msg) => sent.push(JSON.parse(msg)));
+
+    processor.enqueue(req(1, 'boom'));
+    processor.enqueue(req(2, 'echo', { x: 1 }));
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(sent[0].result.isError).toBe(true);
+    expect(sent[1].id).toBe(2);
   });
 });

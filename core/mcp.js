@@ -387,16 +387,32 @@ export function buildAllTools(cms, extraTools = {}, opts = {}) {
  *   where the CMS tools would just be noise for the client. `cms` is still
  *   required either way — the stdio loop calls `cms.shutdown()` on close.
  */
-export function createMCPServer(cms, extraTools = {}, opts = {}) {
-  const allTools = buildAllTools(cms, extraTools, opts);
-
-  const rl = createInterface({ input: process.stdin, terminal: false });
-
-  function send(msg) {
-    process.stdout.write(msg + '\n');
-  }
-
-  rl.on('line', async (line) => {
+/**
+ * Builds a strictly-ordered line processor: each `enqueue(line)` call's
+ * work is chained onto a single promise, so line N+1 never starts
+ * processing until line N's response has been sent. Pulled out of
+ * `createMCPServer` (same reason `buildAllTools` was, per its own doc
+ * comment above) so the ordering guarantee is directly testable without
+ * wiring real stdio.
+ *
+ * Found live (2026-08-03, independent audit): `readline`'s `'line'` event
+ * does NOT await an async listener -- it fires for every buffered line
+ * synchronously, so an `async (line) => {...}` handler directly on
+ * `rl.on('line', ...)` let requests run CONCURRENTLY and let responses
+ * land out of order. A client that pipelines requests without waiting for
+ * each response (valid per JSON-RPC) could see a `list` complete before
+ * an earlier `create` had actually committed, because the two handlers
+ * were racing instead of running one after another.
+ *
+ * `processLine` (below) never rejects (both its catch blocks terminate
+ * normally rather than re-throwing), so this chain can never get stuck on
+ * a rejected promise.
+ * @param {Record<string, object>} allTools
+ * @param {(msg: string) => void} send
+ * @returns {{ enqueue: (line: string) => void }}
+ */
+export function createLineProcessor(allTools, send) {
+  async function processLine(line) {
     let request;
     try {
       request = JSON.parse(line);
@@ -418,7 +434,27 @@ export function createMCPServer(cms, extraTools = {}, opts = {}) {
         isError: true,
       }));
     }
-  });
+  }
+
+  let queue = Promise.resolve();
+  return {
+    enqueue(line) {
+      queue = queue.then(() => processLine(line));
+    },
+  };
+}
+
+export function createMCPServer(cms, extraTools = {}, opts = {}) {
+  const allTools = buildAllTools(cms, extraTools, opts);
+
+  const rl = createInterface({ input: process.stdin, terminal: false });
+
+  function send(msg) {
+    process.stdout.write(msg + '\n');
+  }
+
+  const processor = createLineProcessor(allTools, send);
+  rl.on('line', (line) => processor.enqueue(line));
 
   rl.on('close', () => {
     cms.shutdown().catch(() => {});
