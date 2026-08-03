@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1120 tests | 0 deps | 27 core modules
+By automators.work | 1127 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -1243,7 +1243,9 @@ engine.create({
   name: 'Notify on publish',
   trigger: { type: 'webhook', config: { path: 'on-publish' } },
   nodes: [
-    { id: 'msg', type: 'text.template', inputs: { template: 'Published: {{_trigger.title}}', data: '{{_trigger}}' } },
+    // text.template's own `data`-driven {{var}} substitution is dead inside a workflow (see below) --
+    // this only works because {{_trigger.title}} is resolved directly by the engine's {{ref}} syntax.
+    { id: 'msg', type: 'text.template', inputs: { template: 'Published: {{_trigger.title}}' } },
     { id: 'send', type: 'slack.send', inputs: { message: '{{msg}}' }, credentials: 'slack' },
   ],
 });
@@ -1257,6 +1259,22 @@ Core: http.request, set.value, filter, merge, wait, wait.until, wait.forWebhook,
 Communication: slack.send, discord.send, email.send
 Data: json.parse, json.stringify, text.template, base64.encode, base64.decode, math.calc, datetime.now
 AI: openai.chat, anthropic.chat
+
+**Referencing a node's output — read `GET /api/workflows/nodes/list`'s `outputs[].note`, not just
+`outputs[].name`.** Most nodes return a bare value (string/number/array/boolean), which `_runLevels`
+never wraps — `{{nodeId}}` IS that value directly; `{{nodeId.<outputName>}}` silently resolves to
+`undefined` (found live: `switch`'s declared `matched` output led to `{{sw.matched}}`, which a `runIf`
+compared against `undefined`, always false, no error). Only nodes that genuinely return a multi-field
+object (`wait.until`, `wait.forWebhook`, `workflow.execute`, `loop.forEach`, `data.table`) have real,
+addressable `.field` sub-references. The 6 API-executor nodes (`http.request`, `slack.send`,
+`discord.send`, `email.send`, `openai.chat`, `anthropic.chat`) are a sharper version of the same trap:
+their executor builds `{ ok, status, data, headers }`, but only `data` (the response body) survives —
+`ok`/`status`/`headers` are genuinely unreachable via any `{{ref}}`, not just misnamed. `text.template`
+has an unrelated trap of its own: its own `{{variable}}` substitution (via `data`) uses the same `{{...}}`
+delimiter as the engine's `{{ref}}` resolution, which always runs first — inside a real workflow, `data`'s
+placeholders never get a chance to substitute (silently blanked to `''`). Reference `{{_trigger.x}}`/
+`{{otherNodeId}}` directly in `template` instead of relying on `data`; `data` only works when the node
+runs standalone via `NodeRegistry.execute()` outside a `WorkflowEngine`.
 
 `code.run` was removed in the 2026-07 security audit: it ran arbitrary JS via `new Function`
 behind a keyword denylist that was trivially bypassable (real RCE, not a sandbox). Register
@@ -2330,6 +2348,38 @@ at/near expiry, forces a refresh and reports whether it actually succeeded. New
 `POST /api/workflows/credentials/:name/test`. Both registered in the `GET /api/schema` catalog. 18 new
 regression tests. Verified: 20 isolated runs of each touched test file and 2 full-suite runs, all
 clean. Also verified live over a real spawned server for both endpoints.
+
+**`outputs` metadata corrected on 20 nodes (2026-08-03, found via a live full system test):** a node's
+declared `outputs[].name` looked like a real, addressable sub-field (`{{nodeId.name}}`), but
+`_runLevels` only unwraps a handler's return value when it's an object with a literal `data` key —
+otherwise the whole return value becomes `{{nodeId}}` directly, no addressable sub-fields at all. Hit
+this firsthand authoring a real workflow: `switch`'s declared `matched` output led to
+`{{sw.matched}}`, silently `undefined` (strings have no `.matched` property), so a `runIf` built on it
+always evaluated false — no error, no warning. 18 bare-value nodes (`if`, `switch`, `filter`, `merge`,
+`set.value`, `json.parse`, `json.stringify`, `text.template`, `base64.encode`/`decode`, `math.calc`,
+`datetime.now`, and the 6 HTTP-executor nodes) gain an additive `note` field (doesn't touch the
+existing `{name, type}` shape) stating the real reference is `{{nodeId}}`. The 6 HTTP-executor nodes
+get a sharper note: their executor actually returns `{ ok, status, data, headers }`, but only `data`
+(the response body) survives the same unwrap — `ok`/`status`/`headers` are genuinely unreachable via
+any template ref, not just misnamed. `workflow.execute`'s outputs previously declared a `result` field
+that never existed; corrected to the real keys (`executionId`, `status`, `nodeResults`). 14 new
+regression tests. Verified: 2 full-suite runs + 20 isolated runs of `nodes.test.js`/`workflow.test.js`,
+all clean. Also verified live: `GET /api/workflows/nodes/list` now surfaces the corrected note.
+
+**`text.template`'s own substitution documented as dead inside a workflow (2026-08-03, found on a
+follow-up live system test):** `text.template`'s own `{{variable}}` substitution (driven by its `data`
+input) and a `WorkflowEngine`'s `{{ref}}` resolution use the identical `{{...}}` delimiter, and
+`_resolveInputs` always resolves every string input — including `template` — before the handler runs.
+Reproduced live: `template: "calc={{n}}, sw={{s}}"` with `data: { n: '{{doubled}}', s: '{{sw}}' }`
+rendered `"calc=, sw="` — both placeholders silently blanked, not an error; `data`'s own substitution
+never gets a chance to run inside a real workflow, only standalone via `NodeRegistry.execute()`.
+Chose documentation over changing the node's own delimiter, to avoid a public-behavior change for that
+standalone use case. Corrected the node's `description` and its `data` input's `note` to state this
+plainly and point at the actual working pattern (`{{_trigger.x}}`/`{{otherNodeId}}` directly in
+`template`); fixed the one example in this file that carried a now-dead `data: '{{_trigger}}'`. 2 new
+regression tests, one of which locks in the documented behavior via a real `engine.run()` (not just
+`NodeRegistry.execute()` standalone). Verified: 2 full-suite runs + 20 isolated runs, all clean. Also
+verified live via `GET /api/workflows/nodes/list`.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
