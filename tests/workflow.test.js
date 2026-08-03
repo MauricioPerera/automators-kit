@@ -922,6 +922,113 @@ describe('Error Workflow', () => {
 // Sub-workflows (workflow.execute node)
 // ---------------------------------------------------------------------------
 
+describe('Data Table node (data.table)', () => {
+  it('find: returns matching docs directly (unwrapped, like every other node)', async () => {
+    db.collection('widgets').insert({ name: 'a', price: 5 });
+    db.collection('widgets').insert({ name: 'b', price: 15 });
+    db.collection('widgets').insert({ name: 'c', price: 25 });
+
+    const wf = engine.create({
+      name: 'Find',
+      nodes: [{ id: 'q', type: 'data.table', inputs: { collection: 'widgets', operation: 'find', filter: { price: { $gt: 10 } }, limit: 1 } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.q.data.length).toBe(1);
+    expect(exec.nodeResults.q.data[0].price).toBe(15);
+  });
+
+  it('find: sort is honored', async () => {
+    db.collection('widgets').insert({ name: 'z', price: 1 });
+    db.collection('widgets').insert({ name: 'a', price: 2 });
+
+    const wf = engine.create({
+      name: 'Sort',
+      nodes: [{ id: 'q', type: 'data.table', inputs: { collection: 'widgets', operation: 'find', sort: { name: 1 } } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.nodeResults.q.data.map(d => d.name)).toEqual(['a', 'z']);
+  });
+
+  it('insert: a single doc, returned directly (unwrapped)', async () => {
+    const wf = engine.create({
+      name: 'Insert',
+      nodes: [{ id: 'i', type: 'data.table', inputs: { collection: 'widgets', operation: 'insert', data: { name: 'new' } } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.i.data.name).toBe('new');
+    expect(db.collection('widgets').findOne({ name: 'new' })).toBeTruthy();
+  });
+
+  it('insert: an array of docs (batch), returned directly', async () => {
+    const wf = engine.create({
+      name: 'InsertBatch',
+      nodes: [{ id: 'i', type: 'data.table', inputs: { collection: 'widgets', operation: 'insert', data: [{ name: 'x' }, { name: 'y' }] } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.nodeResults.i.data.length).toBe(2);
+    expect(db.collection('widgets').count({})).toBe(2);
+  });
+
+  it('update: applies $set to every matching doc, returns count', async () => {
+    db.collection('widgets').insert({ name: 'a', status: 'draft' });
+    db.collection('widgets').insert({ name: 'b', status: 'draft' });
+    db.collection('widgets').insert({ name: 'c', status: 'published' });
+
+    const wf = engine.create({
+      name: 'Update',
+      nodes: [{ id: 'u', type: 'data.table', inputs: { collection: 'widgets', operation: 'update', filter: { status: 'draft' }, data: { status: 'published' } } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.nodeResults.u.data.count).toBe(2);
+    expect(db.collection('widgets').count({ status: 'published' })).toBe(3);
+  });
+
+  it('delete: removes every matching doc, returns count', async () => {
+    db.collection('widgets').insert({ name: 'a', archived: true });
+    db.collection('widgets').insert({ name: 'b', archived: true });
+    db.collection('widgets').insert({ name: 'c', archived: false });
+
+    const wf = engine.create({
+      name: 'Delete',
+      nodes: [{ id: 'd', type: 'data.table', inputs: { collection: 'widgets', operation: 'delete', filter: { archived: true } } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.nodeResults.d.data.count).toBe(2);
+    expect(db.collection('widgets').count({})).toBe(1);
+  });
+
+  it('count: returns the count without fetching docs', async () => {
+    db.collection('widgets').insert({ name: 'a', tag: 'x' });
+    db.collection('widgets').insert({ name: 'b', tag: 'x' });
+    db.collection('widgets').insert({ name: 'c', tag: 'y' });
+
+    const wf = engine.create({
+      name: 'Count',
+      nodes: [{ id: 'c', type: 'data.table', inputs: { collection: 'widgets', operation: 'count', filter: { tag: 'x' } } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.nodeResults.c.data.count).toBe(2);
+  });
+
+  it('rejects an unknown operation with a specific error', async () => {
+    const wf = engine.create({
+      name: 'BadOp',
+      nodes: [{ id: 'x', type: 'data.table', inputs: { collection: 'widgets', operation: 'wipe' } }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('failed');
+    expect(exec.errors.x).toContain("unknown operation 'wipe'");
+  });
+
+  it('is listed in GET-equivalent node registry lookup with its declared shape', () => {
+    const def = engine.nodes.get('data.table');
+    expect(def.category).toBe('core');
+    expect(def.inputs.some(i => i.name === 'operation' && i.required)).toBe(true);
+  });
+});
+
 describe('Sub-workflows (workflow.execute node)', () => {
   beforeEach(() => {
     engine.nodes.add({

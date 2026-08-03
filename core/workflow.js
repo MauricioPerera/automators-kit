@@ -237,6 +237,91 @@ export class WorkflowEngine {
       },
     });
 
+    // 'data.table' node -- registered here (not in core/nodes.js's
+    // engine-agnostic BUILTIN_NODES) because it needs live DB access, same
+    // structural reason 'workflow.execute'/'loop.forEach' above need a live
+    // engine. Reads/writes any DB collection directly -- the same data
+    // exposed via GET/POST/PUT/DELETE /api/db/:col -- without a workflow
+    // having to loop back through its own HTTP API (an http.request node
+    // hitting /api/db/:col) just to touch a "data table" from within a run.
+    // Mirrors that route's filter/sort/limit/offset shape and $-operator
+    // filter convention (e.g. { field: { $gt: 5 } }) so the two stay
+    // interchangeable in how a caller thinks about querying a collection.
+    this._nodeRegistry.add({
+      type: 'data.table',
+      name: 'Data Table',
+      category: 'core',
+      description: 'Read or write a DB collection (find/insert/update/delete/count) -- the same data exposed at /api/db/:col',
+      inputs: [
+        { name: 'collection', type: 'string', required: true },
+        { name: 'operation', type: 'string', required: true }, // find | insert | update | delete | count
+        { name: 'filter', type: 'object', default: {} }, // find/update/delete/count
+        { name: 'sort', type: 'object' }, // find, e.g. { createdAt: -1 }
+        { name: 'limit', type: 'number', default: 50 }, // find, capped at 500
+        { name: 'offset', type: 'number', default: 0 }, // find
+        { name: 'data', type: 'any' }, // insert: a doc or array of docs. update: fields to $set
+      ],
+      // Output shape depends on operation:
+      //  - find/insert: `{ data }` -- a `data` key on a handler's return
+      //    value is unwrapped by _runLevels (same convention every other
+      //    node relies on for {{nodeId}} to resolve directly to the useful
+      //    payload, not {{nodeId.data}}), so {{nodeId}} IS the doc/array.
+      //    Deliberately does NOT also return total/limit/offset/hasMore for
+      //    'find' -- those would be silently discarded by that same
+      //    unwrap (only the `data` key survives), which would be a worse
+      //    trap than just not offering them; use operation: 'count' for a
+      //    total.
+      //  - update/delete/count: `{ count }`, no `data` key -- the unwrap
+      //    only triggers when `result.data !== undefined`, so this object
+      //    survives intact and {{nodeId.count}} works as expected.
+      outputs: [
+        { name: 'data', type: 'any' },
+        { name: 'count', type: 'number' },
+      ],
+      handler: async (inputs) => {
+        const collection = inputs.collection;
+        if (!collection) throw new Error("data.table: 'collection' is required");
+        const col = this.db.collection(collection);
+        const filter = inputs.filter || {};
+
+        switch (inputs.operation) {
+          case 'find': {
+            let cursor = col.find(filter);
+            if (inputs.sort) cursor = cursor.sort(inputs.sort);
+            const limit = Math.min(inputs.limit ?? 50, 500);
+            const offset = inputs.offset || 0;
+            const data = cursor.skip(offset).limit(limit).toArray();
+            return { data };
+          }
+          case 'insert': {
+            if (Array.isArray(inputs.data)) {
+              const docs = inputs.data.map((d) => col.insert(d));
+              this.db.flush();
+              return { data: docs };
+            }
+            const doc = col.insert(inputs.data || {});
+            this.db.flush();
+            return { data: doc };
+          }
+          case 'update': {
+            const count = col.updateMany(filter, { $set: inputs.data || {} });
+            this.db.flush();
+            return { count };
+          }
+          case 'delete': {
+            const count = col.removeMany(filter);
+            this.db.flush();
+            return { count };
+          }
+          case 'count': {
+            return { count: col.count(filter) };
+          }
+          default:
+            throw new Error(`data.table: unknown operation '${inputs.operation}' -- expected one of: find, insert, update, delete, count`);
+        }
+      },
+    });
+
     // Trigger manager
     this._triggers = new TriggerManager({
       onTrigger: (workflowId, triggerData) => {
