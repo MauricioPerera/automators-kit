@@ -1015,6 +1015,70 @@ describe('Projects', () => {
       const res = await app.handle(req('GET', '/api/workflows/does-not-exist', null, adminToken));
       expect(res.status).toBe(404);
     });
+
+    // BUG 1 + BUG 2 (2026-08-03, found by a second independent audit right
+    // after H2 shipped): H2 gated GET /:id and POST /:id/run but left
+    // toggle and execution-history routes open to any authenticated user.
+    it('a non-member gets 403 on toggle (BUG 1) -- can\'t read the workflow, but used to be able to flip its active state anyway', async () => {
+      const { workflow } = await makeProjectWorkflow();
+      const res = await app.handle(req('POST', `/api/workflows/${workflow._id}/toggle`, {}, memberToken));
+      expect(res.status).toBe(403);
+      expect((await json(res)).error).toContain('editor');
+    });
+
+    it('a project viewer CAN toggle is false -- toggle requires editor+, same bar as run', async () => {
+      const { project, workflow } = await makeProjectWorkflow();
+      await app.handle(req('POST', `/api/projects/${project._id}/members`, { userId: memberId, role: 'viewer' }, adminToken));
+      const res = await app.handle(req('POST', `/api/workflows/${workflow._id}/toggle`, {}, memberToken));
+      expect(res.status).toBe(403);
+    });
+
+    it('a project editor CAN toggle', async () => {
+      const { project, workflow } = await makeProjectWorkflow();
+      await app.handle(req('POST', `/api/projects/${project._id}/members`, { userId: memberId, role: 'editor' }, adminToken));
+      const res = await app.handle(req('POST', `/api/workflows/${workflow._id}/toggle`, {}, memberToken));
+      expect(res.status).toBe(200);
+    });
+
+    it('a non-member gets 403 on both execution-history routes (BUG 2) -- can\'t read the definition, but used to be able to read real processed data anyway', async () => {
+      const { workflow } = await makeProjectWorkflow();
+      const runRes = await app.handle(req('POST', `/api/workflows/${workflow._id}/run`, {}, adminToken));
+      const execId = (await json(runRes)).execution._id;
+
+      const listRes = await app.handle(req('GET', `/api/workflows/${workflow._id}/executions`, null, memberToken));
+      expect(listRes.status).toBe(403);
+
+      const oneRes = await app.handle(req('GET', `/api/workflows/executions/${execId}`, null, memberToken));
+      expect(oneRes.status).toBe(403);
+      expect((await json(oneRes)).error).toContain(execId);
+    });
+
+    it('a project viewer CAN read both execution-history routes -- viewer+, same bar as GET /:id', async () => {
+      const { project, workflow } = await makeProjectWorkflow();
+      const runRes = await app.handle(req('POST', `/api/workflows/${workflow._id}/run`, {}, adminToken));
+      const execId = (await json(runRes)).execution._id;
+      await app.handle(req('POST', `/api/projects/${project._id}/members`, { userId: memberId, role: 'viewer' }, adminToken));
+
+      expect((await app.handle(req('GET', `/api/workflows/${workflow._id}/executions`, null, memberToken))).status).toBe(200);
+      expect((await app.handle(req('GET', `/api/workflows/executions/${execId}`, null, memberToken))).status).toBe(200);
+    });
+
+    it('an unassigned workflow\'s toggle/executions stay open to any authenticated user -- unchanged, not a regression', async () => {
+      const { workflow } = await json(await app.handle(req('POST', '/api/workflows', {
+        name: 'Unassigned WF2', nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }],
+      }, adminToken)));
+      const runRes = await app.handle(req('POST', `/api/workflows/${workflow._id}/run`, {}, adminToken));
+      const execId = (await json(runRes)).execution._id;
+
+      expect((await app.handle(req('POST', `/api/workflows/${workflow._id}/toggle`, {}, memberToken))).status).toBe(200);
+      expect((await app.handle(req('GET', `/api/workflows/${workflow._id}/executions`, null, memberToken))).status).toBe(200);
+      expect((await app.handle(req('GET', `/api/workflows/executions/${execId}`, null, memberToken))).status).toBe(200);
+    });
+
+    it('GET /executions/:execId for a genuinely nonexistent execution still 404s', async () => {
+      const res = await app.handle(req('GET', '/api/workflows/executions/does-not-exist', null, adminToken));
+      expect(res.status).toBe(404);
+    });
   });
 });
 

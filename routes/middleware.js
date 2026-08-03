@@ -136,3 +136,47 @@ export function requireWorkflowProjectRole(engine, projectManager, minRole) {
     return next();
   };
 }
+
+/**
+ * Same idea as requireWorkflowProjectRole, but for a route whose `:execId`
+ * param is an EXECUTION id (`routes/workflows.js`'s `GET
+ * /executions/:execId`) -- resolves the execution, then its owning
+ * workflow, then gates on THAT workflow's `projectId`.
+ *
+ * SECURITY (2026-08-03, found by a second independent audit right after
+ * H2 shipped): H2 gated a workflow's DEFINITION (`GET /:id`) but not its
+ * EXECUTION HISTORY -- `GET /:id/executions` (still uses
+ * requireWorkflowProjectRole, see below) and this route both let any
+ * authenticated user read a project-owned workflow's `nodeResults`
+ * (real data the workflow processed, often more sensitive than the
+ * definition itself) despite having no project membership. `routes/
+ * workflows.js`'s own doc comments already called this out as a known,
+ * un-bundled follow-up to H2; this closes it.
+ *
+ * If the execution's owning workflow no longer exists (deleted), or was
+ * never assigned to a project, there's nothing to gate against -- same
+ * "project scoping is additive" fallback as requireWorkflowProjectRole.
+ * @param {import('../core/workflow.js').WorkflowEngine} engine
+ * @param {import('../core/projects.js').ProjectManager} projectManager
+ * @param {'owner'|'editor'|'viewer'} minRole
+ */
+export function requireExecutionProjectRole(engine, projectManager, minRole) {
+  return async (ctx, next) => {
+    const user = ctx.state.user;
+    if (!user) return error('Authorization required', 401);
+
+    const exec = engine.getExecution(ctx.params.execId);
+    if (!exec) return error('Execution not found', 404);
+    ctx.state.execution = exec;
+
+    const wf = engine.get(exec.workflowId);
+    if (!wf || !wf.projectId) return next();
+
+    if (!projectManager.hasProjectRole(wf.projectId, user._id, minRole)) {
+      const actual = projectManager.getMemberRole(wf.projectId, user._id);
+      const have = actual ? `'${actual}'` : 'no membership';
+      return error(`Insufficient project permissions: execution '${ctx.params.execId}' belongs to workflow '${exec.workflowId}' in project '${wf.projectId}', requires '${minRole}' or higher, you have ${have}`, 403);
+    }
+    return next();
+  };
+}

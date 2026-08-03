@@ -5,7 +5,7 @@
 
 import { Router, json, error } from '../core/http.js';
 import { validateBody } from '../core/validate.js';
-import { createAuth, requireRole, requireWorkflowProjectRole } from './middleware.js';
+import { createAuth, requireRole, requireWorkflowProjectRole, requireExecutionProjectRole } from './middleware.js';
 import { validateWorkflowDefinition } from '../core/workflow.js';
 
 export const CreateSchema = {
@@ -93,7 +93,13 @@ export function workflowRoutes(cms, engine, projectManager) {
     return json({ deleted: true });
   });
 
-  r.post('/:id/toggle', auth, async (ctx) => {
+  // SECURITY (2026-08-03, BUG 1 from a second independent audit right
+  // after H2 shipped): H2 gated read/run but left toggle open to any
+  // authenticated user -- a non-member could flip a project-owned
+  // workflow's active state (controlling whether its triggers fire) even
+  // though the SAME user got 403 just reading that workflow. editor+,
+  // matching run's bar (a real state-changing action, not a read).
+  r.post('/:id/toggle', auth, requireWorkflowProjectRole(engine, projectManager, 'editor'), async (ctx) => {
     try {
       const wf = engine.toggle(ctx.params.id);
       return json({ workflow: wf });
@@ -118,15 +124,18 @@ export function workflowRoutes(cms, engine, projectManager) {
     }
   });
 
-  r.get('/:id/executions', auth, async (ctx) => {
+  // SECURITY (2026-08-03, BUG 2 from a second independent audit): a
+  // workflow's execution history holds real nodeResults -- the actual
+  // data it processed, often more sensitive than the definition itself --
+  // so it needs the same project gate GET /:id already has, not just
+  // read-vs-write parity with it. viewer+, matching GET /:id's own bar.
+  r.get('/:id/executions', auth, requireWorkflowProjectRole(engine, projectManager, 'viewer'), async (ctx) => {
     const limit = parseInt(ctx.query.limit) || 50;
     return json({ executions: engine.getExecutions(ctx.params.id, limit, { status: ctx.query.status }) });
   });
 
-  r.get('/executions/:execId', auth, async (ctx) => {
-    const exec = engine.getExecution(ctx.params.execId);
-    if (!exec) return error('Execution not found', 404);
-    return json({ execution: exec });
+  r.get('/executions/:execId', auth, requireExecutionProjectRole(engine, projectManager, 'viewer'), async (ctx) => {
+    return json({ execution: ctx.state.execution });
   });
 
   // Retries a failed execution from the DAG level where it failed instead
