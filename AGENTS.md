@@ -1,14 +1,14 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1181 tests | 0 deps | 27 core modules
+By automators.work | 1207 tests | 0 deps | 27 core modules
 
 ## Architecture
 
 ```
 Core (27 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
 
-db.js              Document DB: MongoDB queries, indices, JWT auth, AES-256-GCM encryption
+db.js              Document DB: MongoDB queries, indices, JWT auth, AES-256-GCM encryption, long-lived API keys
 vector.js          Vector DB: Float32/Int8/Polar3bit/Binary, IVF, Matryoshka, BM25
 hnsw.js            HNSW index: O(log n) approximate nearest neighbor search
 http.js            HTTP router: Request/Response, middleware, params, sub-routers, CORS
@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry, optional execution queue for horizontal scaling
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry, persistent per-workflow scratch space (workflow.staticData), optional execution queue for horizontal scaling
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -1149,6 +1149,31 @@ bun cli.js seed --file seed.json
 - POST /api/auth/register - { email, password, name }
 - POST /api/auth/login - { email, password } returns { token, user }
 - GET /api/auth/me - Bearer token
+- POST /api/auth/api-keys - { name } (Bearer required) -- create a long-lived API key; see "API Keys" below
+- GET /api/auth/api-keys - list the caller's own keys (metadata only)
+- DELETE /api/auth/api-keys/:id - revoke one of the caller's own keys
+
+### API Keys
+
+Long-lived tokens for programmatic/CI callers that shouldn't have to hold a user's password. `Auth.
+createApiKey(userId, name)` (`core/db.js`) generates one and returns the raw key ONCE (`akit_...` --
+only its SHA-256 hash is ever persisted, in a new `_api_keys` collection). Pass it exactly where a JWT
+goes -- `Authorization: Bearer akit_...` -- `Auth.verify()` accepts either transparently, resolving to
+the same `{ sub: userId, ... }` shape, so every existing auth-middleware caller (routes, project-role
+gates, etc.) works completely unchanged regardless of which kind of token it received.
+
+Not session-backed: no expiry, no `_sessions` row -- revocation is deletion
+(`DELETE /api/auth/api-keys/:id`, an owner-only operation; refuses another user's key with a 404,
+matching the existing "don't confirm existence" convention). A key's effective permissions are
+resolved live from its owning user at request time (`sub` -> `findById` -> current `role`), not a
+snapshot frozen at creation -- promoting or demoting the user immediately changes what an
+already-issued key can do, same as it would for that user's own login session.
+
+```javascript
+const created = await cms.users.createApiKey(userId, 'CI pipeline');
+// created.key === 'akit_...' -- shown ONCE, never retrievable again
+// created.id/.prefix/.name/.createdAt -- safe to log/display
+```
 
 ### Content Types
 - GET/POST/PUT/DELETE /api/content-types[/:slug]
@@ -1543,6 +1568,26 @@ entry (nodes from earlier levels are **not** re-run). Only the failed level's ow
 cleared — an unrelated `continueOnError` error recorded in an earlier level is preserved, not wiped.
 `POST /api/workflows/executions/:execId/retry` — 404 if the execution doesn't exist, 400 if its status
 isn't `'failed'`.
+
+### Workflow Static Data
+
+A small JSON scratch space tied to a workflow, persisted on its own document (`staticData`, default
+`{}`), surviving across executions — e.g. a poll trigger's own dedup cursor, without needing a
+separate `data.table` row. Deliberately NOT reachable through `create()`/`update()`'s field whitelist
+(same pattern `errorWorkflow`/`projectId` follow for other engine-managed fields) — this is
+engine/node-managed runtime state, not a user-editable workflow property.
+
+```javascript
+engine.getStaticData(wf._id);              // {} by default
+engine.setStaticData(wf._id, { cursor: 1 }); // replaces entirely
+engine.mergeStaticData(wf._id, { seen: [] }); // shallow-merges into existing
+```
+
+Also reachable from inside a run via the `workflow.staticData` node (`action: 'get'|'set'|'merge'`,
+`data` for set/merge) — it always operates on the CURRENTLY executing workflow (resolved from the
+node's own call-chain context, no id input needed, so it can't accidentally target another workflow).
+Last-write-wins, no locking — same concurrency guarantee an in-process single-writer trigger/node
+already has in practice, matching n8n's own equivalent (`getWorkflowStaticData`).
 
 ### Triggers
 - manual: `engine.run(id, data)`
@@ -2440,9 +2485,30 @@ design). 9 new regression tests. Verified: 2 full-suite runs + 20 isolated runs 
 all clean. Also verified live end-to-end over a real spawned server: webhook → enqueue → queue
 processes → real execution recorded with the correct trigger data.
 
+**Workflow static data + API keys (2026-08-03):** two more gaps closed from re-reasoning about what a
+real n8n-self-hosted alternative needs on the execution/roles pillars. (1) Workflows had no persistent
+scratch space across executions — n8n's `getWorkflowStaticData` equivalent — useful for a poll
+trigger's own dedup cursor without a `data.table` row. New `WorkflowEngine.getStaticData`/
+`setStaticData`/`mergeStaticData`, stored on the workflow document's `staticData` field (default `{}`,
+deliberately outside `create()`/`update()`'s field whitelist — engine/node-managed, not user-editable),
+plus a new `workflow.staticData` node (`get`/`set`/`merge`) that always operates on the currently
+executing workflow, resolved from the node's own call-chain context (`ctx.callChain`'s last entry is
+always the current workflow id, root-triggered or not — no new plumbing needed, `execute()` already
+threads it through for `workflow.execute`'s cycle detection). (2) Auth had no way to issue a token for a
+script/CI caller without it holding a real user's password — new `Auth.createApiKey`/`listApiKeys`/
+`revokeApiKey` (`core/db.js`), long-lived `akit_...` tokens (only their SHA-256 hash persisted, raw key
+shown once), accepted by `verify()` transparently alongside JWTs (same `{ sub, ... }` shape) so every
+existing auth-middleware caller works unchanged. New routes `POST`/`GET`/`DELETE /api/auth/api-keys`,
+registered in the `GET /api/schema` catalog. 22 new regression tests (both features). Verified: 2
+full-suite runs + 20 isolated runs of `db.test.js`/`workflow.test.js`/`integration.test.js`, all clean.
+Also verified live over a real spawned server: an API key authenticates a real request exactly like a
+JWT, a revoked key is rejected, and `workflow.staticData`'s merge survives across two separate real
+executions of the same workflow.
+
 Current posture:
-- JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
+- JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
 - AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
+- Workflow credential-vault master key: random per-instance unless `opts.secret` is configured explicitly, via `createApp()` or `WorkflowEngine` directly (no hardcoded fallback either way)
 - Timing-safe password comparison (byte-level XOR)
 - Credential vault with encrypted storage, random per-installation PBKDF2 salt
 - SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions, plus a real, enforced HTTP header for webhook secrets
@@ -2457,12 +2523,15 @@ Current posture:
 
 ## Known Security Gaps (all resolved)
 
-Found across two rounds of independent, no-prior-context audits (fresh GLM instances given only the repo
-+ this file, no knowledge of any work done in the session that built the features around them — the second
-round, right after H1/H2 shipped, also had no knowledge those fixes had just landed), then independently
-re-verified against the source by the session that requested each audit — every item confirmed by reading
-the exact code paths, not taken on the auditor's word alone. Documented first, on request, before any code
-change each time; all fixed shortly after in separate, explicitly-requested passes.
+Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
+the repo + this file, no knowledge of any work done in the session that built the features around them —
+the second round, right after H1/H2 shipped, also had no knowledge those fixes had just landed), then
+independently re-verified against the source by the session that requested each audit — every item
+confirmed by reading the exact code paths, not taken on the auditor's word alone. Item 6 found a different
+way: this session's own audit-summary claims (the "3 full security audits" list in README.md's Security
+section) were spot-checked against current source rather than trusted at face value, and one no longer
+held. Documented first, on request, before any code change each time; all fixed shortly after in separate,
+explicitly-requested passes.
 
 1. **RESOLVED (2026-08-03).** Unauthenticated privilege escalation via registration. `POST
    /api/auth/register`'s `RegisterSchema` (`routes/auth.js`) allowed the caller to set `role` to any of
@@ -2533,10 +2602,31 @@ change each time; all fixed shortly after in separate, explicitly-requested pass
    tests. Verified: 2 full-suite runs + 20 isolated runs of `mcp.test.js`, all clean. Also verified live
    over a real spawned MCP stdio subprocess sending pipelined requests, confirming out-of-order responses
    before the fix and strictly in-order responses after.
+6. **RESOLVED (2026-08-03).** Predictable default workflow credential-vault master key. README's own
+   Security section claimed "replaced predictable default secrets (CMS JWT, workflow vault key,
+   credential-vault PBKDF2 salt) with per-instance random values" (FIX-13 and follow-ups) — true for the
+   CMS JWT secret (`core/cms.js`'s `_generateRandomSecret()`, tested) and the PBKDF2 salt
+   (`core/credentials.js`'s per-install random salt), but NOT true for the workflow vault key reached
+   through `createApp()` (`index.js`), the documented main entry point. `WorkflowEngine` itself already
+   falls back to a correct, random `_generateMasterKey()` when `opts.masterKey` is omitted (tested in
+   "Security: masterKey default (FIX-23 #1)" above) — but `createApp()` pre-empted that safe fallback with
+   `masterKey: opts.secret || 'akit-dev-secret'`. Any `createApp()` instance without an explicit
+   `opts.secret` (documented as fine — the CMS JWT secret alone correctly randomizes in that case) got the
+   literal string `'akit-dev-secret'` as its vault key instead — the SAME hardcoded string FIX-13 already
+   named and banned for the CMS JWT secret specifically for being public in source, reintroduced here for
+   a different purpose. Verified live before the fix: two separate no-secret `createApp()` instances had
+   `IDENTICAL` `workflowEngine.vault._masterKey === 'akit-dev-secret'` — any credential encrypted under it
+   (OAuth2 tokens, connector secrets) was trivially decryptable by anyone with the source, not just the
+   instance that stored it. Fixed: `index.js` now passes `opts.secret` through as-is (`undefined` when
+   omitted), letting `WorkflowEngine`'s own already-correct fallback apply; an explicit `opts.secret` is
+   still used as the vault key unchanged (intentional, pre-existing behavior, not part of the bug). 4 new
+   regression tests. Verified: 2 full-suite runs + 20 isolated runs of `integration.test.js`, all clean.
+   Also verified live: two no-secret instances now get distinct random keys, and an explicit `opts.secret`
+   still works as before.
 
-Items 1-4 verified: 2 full-suite runs + 20 isolated runs of `integration.test.js` each, all clean. Also
-verified live over real spawned servers, each reproducing the exact exploit before the fix and confirming
-it's blocked after. Item 5 verified separately as described above.
+Items 1-4 and 6 verified: 2 full-suite runs + 20 isolated runs of `integration.test.js` each, all clean.
+Also verified live over real spawned servers/instances, each reproducing the exact exploit before the fix
+and confirming it's blocked after. Item 5 verified separately as described above (its own test file).
 
 ## Known Agent-UX Friction Points
 
