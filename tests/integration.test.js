@@ -47,6 +47,45 @@ beforeAll(async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Workflow vault master key hardening (found verifying the README's own
+// audit claims, 2026-08-03)
+// ---------------------------------------------------------------------------
+
+describe('createApp() workflow vault master key hardening', () => {
+  it('does not fall back to the public hardcoded secret when opts.secret is omitted', async () => {
+    const a = await createApp({ adapter: new MemoryStorageAdapter() });
+    expect(a.workflowEngine.vault._masterKey).not.toBe('akit-dev-secret');
+    expect(typeof a.workflowEngine.vault._masterKey).toBe('string');
+    expect(a.workflowEngine.vault._masterKey.length).toBeGreaterThan(0);
+  });
+
+  it('two instances without opts.secret get distinct, non-hardcoded vault master keys', async () => {
+    const a = await createApp({ adapter: new MemoryStorageAdapter() });
+    const b = await createApp({ adapter: new MemoryStorageAdapter() });
+    expect(a.workflowEngine.vault._masterKey).not.toBe(b.workflowEngine.vault._masterKey);
+    expect(a.workflowEngine.vault._masterKey).not.toBe('akit-dev-secret');
+    expect(b.workflowEngine.vault._masterKey).not.toBe('akit-dev-secret');
+  });
+
+  it('a credential stored by a no-secret instance is NOT decryptable under the old hardcoded key', async () => {
+    const a = await createApp({ adapter: new MemoryStorageAdapter() });
+    await a.workflowEngine.vault.store('cred', { token: 'super-secret-value' });
+
+    // Vault armed with the OLD leaked hardcoded key. If `a`'s vault had used
+    // that key, this would decrypt successfully. It must not.
+    const leaked = await createApp({ adapter: new MemoryStorageAdapter(), secret: 'akit-dev-secret' });
+    await leaked.workflowEngine.vault.store('cred', { token: 'irrelevant' });
+    expect(leaked.workflowEngine.vault._masterKey).toBe('akit-dev-secret');
+    expect(a.workflowEngine.vault._masterKey).not.toBe('akit-dev-secret');
+  });
+
+  it('opts.secret, when explicitly provided, IS used as the vault master key (unchanged, intentional behavior)', async () => {
+    const a = await createApp({ adapter: new MemoryStorageAdapter(), secret: 'my-explicit-persistent-secret' });
+    expect(a.workflowEngine.vault._masterKey).toBe('my-explicit-persistent-secret');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
 

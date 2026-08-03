@@ -88,7 +88,12 @@ via the standard tools/list method.`;
  *
  * @param {object} opts
  * @param {object} opts.adapter - Storage adapter (FileStorageAdapter, MemoryStorageAdapter, etc.)
- * @param {string} opts.secret - JWT secret key
+ * @param {string} [opts.secret] - JWT secret key. Also doubles as the
+ *   workflow engine's credential-vault master key (see WorkflowEngine's own
+ *   `opts.masterKey` doc comment, core/workflow.js). If omitted, both fall
+ *   back to their own cryptographically random per-instance value -- tokens
+ *   and encrypted credentials will NOT survive a process restart in that
+ *   case. Production should always set an explicit, persistent `opts.secret`.
  * @param {number} opts.tokenExpiry - Token expiry in seconds
  * @param {object} opts.plugins - Plugin config: { plugins: [...] }
  * @param {boolean} opts.cors - Enable CORS (default: true)
@@ -149,7 +154,22 @@ export async function createApp(opts = {}) {
 
   // Workflow engine (n8n-style)
   const workflowEngine = new WorkflowEngine(cms.db, {
-    masterKey: opts.secret || 'akit-dev-secret',
+    // SECURITY (2026-08-03, found verifying the README's own audit claims):
+    // this used to fall back to the literal string 'akit-dev-secret' when
+    // opts.secret was omitted -- the exact same hardcoded default FIX-13
+    // (core/cms.js, see _generateRandomSecret's doc comment) already
+    // banned for the CMS JWT secret for being public in source, reintroduced
+    // here for the credential vault's master key. Any two createApp()
+    // instances without an explicit opts.secret ended up with the IDENTICAL,
+    // publicly-known vault key -- every credential encrypted under it
+    // (OAuth2 tokens, connector secrets) was trivially decryptable by
+    // anyone with the source, not just the instance that stored it. Passing
+    // `opts.secret` through as-is (undefined when omitted) lets
+    // WorkflowEngine's own constructor fall back to its already-correct,
+    // already-tested `_generateMasterKey()` (see
+    // "Security: masterKey default (FIX-23 #1)" in tests/workflow.test.js)
+    // instead of being pre-empted by this hardcoded string.
+    masterKey: opts.secret,
     // Optional: a core/queue.js JobQueue or integrations/postgres-queue.js
     // PostgresJobQueue instance, for distributing triggered/error-workflow
     // execution across worker processes. Unset by default -- everything
