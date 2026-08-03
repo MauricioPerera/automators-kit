@@ -163,7 +163,17 @@ export class WorkflowEngine {
         { name: 'workflowId', type: 'string', required: true },
         { name: 'data', type: 'object' }, // becomes the sub-workflow's {{_trigger...}}
       ],
-      outputs: [{ name: 'result', type: 'object' }],
+      // Found live (2026-08-03 full system test): this used to declare a
+      // single `result` output field, but the handler below returns
+      // { executionId, status, nodeResults } directly (no `data` key, so
+      // _runLevels' unwrap doesn't apply and the whole object survives as
+      // {{nodeId}}) -- there never was a `.result` field to reference.
+      // Listing the real keys here instead of a wrong placeholder one.
+      outputs: [
+        { name: 'executionId', type: 'string' },
+        { name: 'status', type: 'string' },
+        { name: 'nodeResults', type: 'object' },
+      ],
       handler: async (inputs, _credentials, ctx) => {
         const subTriggerData = {
           trigger: 'workflow',

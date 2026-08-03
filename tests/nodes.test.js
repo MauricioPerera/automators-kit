@@ -169,3 +169,54 @@ describe('NodeRegistry', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// outputs[].note -- corrected metadata (found live 2026-08-03: a node's
+// declared output field name looked like a real {{nodeId.name}} sub-field,
+// but most handlers return a bare value that _runLevels never wraps, so the
+// name was pure fiction -- {{switchId.matched}} silently resolved to
+// undefined and a runIf built on it always evaluated false).
+// ---------------------------------------------------------------------------
+
+describe('BUILTIN_NODES outputs metadata', () => {
+  const BARE_VALUE_NODE_TYPES = [
+    'set.value', 'filter', 'merge', 'if', 'switch',
+    'json.parse', 'json.stringify', 'text.template',
+    'base64.encode', 'base64.decode', 'math.calc', 'datetime.now',
+  ];
+  const API_NODE_TYPES = ['http.request', 'slack.send', 'discord.send', 'email.send', 'openai.chat', 'anthropic.chat'];
+
+  it('every bare-value node documents {{nodeId}} as the real reference, not {{nodeId.<name>}}', () => {
+    for (const type of BARE_VALUE_NODE_TYPES) {
+      const node = BUILTIN_NODES.find(n => n.type === type);
+      expect(node).toBeTruthy();
+      const output = node.outputs[0];
+      expect(output.note).toBeTruthy();
+      expect(output.note).toContain('{{nodeId}}');
+      expect(output.note).toContain(`{{nodeId.${output.name}}}`);
+    }
+  });
+
+  it("switch specifically documents the exact live-found gotcha ({{sw.matched}} silently resolving to undefined)", () => {
+    const node = BUILTIN_NODES.find(n => n.type === 'switch');
+    expect(node.outputs[0].name).toBe('matched');
+    expect(node.outputs[0].note).toContain('{{nodeId.matched}}');
+  });
+
+  it('every API-based node documents that ok/status/headers are unreachable -- only the response body survives as {{nodeId}}', () => {
+    for (const type of API_NODE_TYPES) {
+      const node = BUILTIN_NODES.find(n => n.type === type);
+      expect(node).toBeTruthy();
+      const output = node.outputs[0];
+      expect(output.note).toContain('ok, status, data, headers');
+      expect(output.note).toContain('{{nodeId}}');
+    }
+  });
+
+  it('wait.until and wait.forWebhook are genuinely correct as declared -- no note needed, their outputs are real object keys', () => {
+    const waitUntil = BUILTIN_NODES.find(n => n.type === 'wait.until');
+    expect(waitUntil.outputs).toEqual([{ name: 'resumeAt', type: 'number' }]);
+    const waitForWebhook = BUILTIN_NODES.find(n => n.type === 'wait.forWebhook');
+    expect(waitForWebhook.outputs.every(o => !o.note)).toBe(true);
+  });
+});

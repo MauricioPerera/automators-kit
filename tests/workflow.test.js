@@ -1030,6 +1030,12 @@ describe('Data Table node (data.table)', () => {
 });
 
 describe('Sub-workflows (workflow.execute node)', () => {
+  it("declares its real output fields (executionId/status/nodeResults) -- not the old wrong 'result' placeholder", () => {
+    const def = engine.nodes.get('workflow.execute');
+    expect(def.outputs.map(o => o.name)).toEqual(['executionId', 'status', 'nodeResults']);
+    expect(def.outputs.some(o => o.name === 'result')).toBe(false);
+  });
+
   beforeEach(() => {
     engine.nodes.add({
       type: 'test.boom',

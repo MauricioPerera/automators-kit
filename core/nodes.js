@@ -221,6 +221,42 @@ function resolveObj(obj, inputs, creds) {
  * @property {Function} [handler] - Custom handler (overrides API call)
  */
 
+/**
+ * Found live (2026-08-03 full system test): a node's `outputs[].name` looks
+ * like a real, addressable sub-field (`{{nodeId.name}}`), but `_runLevels`
+ * (core/workflow.js) only unwraps a handler's return value when it is an
+ * object with a literal `data` key -- otherwise the WHOLE return value
+ * becomes `{{nodeId}}` directly, with no addressable sub-fields at all. Most
+ * built-in nodes return a bare scalar/array/string (never an object keyed by
+ * their declared output name), so `{{nodeId.<outputName>}}` silently
+ * resolves to `undefined` instead of throwing -- exactly what happened live
+ * with `switch`'s `{{nodeId.matched}}` and a `runIf` that quietly always
+ * evaluated false. `outputName`/`type` are kept as human-readable
+ * documentation of WHAT the value conceptually is; `note` (additive, not
+ * part of the original `{name, type}` shape, so nothing consuming just
+ * those two fields breaks) states the one fact that actually matters for
+ * templating it correctly.
+ */
+const BARE_VALUE_NOTE = (outputName) =>
+  `Bare value -- reference this node's output directly as {{nodeId}}, NOT {{nodeId.${outputName}}}. ` +
+  `The handler does not return an object with a "${outputName}" key; "${outputName}" here just names ` +
+  'what the value conceptually is.';
+
+/**
+ * The 6 built-in nodes below (http.request/slack.send/discord.send/
+ * email.send/openai.chat/anthropic.chat) have no explicit `handler` --
+ * NodeRegistry.execute() falls through to `_executeApi()`, which returns
+ * `{ ok, status, data, headers }`. Because that object HAS a `data` key,
+ * `_runLevels`'s unwrap applies: only `data` (the parsed JSON body, or raw
+ * text) survives as `{{nodeId}}`. `ok`/`status`/`headers` are computed but
+ * genuinely UNREACHABLE via any template reference -- not hidden behind a
+ * different path, actually discarded every time.
+ */
+const API_OUTPUT_NOTE =
+  'The response BODY becomes {{nodeId}} directly (parsed JSON, or raw text) -- {{nodeId.<name>}} does not ' +
+  'work. The { ok, status, data, headers } object this node\'s executor actually builds is not reachable via ' +
+  'template refs; only "data" (the body) survives the engine\'s data-key unwrap.';
+
 const BUILTIN_NODES = [
   // ─── Core ──────────────────────────────────────────────────
   {
@@ -234,7 +270,7 @@ const BUILTIN_NODES = [
       { name: 'headers', type: 'object' },
       { name: 'body', type: 'object' },
     ],
-    outputs: [{ name: 'response', type: 'object' }],
+    outputs: [{ name: 'response', type: 'object', note: API_OUTPUT_NOTE }],
   },
   // NOTE: the `code.run` node was removed from the built-in registry. Its
   // handler ran user-supplied JavaScript through `new Function(...)` with a
@@ -250,7 +286,7 @@ const BUILTIN_NODES = [
     category: 'core',
     description: 'Set a static or computed value',
     inputs: [{ name: 'value', type: 'any', required: true }],
-    outputs: [{ name: 'value', type: 'any' }],
+    outputs: [{ name: 'value', type: 'any', note: BARE_VALUE_NOTE('value') }],
     handler: async (inputs) => inputs.value,
   },
   {
@@ -264,7 +300,7 @@ const BUILTIN_NODES = [
       { name: 'operator', type: 'string', default: '==' },
       { name: 'value', type: 'any', required: true },
     ],
-    outputs: [{ name: 'items', type: 'array' }],
+    outputs: [{ name: 'items', type: 'array', note: BARE_VALUE_NOTE('items') }],
     handler: async (inputs) => {
       const { items, field, operator, value } = inputs;
       if (!Array.isArray(items)) return [];
@@ -291,7 +327,7 @@ const BUILTIN_NODES = [
     category: 'core',
     description: 'Merge data from multiple inputs',
     inputs: [{ name: 'items', type: 'array' }],
-    outputs: [{ name: 'merged', type: 'any' }],
+    outputs: [{ name: 'merged', type: 'any', note: BARE_VALUE_NOTE('merged') }],
     handler: async (inputs) => {
       if (!Array.isArray(inputs.items)) return [];
       return inputs.items.flat(1); // single level only
@@ -345,7 +381,7 @@ const BUILTIN_NODES = [
       { name: 'operator', type: 'string', default: '==' },
       { name: 'compare', type: 'any' },
     ],
-    outputs: [{ name: 'result', type: 'boolean' }],
+    outputs: [{ name: 'result', type: 'boolean', note: BARE_VALUE_NOTE('result') }],
     handler: async (inputs) => {
       const { value, operator, compare } = inputs;
       switch (operator) {
@@ -372,7 +408,7 @@ const BUILTIN_NODES = [
       { name: 'cases', type: 'array', required: true },
       { name: 'default', type: 'string' }, // returned when no case matches
     ],
-    outputs: [{ name: 'matched', type: 'string' }],
+    outputs: [{ name: 'matched', type: 'string', note: BARE_VALUE_NOTE('matched') }],
     handler: async (inputs) => {
       const { value, cases, default: defaultLabel } = inputs;
       for (const c of cases || []) {
@@ -396,7 +432,7 @@ const BUILTIN_NODES = [
       { name: 'channel', type: 'string' },
     ],
     credentials: ['webhookUrl'],
-    outputs: [{ name: 'ok', type: 'boolean' }],
+    outputs: [{ name: 'ok', type: 'boolean', note: API_OUTPUT_NOTE }],
   },
   {
     type: 'discord.send',
@@ -408,7 +444,7 @@ const BUILTIN_NODES = [
     body: { content: '{{message}}' },
     inputs: [{ name: 'message', type: 'string', required: true }],
     credentials: ['webhookUrl'],
-    outputs: [{ name: 'ok', type: 'boolean' }],
+    outputs: [{ name: 'ok', type: 'boolean', note: API_OUTPUT_NOTE }],
   },
   {
     type: 'email.send',
@@ -426,7 +462,7 @@ const BUILTIN_NODES = [
       { name: 'from', type: 'string' },
     ],
     credentials: ['apiUrl', 'token'],
-    outputs: [{ name: 'id', type: 'string' }],
+    outputs: [{ name: 'id', type: 'string', note: API_OUTPUT_NOTE }],
   },
 
   // ─── Data ──────────────────────────────────────────────────
@@ -436,7 +472,11 @@ const BUILTIN_NODES = [
     category: 'data',
     description: 'Parse JSON string to object',
     inputs: [{ name: 'text', type: 'string', required: true }],
-    outputs: [{ name: 'data', type: 'object' }],
+    outputs: [{ name: 'data', type: 'object', note:
+      'Bare value -- {{nodeId}} IS the parsed object/array/primitive, not {{nodeId.data}}. Extra ' +
+      'sharp edge: if the parsed JSON itself happens to be an object with its own "data" key, the ' +
+      "engine's unwrap treats THAT as a data-key object too, and {{nodeId}} silently becomes only " +
+      'that inner value instead of the whole parsed result.' }],
     handler: async (inputs) => JSON.parse(inputs.text),
   },
   {
@@ -445,7 +485,7 @@ const BUILTIN_NODES = [
     category: 'data',
     description: 'Convert object to JSON string',
     inputs: [{ name: 'data', type: 'any', required: true }],
-    outputs: [{ name: 'text', type: 'string' }],
+    outputs: [{ name: 'text', type: 'string', note: BARE_VALUE_NOTE('text') }],
     handler: async (inputs) => JSON.stringify(inputs.data, null, 2),
   },
   {
@@ -457,7 +497,7 @@ const BUILTIN_NODES = [
       { name: 'template', type: 'string', required: true },
       { name: 'data', type: 'object' },
     ],
-    outputs: [{ name: 'text', type: 'string' }],
+    outputs: [{ name: 'text', type: 'string', note: BARE_VALUE_NOTE('text') }],
     handler: async (inputs) => {
       let tpl = inputs.template || '';
       for (const [k, v] of Object.entries(inputs.data || {})) {
@@ -472,7 +512,7 @@ const BUILTIN_NODES = [
     category: 'data',
     description: 'Encode text to Base64',
     inputs: [{ name: 'text', type: 'string', required: true }],
-    outputs: [{ name: 'encoded', type: 'string' }],
+    outputs: [{ name: 'encoded', type: 'string', note: BARE_VALUE_NOTE('encoded') }],
     handler: async (inputs) => btoa(unescape(encodeURIComponent(inputs.text))),
   },
   {
@@ -481,7 +521,7 @@ const BUILTIN_NODES = [
     category: 'data',
     description: 'Decode Base64 to text',
     inputs: [{ name: 'encoded', type: 'string', required: true }],
-    outputs: [{ name: 'text', type: 'string' }],
+    outputs: [{ name: 'text', type: 'string', note: BARE_VALUE_NOTE('text') }],
     handler: async (inputs) => decodeURIComponent(escape(atob(inputs.encoded))),
   },
   {
@@ -494,7 +534,7 @@ const BUILTIN_NODES = [
       { name: 'operation', type: 'string', default: 'add' },
       { name: 'b', type: 'number' },
     ],
-    outputs: [{ name: 'result', type: 'number' }],
+    outputs: [{ name: 'result', type: 'number', note: BARE_VALUE_NOTE('result') }],
     handler: async ({ a, operation, b }) => {
       switch (operation) {
         case 'add': return a + (b || 0);
@@ -515,7 +555,7 @@ const BUILTIN_NODES = [
     category: 'data',
     description: 'Get current date and time',
     inputs: [{ name: 'format', type: 'string', default: 'iso' }],
-    outputs: [{ name: 'datetime', type: 'string' }],
+    outputs: [{ name: 'datetime', type: 'string', note: BARE_VALUE_NOTE('datetime') }],
     handler: async (inputs) => {
       const now = new Date();
       if (inputs.format === 'timestamp') return now.getTime();
@@ -541,7 +581,7 @@ const BUILTIN_NODES = [
       { name: 'model', type: 'string', default: 'gpt-4o-mini' },
     ],
     credentials: ['token'],
-    outputs: [{ name: 'response', type: 'object' }],
+    outputs: [{ name: 'response', type: 'object', note: API_OUTPUT_NOTE }],
   },
   {
     type: 'anthropic.chat',
@@ -561,7 +601,7 @@ const BUILTIN_NODES = [
       { name: 'model', type: 'string', default: 'claude-sonnet-4-20250514' },
     ],
     credentials: ['apiKey'],
-    outputs: [{ name: 'response', type: 'object' }],
+    outputs: [{ name: 'response', type: 'object', note: API_OUTPUT_NOTE }],
   },
 ];
 
