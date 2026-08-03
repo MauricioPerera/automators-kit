@@ -123,13 +123,14 @@ describe('API discovery', () => {
 // ---------------------------------------------------------------------------
 
 describe('Auth flow', () => {
-  it('register returns user', async () => {
+  it('register returns user, defaulting to the lowest-privilege role', async () => {
     const res = await app.handle(req('POST', '/api/auth/register', {
       email: 'newuser@test.com', password: 'password1234', name: 'New User',
     }));
     expect(res.status).toBe(201);
     const body = await json(res);
     expect(body.user.email).toBe('newuser@test.com');
+    expect(body.user.role).toBe('viewer');
   });
 
   it('register fails with invalid email', async () => {
@@ -137,6 +138,55 @@ describe('Auth flow', () => {
       email: 'not-email', password: 'password1234', name: 'Bad',
     }));
     expect(res.status).toBe(400);
+  });
+
+  // Security (2026-08-03, found by an independent audit): unauthenticated
+  // self-registration used to pass `role` straight through with zero gate
+  // -- a single POST to this public route could self-provision as 'admin'.
+  describe('cannot self-assign a role via public registration', () => {
+    it('role: "admin" is rejected with a clear 400, and no account is left behind', async () => {
+      const res = await app.handle(req('POST', '/api/auth/register', {
+        email: 'wannabe-admin@test.com', password: 'password1234', name: 'Nope', role: 'admin',
+      }));
+      expect(res.status).toBe(400);
+      expect((await json(res)).error).toContain('cannot be set via public registration');
+
+      // No account leaked through -- the rejection happens before register() runs.
+      const loginRes = await app.handle(req('POST', '/api/auth/login', {
+        email: 'wannabe-admin@test.com', password: 'password1234',
+      }));
+      expect(loginRes.status).toBe(401);
+    });
+
+    it('role: "editor" and role: "author" are rejected the same way', async () => {
+      for (const role of ['editor', 'author']) {
+        const res = await app.handle(req('POST', '/api/auth/register', {
+          email: `wannabe-${role}@test.com`, password: 'password1234', name: 'Nope', role,
+        }));
+        expect(res.status).toBe(400);
+      }
+    });
+
+    it('explicitly sending role: "viewer" (the default anyway) still succeeds -- not a regression for a harmless, already-correct value', async () => {
+      const res = await app.handle(req('POST', '/api/auth/register', {
+        email: 'explicit-viewer@test.com', password: 'password1234', name: 'Explicit', role: 'viewer',
+      }));
+      expect(res.status).toBe(201);
+      expect((await json(res)).user.role).toBe('viewer');
+    });
+
+    it('the self-registered account genuinely has no admin access (defense in depth, not just a schema check)', async () => {
+      await app.handle(req('POST', '/api/auth/register', {
+        email: 'genuinely-viewer@test.com', password: 'password1234', name: 'GV',
+      }));
+      const loginRes = await app.handle(req('POST', '/api/auth/login', {
+        email: 'genuinely-viewer@test.com', password: 'password1234',
+      }));
+      const token = (await json(loginRes)).token;
+
+      const res = await app.handle(req('POST', '/api/content-types', { name: 'X', slug: 'x' }, token));
+      expect(res.status).toBe(403);
+    });
   });
 
   it('login returns token', async () => {
