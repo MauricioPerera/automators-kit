@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1172 tests | 0 deps | 27 core modules
+By automators.work | 1181 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry, optional execution queue for horizontal scaling
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -1550,6 +1550,38 @@ isn't `'failed'`.
 - cron: `{ type: 'cron', config: { expression: '0 9 * * *' } }`
 - poll: `{ type: 'poll', config: { url: '...', interval: 60000 } }`
 
+### Execution Queue (horizontal scaling)
+
+By default every triggered execution runs in-process. For real load — many webhooks/cron/poll
+triggers firing across multiple worker processes or machines — pass a job queue:
+
+```javascript
+import { WorkflowEngine } from './core/workflow.js';
+import { PostgresJobQueue } from './integrations/postgres-queue.js'; // needs the optional `pg` dep
+import { Pool } from 'pg';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const queue = new PostgresJobQueue(pool, { concurrency: 5 });
+const engine = new WorkflowEngine(db, { masterKey: 'secret', executionQueue: queue });
+await engine.init();  // also creates the queue's tables
+engine.start();       // also starts the queue's own polling
+```
+
+Or via `createApp({ ..., workflowExecutionQueue: queue })` to thread it through the convenience
+wrapper. `core/queue.js`'s zero-dependency `JobQueue` works too (same `register`/`enqueue`/`start`/
+`stop` shape, duck-typed) — useful for local dev/testing, but it is single-process only; only
+`PostgresJobQueue`'s `FOR UPDATE SKIP LOCKED` claim is actually safe across multiple processes/machines.
+
+Only trigger-fired executions (webhook/cron/poll) and error-workflow triggering are enqueued — `run()`,
+`retryExecution()`, `resumeWebhook()`, and the `workflow.execute`/`loop.forEach` nodes (a sub-workflow
+the parent must await synchronously) always stay direct and in-process. Unset (the default): zero
+behavior change, everything runs exactly as before.
+
+**Honest scope:** this distributes execution *dispatch* only. For genuine multi-machine deployment the
+underlying `db` also needs to be shared — see `integrations/postgres-collection.js` (a real,
+cross-process-cached, Postgres-backed `Collection` equivalent with LISTEN/NOTIFY invalidation), not
+wired into `WorkflowEngine` — pairing the two is a separate integration effort left to the caller.
+
 ### Credential Vault
 ```javascript
 await engine.vault.store('slack', { webhookUrl: 'https://hooks.slack.com/...' });
@@ -2383,6 +2415,31 @@ regression tests, one of which locks in the documented behavior via a real `engi
 `NodeRegistry.execute()` standalone). Verified: 2 full-suite runs + 20 isolated runs, all clean. Also
 verified live via `GET /api/workflows/nodes/list`.
 
+**Optional execution queue for horizontal scaling (2026-08-03):** closes the gap identified when
+reasoning explicitly about what it'd take for this to be a real n8n-self-hosted alternative on
+execution power/load specifically (not node-catalog size or UI, out of scope by design) —
+`WorkflowEngine` ran every triggered execution in-process, with no path to distributing load across
+worker processes, even though `integrations/postgres-queue.js`'s `PostgresJobQueue` already existed
+(real, multi-process-safe via Postgres `FOR UPDATE SKIP LOCKED`) with nothing wiring it to workflow
+execution. New `opts.executionQueue` on `WorkflowEngine`, duck-typed against `core/queue.js`'s
+`JobQueue` and `PostgresJobQueue` (both share the same `register`/`enqueue`/`start`/`stop` shape, so
+either works transparently). When set, trigger-fired executions (webhook/cron/poll) and
+error-workflow triggering are enqueued via a new shared `_dispatchExecution()` helper instead of
+`execute()` directly — any worker process sharing that queue can pick them up. Deliberately does NOT
+affect `run()`/`retryExecution()`/`resumeWebhook()` (an explicit caller waiting for a real synchronous
+result) or the `workflow.execute`/`loop.forEach` nodes (a sub-workflow the parent must await
+directly). Unset by default: zero behavior change for every existing deployment. `init()` awaits the
+queue's own `init()` when present (`PostgresJobQueue` needs it to create tables; `core/queue.js`'s
+`JobQueue` has none, a harmless no-op); `start()`/`stop()` also start/stop the queue. `createApp()`
+gains `opts.workflowExecutionQueue` to thread this through the convenience wrapper too. Honest scope:
+this distributes execution *dispatch* only — true multi-machine deployment also needs the underlying
+`db` shared (see `integrations/postgres-collection.js`, not wired in here, a separate effort), and
+real cross-process safety specifically requires `PostgresJobQueue` (the zero-dep `JobQueue` used in
+tests proves the wiring logic via its identical shape but isn't itself multi-process-safe, by its own
+design). 9 new regression tests. Verified: 2 full-suite runs + 20 isolated runs of `workflow.test.js`,
+all clean. Also verified live end-to-end over a real spawned server: webhook → enqueue → queue
+processes → real execution recorded with the correct trigger data.
+
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
 - AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
@@ -2458,10 +2515,28 @@ change each time; all fixed shortly after in separate, explicitly-requested pass
    /api/workflows/executions/:execId/retry` has the same underlying gap but wasn't part of this finding;
    noted, not bundled in. 7 new regression tests, including confirming an unassigned workflow's
    toggle/executions stay open to any authenticated user, unchanged.
+5. **RESOLVED (2026-08-03).** MCP stdio server processed pipelined requests out of order — found
+   (informational, not fixed yet) by the same second independent audit that found items 3-4. Node's
+   `readline`'s `'line'` event does not await an async listener, and `createMCPServer` (`core/mcp.js`)
+   registered `rl.on('line', async (line) => {...})` directly — each incoming line kicked off its own
+   independent async handler with no ordering guarantee between them, so a client that pipelines
+   several `tools/call` requests without waiting for each response could see responses arrive out of
+   order, and two requests touching the same state (e.g. two `data.table` writes) could race. Real MCP
+   clients in practice (Claude Code, this session's own MCP tests) don't pipeline, so this was a latent
+   risk rather than an active exploit — still fixed, since a pipelining client is a legitimate, spec-
+   compliant way to use JSON-RPC 2.0 over stdio. Fixed: new `createLineProcessor(allTools, send)`
+   (`core/mcp.js`, extracted the same way `buildAllTools` already was, for testability without touching
+   stdio) chains each line strictly — `queue = queue.then(() => processLine(line))` — so a line is fully
+   processed and its response sent before the next one starts; `processLine` never rejects (both its
+   catch branches terminate normally), so the queue can never get stuck on a bad request.
+   `createMCPServer`'s `rl.on('line', ...)` now just calls `processor.enqueue(line)`. 3 new regression
+   tests. Verified: 2 full-suite runs + 20 isolated runs of `mcp.test.js`, all clean. Also verified live
+   over a real spawned MCP stdio subprocess sending pipelined requests, confirming out-of-order responses
+   before the fix and strictly in-order responses after.
 
-All four verified: 2 full-suite runs + 20 isolated runs of `integration.test.js` each, all clean. Also
+Items 1-4 verified: 2 full-suite runs + 20 isolated runs of `integration.test.js` each, all clean. Also
 verified live over real spawned servers, each reproducing the exact exploit before the fix and confirming
-it's blocked after.
+it's blocked after. Item 5 verified separately as described above.
 
 ## Known Agent-UX Friction Points
 
