@@ -112,7 +112,7 @@ export function workflowRoutes(cms, engine) {
 
   r.get('/:id/executions', auth, async (ctx) => {
     const limit = parseInt(ctx.query.limit) || 50;
-    return json({ executions: engine.getExecutions(ctx.params.id, limit) });
+    return json({ executions: engine.getExecutions(ctx.params.id, limit, { status: ctx.query.status }) });
   });
 
   r.get('/executions/:execId', auth, async (ctx) => {
@@ -135,16 +135,31 @@ export function workflowRoutes(cms, engine) {
 
   // ─── WEBHOOK TRIGGER ──────────────────────────────────────
 
-  r.post('/webhook/:path', async (ctx) => {
-    const body = await ctx.json();
+  // A workflow's webhook trigger can register for any of these methods via
+  // `trigger.config.method` (default POST, unchanged from before
+  // 2026-08-03) -- registered here for every method so the SAME handler
+  // dispatches regardless, and `engine.webhookTrigger`'s `method` param
+  // decides whether this specific request actually matches what the
+  // workflow registered (same generic "not found" if it doesn't, same
+  // don't-leak-which-case shape as the secret check below). GET/HEAD have
+  // no conventional body, so their payload comes from the query string
+  // instead of ctx.json() (which would just see an empty body).
+  const webhookHandler = async (ctx) => {
+    const data = ['GET', 'HEAD'].includes(ctx.method) ? ctx.query : await ctx.json();
     // Secret is read from a header, never from the body/query (avoids logging
     // it in access logs or URL history). Same generic 404 whether the path
-    // isn't registered or the secret is wrong — don't leak which case it is.
+    // isn't registered, the method doesn't match, or the secret is wrong —
+    // don't leak which case it is.
     const secret = ctx.req.headers.get('X-Webhook-Secret');
-    const workflowId = engine.webhookTrigger(ctx.params.path, body, secret);
+    const workflowId = engine.webhookTrigger(ctx.params.path, data, secret, ctx.method);
     if (!workflowId) return error('No workflow registered for this webhook', 404);
     return json({ triggered: workflowId });
-  });
+  };
+  r.get('/webhook/:path', webhookHandler);
+  r.post('/webhook/:path', webhookHandler);
+  r.put('/webhook/:path', webhookHandler);
+  r.patch('/webhook/:path', webhookHandler);
+  r.delete('/webhook/:path', webhookHandler);
 
   // Resumes an execution paused at a `wait.forWebhook` node -- the
   // counterpart to the trigger webhook above, but for an already-running

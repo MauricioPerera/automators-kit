@@ -376,12 +376,25 @@ export class WorkflowEngine {
   create(definition) {
     this._validateNodeIds(definition.nodes || []);
 
+    const trigger = definition.trigger || { type: TriggerType.MANUAL };
+    const active = definition.active !== false;
+    // Reject a colliding webhook path/method BEFORE inserting anything, so a
+    // rejected create() leaves nothing persisted (same "reject before
+    // recording" precedent core/triggers.js's register() already follows
+    // for a poller's SSRF-guarded URL). Without this, TriggerManager.
+    // register()'s Map.set() would silently overwrite the earlier
+    // workflow's entry, hijacking its webhook with zero warning anywhere --
+    // the exact bug found live during a full system test (2026-08-03).
+    if (active && trigger.type === TriggerType.WEBHOOK && this._triggers.webhookPathTaken(trigger, null)) {
+      throw new Error(`Webhook path '${trigger.config?.path}' (${(trigger.config?.method || 'POST').toUpperCase()}) is already registered to another active workflow`);
+    }
+
     const wf = this._workflows.insert({
       name: definition.name,
       description: definition.description || '',
-      trigger: definition.trigger || { type: TriggerType.MANUAL },
+      trigger,
       nodes: definition.nodes || [],
-      active: definition.active !== false,
+      active,
       settings: definition.settings || {},
       // Workflow id to run (with error context as trigger data) when THIS
       // workflow's execution ends with status 'failed'. Falls back to the
@@ -425,6 +438,15 @@ export class WorkflowEngine {
     // Validate node ids if nodes are being updated.
     if (changes.nodes !== undefined) {
       this._validateNodeIds(changes.nodes);
+    }
+
+    // Same collision guard as create() -- computed against the EFFECTIVE
+    // post-update trigger/active (changes may touch either or neither),
+    // excluding this workflow's own id so it can keep/reuse its own path.
+    const effectiveTrigger = changes.trigger !== undefined ? changes.trigger : wf.trigger;
+    const effectiveActive = changes.active !== undefined ? changes.active : wf.active;
+    if (effectiveActive && effectiveTrigger?.type === TriggerType.WEBHOOK && this._triggers.webhookPathTaken(effectiveTrigger, id)) {
+      throw new Error(`Webhook path '${effectiveTrigger.config?.path}' (${(effectiveTrigger.config?.method || 'POST').toUpperCase()}) is already registered to another active workflow`);
     }
 
     // Unregister old trigger
@@ -946,14 +968,25 @@ export class WorkflowEngine {
   }
 
   /** Webhook trigger (called from HTTP route) */
-  webhookTrigger(path, data, secret) {
-    return this._triggers.fireWebhook(path, data, secret);
+  webhookTrigger(path, data, secret, method) {
+    return this._triggers.fireWebhook(path, data, secret, method);
   }
 
   // ─── HISTORY ─────────────────────────────────────────────
 
-  getExecutions(workflowId, limit = 50) {
+  /**
+   * @param {string} [workflowId]
+   * @param {number} [limit]
+   * @param {object} [opts]
+   * @param {string} [opts.status] - e.g. 'failed', to find retryable
+   *   executions without fetching everything and filtering client-side.
+   *   Added as a 3rd param (not folded into an opts-only signature) to
+   *   keep every existing positional (workflowId, limit) call working
+   *   unchanged.
+   */
+  getExecutions(workflowId, limit = 50, opts = {}) {
     const filter = workflowId ? { workflowId } : {};
+    if (opts.status) filter.status = opts.status;
     return this._executions.find(filter).sort({ startedAt: -1 }).limit(limit).toArray();
   }
 

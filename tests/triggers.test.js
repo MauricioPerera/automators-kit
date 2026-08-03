@@ -308,6 +308,77 @@ describe('TriggerManager', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Webhook method support + collision detection (2026-08-03)
+// ---------------------------------------------------------------------------
+
+describe('TriggerManager: webhook method + webhookPathTaken', () => {
+  it('fireWebhook defaults to POST when neither side specifies a method (unchanged pre-2026-08-03 behavior)', () => {
+    const fired = [];
+    const tm = new TriggerManager({ onTrigger: (id) => fired.push(id) });
+    tm.register('wf1', { type: TriggerType.WEBHOOK, config: { path: 'h' } });
+    expect(tm.fireWebhook('h', {})).toBe('wf1'); // no method arg -> POST
+    expect(tm.fireWebhook('h', {}, null, 'GET')).toBeNull(); // a GET request 404s against a POST-only registration
+    expect(fired).toEqual(['wf1']);
+  });
+
+  it('a workflow can register for a non-POST method, and only that method fires it', () => {
+    const tm = new TriggerManager({ onTrigger: () => {} });
+    tm.register('wf1', { type: TriggerType.WEBHOOK, config: { path: 'h', method: 'get' } }); // lowercase, must normalize
+    expect(tm.fireWebhook('h', {}, null, 'GET')).toBe('wf1');
+    expect(tm.fireWebhook('h', {}, null, 'POST')).toBeNull();
+    expect(tm.fireWebhook('h', {})).toBeNull(); // default method arg is POST -- also a miss
+  });
+
+  it('two workflows can share the same path under different methods without colliding', () => {
+    const fired = [];
+    const tm = new TriggerManager({ onTrigger: (id) => fired.push(id) });
+    tm.register('getter', { type: TriggerType.WEBHOOK, config: { path: 'shared', method: 'GET' } });
+    tm.register('poster', { type: TriggerType.WEBHOOK, config: { path: 'shared', method: 'POST' } });
+    expect(tm.fireWebhook('shared', {}, null, 'GET')).toBe('getter');
+    expect(tm.fireWebhook('shared', {}, null, 'POST')).toBe('poster');
+    expect(fired).toEqual(['getter', 'poster']);
+  });
+
+  it('unregister removes the correct method-keyed entry, not a different method sharing the same path', () => {
+    const tm = new TriggerManager({ onTrigger: () => {} });
+    tm.register('getter', { type: TriggerType.WEBHOOK, config: { path: 'shared', method: 'GET' } });
+    tm.register('poster', { type: TriggerType.WEBHOOK, config: { path: 'shared', method: 'POST' } });
+    tm.unregister('getter');
+    expect(tm.fireWebhook('shared', {}, null, 'GET')).toBeNull();
+    expect(tm.fireWebhook('shared', {}, null, 'POST')).toBe('poster'); // untouched
+  });
+
+  it('webhookPathTaken: false when the path/method is free', () => {
+    const tm = new TriggerManager({ onTrigger: () => {} });
+    expect(tm.webhookPathTaken({ config: { path: 'orders' } }, null)).toBe(false);
+  });
+
+  it('webhookPathTaken: true when another workflow already owns that exact path+method', () => {
+    const tm = new TriggerManager({ onTrigger: () => {} });
+    tm.register('wf1', { type: TriggerType.WEBHOOK, config: { path: 'orders' } });
+    expect(tm.webhookPathTaken({ config: { path: 'orders' } }, null)).toBe(true);
+    expect(tm.webhookPathTaken({ config: { path: 'orders' } }, 'some-other-id')).toBe(true);
+  });
+
+  it("webhookPathTaken: false for the SAME workflow's own existing registration (excludeWorkflowId)", () => {
+    const tm = new TriggerManager({ onTrigger: () => {} });
+    tm.register('wf1', { type: TriggerType.WEBHOOK, config: { path: 'orders' } });
+    expect(tm.webhookPathTaken({ config: { path: 'orders' } }, 'wf1')).toBe(false);
+  });
+
+  it('webhookPathTaken: false when the same path is taken under a DIFFERENT method', () => {
+    const tm = new TriggerManager({ onTrigger: () => {} });
+    tm.register('wf1', { type: TriggerType.WEBHOOK, config: { path: 'orders', method: 'GET' } });
+    expect(tm.webhookPathTaken({ config: { path: 'orders', method: 'POST' } }, null)).toBe(false);
+  });
+
+  it('webhookPathTaken: false when no path is set (falls back to the always-unique workflow id)', () => {
+    const tm = new TriggerManager({ onTrigger: () => {} });
+    expect(tm.webhookPathTaken({ config: {} }, null)).toBe(false);
+  });
+});
+
 describe('TriggerType constants', () => {
   it('has all types', () => {
     expect(TriggerType.MANUAL).toBe('manual');

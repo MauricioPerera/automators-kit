@@ -449,6 +449,89 @@ describe('Webhook trigger', () => {
     const res = await app.handle(req('POST', '/api/workflows/webhook/open-hook', { msg: 'hi' }));
     expect(res.status).toBe(200);
   });
+
+  it('POST /api/workflows rejects creating an active workflow whose webhook path collides with an already-active one', async () => {
+    const firstRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'First collider',
+      trigger: { type: 'webhook', config: { path: 'shared-orders' } },
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: 'first' } }],
+      active: true,
+    }, adminToken));
+    expect(firstRes.status).toBe(201);
+
+    const secondRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'Second collider',
+      trigger: { type: 'webhook', config: { path: 'shared-orders' } },
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: 'second' } }],
+      active: true,
+    }, adminToken));
+    expect(secondRes.status).toBe(400);
+    expect((await json(secondRes)).error).toContain('shared-orders');
+
+    // The first workflow's webhook is still the sole owner of the path.
+    const triggerRes = await app.handle(req('POST', '/api/workflows/webhook/shared-orders', { x: 1 }));
+    expect(triggerRes.status).toBe(200);
+  });
+
+  it('a workflow can register a GET webhook, reading its payload from the query string', async () => {
+    const createRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'GET webhook',
+      trigger: { type: 'webhook', config: { path: 'get-hook', method: 'GET' } },
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: '{{_trigger.name}}' } }],
+      active: true,
+    }, adminToken));
+    expect(createRes.status).toBe(201);
+    const wfId = (await json(createRes)).workflow._id;
+
+    // A POST to the same path 404s -- this workflow only registered for GET.
+    const postRes = await app.handle(req('POST', '/api/workflows/webhook/get-hook', { name: 'ignored' }));
+    expect(postRes.status).toBe(404);
+
+    const getRes = await app.handle(req('GET', '/api/workflows/webhook/get-hook?name=Ana'));
+    expect(getRes.status).toBe(200);
+
+    const execsRes = await app.handle(req('GET', `/api/workflows/${wfId}/executions`, null, adminToken));
+    const exec = (await json(execsRes)).executions[0];
+    expect(exec.nodeResults.n1.data).toBe('Ana');
+  });
+
+  it('two workflows can share the same webhook path under different methods', async () => {
+    await app.handle(req('POST', '/api/workflows', {
+      name: 'Path share GET',
+      trigger: { type: 'webhook', config: { path: 'multi-method', method: 'GET' } },
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: 'from-get' } }],
+      active: true,
+    }, adminToken));
+    const postRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'Path share POST',
+      trigger: { type: 'webhook', config: { path: 'multi-method', method: 'POST' } },
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: 'from-post' } }],
+      active: true,
+    }, adminToken));
+    expect(postRes.status).toBe(201); // no collision -- different methods
+
+    const getRes = await app.handle(req('GET', '/api/workflows/webhook/multi-method'));
+    expect(getRes.status).toBe(200);
+    const postTriggerRes = await app.handle(req('POST', '/api/workflows/webhook/multi-method', {}));
+    expect(postTriggerRes.status).toBe(200);
+  });
+
+  it('GET /api/workflows/:id/executions?status= filters without needing to fetch everything client-side', async () => {
+    const createRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'Status filter test',
+      nodes: [{ id: 'n', type: 'http.request', credentials: 'does-not-exist', inputs: { url: 'http://example.com' } }],
+    }, adminToken));
+    const wfId = (await json(createRes)).workflow._id;
+    await app.handle(req('POST', `/api/workflows/${wfId}/run`, {}, adminToken)); // fails: missing credential
+
+    const failedRes = await app.handle(req('GET', `/api/workflows/${wfId}/executions?status=failed`, null, adminToken));
+    const failedBody = await json(failedRes);
+    expect(failedBody.executions.length).toBe(1);
+    expect(failedBody.executions[0].status).toBe('failed');
+
+    const successRes = await app.handle(req('GET', `/api/workflows/${wfId}/executions?status=success`, null, adminToken));
+    expect((await json(successRes)).executions.length).toBe(0);
+  });
 });
 
 // ---------------------------------------------------------------------------

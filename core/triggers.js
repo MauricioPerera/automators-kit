@@ -30,7 +30,7 @@ export class TriggerManager {
   constructor(opts = {}) {
     this._onTrigger = opts.onTrigger || (() => {});
     this._cron = new CronScheduler();
-    this._webhooks = new Map();  // name -> workflowId
+    this._webhooks = new Map();  // "METHOD:path" -> { workflowId, secret, method }
     this._pollers = new Map();   // workflowId -> { timer, config, _failures }
     this._registered = new Map(); // workflowId -> trigger config
     // Pollers that tripped the consecutive-failure threshold land here so the
@@ -38,6 +38,40 @@ export class TriggerManager {
     this._pollerErrors = new Map(); // workflowId -> { status, lastError, failures }
     // Max consecutive poll failures before a poller is auto-unregistered.
     this._maxConsecutiveFailures = opts.maxConsecutiveFailures ?? 5;
+  }
+
+  /**
+   * Builds the `_webhooks` Map key for a webhook trigger config, shared by
+   * register()/unregister()/webhookPathTaken() so all three ever agree on
+   * what "the same webhook" means. Prefixed with the (uppercased, defaults
+   * to POST for backward compatibility) HTTP method so two workflows can
+   * legitimately share a path under different methods (e.g. GET vs POST on
+   * `/orders`) without colliding -- same as a real HTTP router would treat
+   * them as distinct routes.
+   * @private
+   */
+  _webhookKey(path, workflowId, method) {
+    return `${(method || 'POST').toUpperCase()}:${path || workflowId}`;
+  }
+
+  /**
+   * True if `trigger` (a webhook trigger config) would collide with an
+   * ALREADY-registered webhook belonging to a DIFFERENT workflow. Callers
+   * (WorkflowEngine.create()/update()) check this BEFORE calling register()
+   * and reject the mutation with a clear error instead of register()
+   * silently overwriting the Map entry and hijacking an already-working
+   * webhook with zero warning -- the bug this exists to prevent, found live
+   * during a full system test (2026-08-03).
+   * @param {{config?: {path?: string, method?: string}}} trigger
+   * @param {string} excludeWorkflowId - the workflow being created/updated;
+   *   never a collision against its OWN existing registration.
+   */
+  webhookPathTaken(trigger, excludeWorkflowId) {
+    const path = trigger?.config?.path;
+    if (!path) return false; // no path set -> falls back to the (always-unique) workflow id, can never collide
+    const key = this._webhookKey(path, null, trigger.config.method);
+    const existing = this._webhooks.get(key);
+    return !!existing && existing.workflowId !== excludeWorkflowId;
   }
 
   /**
@@ -61,15 +95,20 @@ export class TriggerManager {
         });
         break;
 
-      case TriggerType.WEBHOOK:
+      case TriggerType.WEBHOOK: {
         // Store an optional per-webhook secret so callers can be authenticated.
         // When no secret is configured, the webhook stays open (back-compat) —
-        // hardening is opt-in by whoever builds the workflow.
-        this._webhooks.set(trigger.config.path || workflowId, {
+        // hardening is opt-in by whoever builds the workflow. `method`
+        // defaults to POST (the only method this ever supported before
+        // 2026-08-03), keeping every existing workflow's behavior unchanged.
+        const method = (trigger.config.method || 'POST').toUpperCase();
+        this._webhooks.set(this._webhookKey(trigger.config.path, workflowId, method), {
           workflowId,
           secret: trigger.config.secret,
+          method,
         });
         break;
+      }
 
       case TriggerType.POLL: {
         // Clamp interval to a minimum of 1000ms to avoid a tight loop that
@@ -99,7 +138,7 @@ export class TriggerManager {
         this._cron.remove(`wf_${workflowId}`);
         break;
       case TriggerType.WEBHOOK:
-        this._webhooks.delete(trigger.config?.path || workflowId);
+        this._webhooks.delete(this._webhookKey(trigger.config?.path, workflowId, trigger.config?.method));
         break;
       case TriggerType.POLL: {
         const poller = this._pollers.get(workflowId);
@@ -118,10 +157,15 @@ export class TriggerManager {
    *  @param {*} data - Payload delivered by the caller
    *  @param {string} [providedSecret] - Secret presented by the caller; required
    *    only when the registered webhook has `config.secret` set.
+   *  @param {string} [method] - HTTP method of the incoming request, default
+   *    POST (matches the pre-2026-08-03 fixed-POST behavior). A request
+   *    whose method doesn't match what the workflow registered gets the
+   *    same generic "not found" as an unregistered path — same
+   *    don't-leak-which-case shape as the wrong-secret check below.
    *  @returns {string|null} workflowId on success, null when not found or
    *    rejected (wrong/missing secret). */
-  fireWebhook(path, data, providedSecret) {
-    const entry = this._webhooks.get(path);
+  fireWebhook(path, data, providedSecret, method) {
+    const entry = this._webhooks.get(this._webhookKey(path, null, method));
     if (!entry) return null;
     const { workflowId, secret } = entry;
     // If the webhook registered a secret, the caller must present an exact match.

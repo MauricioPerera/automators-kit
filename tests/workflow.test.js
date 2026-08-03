@@ -297,6 +297,25 @@ describe('Workflow Execution', () => {
     expect(history.length).toBe(2);
   });
 
+  it('getExecutions(id, limit, {status}) filters by status without needing to fetch everything client-side', async () => {
+    let calls = 0;
+    engine.nodes.add({ type: 'test.failsFirstRun', name: 'FailsFirstRun', category: 'test', handler: async () => { calls++; if (calls === 1) throw new Error('boom'); return 'ok'; } });
+    const wf = engine.create({ name: 'Mixed', nodes: [{ id: 'n', type: 'test.failsFirstRun', inputs: {} }] });
+    await engine.run(wf._id); // fails
+    await engine.run(wf._id); // succeeds
+
+    const failed = engine.getExecutions(wf._id, 50, { status: 'failed' });
+    expect(failed.length).toBe(1);
+    expect(failed[0].status).toBe('failed');
+
+    const succeeded = engine.getExecutions(wf._id, 50, { status: 'success' });
+    expect(succeeded.length).toBe(1);
+    expect(succeeded[0].status).toBe('success');
+
+    // Omitting opts still returns everything -- existing 2-arg callers unaffected.
+    expect(engine.getExecutions(wf._id, 50).length).toBe(2);
+  });
+
   it('run()/execute() return an execution with a real _id, reachable via getExecution()', async () => {
     const wf = engine.create({
       name: 'HasId',
@@ -372,6 +391,116 @@ describe('Triggers', () => {
     tm.unregister('wf1');
     expect(tm.list().length).toBe(0);
     expect(tm.fireWebhook('h', {})).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Webhook path collision guard (2026-08-03) -- found live during a full
+// system test: two active workflows registering the same webhook path used
+// to silently hijack each other (the second one registered always won,
+// with zero error anywhere). create()/update() now reject the collision
+// up front instead.
+// ---------------------------------------------------------------------------
+
+describe('Webhook path collision guard', () => {
+  it('create() rejects a webhook path already owned by another ACTIVE workflow', () => {
+    engine.create({
+      name: 'First', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }], active: true,
+    });
+    expect(() => engine.create({
+      name: 'Second', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 2 } }], active: true,
+    })).toThrow(/orders.*already registered/);
+    // The rejected create() left nothing persisted.
+    expect(engine.findByName('Second')).toBeNull();
+  });
+
+  it("create() allows the same path when the FIRST workflow isn't active (nothing registered to collide with)", () => {
+    engine.create({
+      name: 'Inactive', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }], active: false,
+    });
+    const wf = engine.create({
+      name: 'Active', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 2 } }], active: true,
+    });
+    expect(wf._id).toBeTruthy();
+  });
+
+  it('create() allows two workflows sharing the same path under different methods', () => {
+    engine.create({
+      name: 'GetHook', trigger: { type: 'webhook', config: { path: 'orders', method: 'GET' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }], active: true,
+    });
+    const wf = engine.create({
+      name: 'PostHook', trigger: { type: 'webhook', config: { path: 'orders', method: 'POST' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 2 } }], active: true,
+    });
+    expect(wf._id).toBeTruthy();
+  });
+
+  it('update() rejects activating into a path collision', () => {
+    engine.create({
+      name: 'First', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }], active: true,
+    });
+    const second = engine.create({
+      name: 'Second', trigger: { type: 'webhook', config: { path: 'other' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 2 } }], active: true,
+    });
+    expect(() => engine.update(second._id, { trigger: { type: 'webhook', config: { path: 'orders' } } }))
+      .toThrow(/orders.*already registered/);
+    // Original definition untouched after the rejected update.
+    expect(engine.get(second._id).trigger.config.path).toBe('other');
+  });
+
+  it("update() lets a workflow keep/reuse its OWN existing path (excludeWorkflowId self-exclusion)", () => {
+    const wf = engine.create({
+      name: 'Self', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }], active: true,
+    });
+    const updated = engine.update(wf._id, { description: 'renamed, same trigger' });
+    expect(updated.trigger.config.path).toBe('orders');
+  });
+
+  it('toggle() rejects activating a workflow whose stored path now collides (routes through update())', () => {
+    engine.create({
+      name: 'First', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }], active: true,
+    });
+    const second = engine.create({
+      name: 'Second', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 2 } }], active: false,
+    });
+    expect(() => engine.toggle(second._id)).toThrow(/orders.*already registered/);
+  });
+
+  it('deactivating the first workflow frees its path for a new one', () => {
+    const first = engine.create({
+      name: 'First', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }], active: true,
+    });
+    engine.update(first._id, { active: false });
+    const second = engine.create({
+      name: 'Second', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 2 } }], active: true,
+    });
+    expect(second._id).toBeTruthy();
+  });
+
+  it('the reproduced live scenario is now blocked instead of silently hijacking', async () => {
+    const a = engine.create({
+      name: 'A', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 'A ran' } }], active: true,
+    });
+    expect(() => engine.create({
+      name: 'B', trigger: { type: 'webhook', config: { path: 'orders' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 'B ran' } }], active: true,
+    })).toThrow();
+
+    const triggeredId = engine.webhookTrigger('orders', {}, null);
+    expect(triggeredId).toBe(a._id); // A is still the sole owner of the path
   });
 });
 
