@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1103 tests | 0 deps | 27 core modules
+By automators.work | 1120 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -18,11 +18,11 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table)
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
-credentials.js     Credential vault: AES-256-GCM encrypted storage, OAuth2 (authorization-code + PKCE + refresh)
+credentials.js     Credential vault: AES-256-GCM encrypted storage, OAuth2 (authorization-code + PKCE + refresh), testCredential (verify without running a workflow)
 projects.js        Projects -> Folders -> Workflows: project-scoped roles (owner/editor/viewer), separate from CMS's global roles
 shell.js           Agent shell: command gateway, parser, pipeline, JQ filter, RBAC
 shell-mcp.js       Exposes shell.js over MCP as 2 fixed tools (shell_help/shell_exec)
@@ -1192,10 +1192,12 @@ bun cli.js seed --file seed.json
 - POST /api/workflows/:id/run - execute manually
 - POST /api/workflows/:id/toggle - activate/deactivate
 - GET /api/workflows/:id/executions - execution history
+- POST /api/workflows/executions/:execId/retry - retry a FAILED execution from the DAG level where it failed
 - POST /api/workflows/webhook/:path - trigger via webhook
 - GET /api/workflows/nodes/list - available nodes
 - POST /api/workflows/credentials - store encrypted credentials
 - GET /api/workflows/credentials - list (no decryption)
+- POST /api/workflows/credentials/:name/test - verify a credential is usable (decrypts, refreshes OAuth2 if near expiry) without running a workflow
 
 ### Agent Shell (command gateway)
 - POST /api/shell/exec - execute command string
@@ -1504,6 +1506,24 @@ sub-execution as an immediate success (not a throw), so the sub-workflow
 becomes an independently-resuming execution rather than the parent
 blocking on it.
 
+### Execution Retry
+
+A FAILED execution can be retried without re-triggering the whole workflow from scratch:
+
+```javascript
+const failed = await engine.run(wf._id);       // status: 'failed'
+const retried = await engine.retryExecution(failed._id); // same execution id, updated in place
+```
+
+Re-dispatches from the DAG level that failed (`executionDoc.failedAt`, recorded by `_runLevels` at the
+moment a node failure stops a run) — the same level-boundary granularity `_resumeExecution` already
+uses for a paused wait, not a per-node cherry-pick: every node in that level re-runs, including a
+sibling that had already succeeded. Context is rebuilt from every already-successful `nodeResults`
+entry (nodes from earlier levels are **not** re-run). Only the failed level's own error entries are
+cleared — an unrelated `continueOnError` error recorded in an earlier level is preserved, not wiped.
+`POST /api/workflows/executions/:execId/retry` — 404 if the execution doesn't exist, 400 if its status
+isn't `'failed'`.
+
 ### Triggers
 - manual: `engine.run(id, data)`
 - webhook: `POST /api/workflows/webhook/:path`
@@ -1539,6 +1559,17 @@ const creds = await engine.vault.get('github'); // { token, refreshToken }
 // no special handling by the caller, including node handlers. A refresh
 // failure logs and falls through (returns the possibly-stale token)
 // rather than throwing; every non-OAuth2 credential is unaffected.
+
+const result = await engine.vault.testCredential('github'); // { ok, reason?, refreshed? }
+// Verifies a credential is usable WITHOUT running a workflow. Unlike
+// get(), a refresh failure here is reported (ok: false, reason) instead
+// of logged and swallowed -- an agent checking a credential proactively
+// wants to know NOW that a refresh token was revoked, not discover it
+// mid-workflow. Only force-refreshes an OAuth2 credential actually at/
+// near expiry (some providers invalidate the previous refresh token on
+// use); cannot confirm the third-party API itself accepts the credential
+// -- the vault has no notion of what service a credential is for beyond
+// a free-text label. POST /api/workflows/credentials/:name/test.
 ```
 
 Routes (`routes/workflows.js`): `POST /api/workflows/oauth2/:name/start` (admin-only; `config`
@@ -2281,6 +2312,24 @@ unwrap. 9 new regression tests. Verified: 20 isolated runs and 2 full-suite runs
 verified live over a real spawned server: seeded rows via the REST route, then a workflow's `data.table`
 node queried them and a downstream node correctly referenced the unwrapped result via
 `{{query.length}}`/`{{query.0.name}}`.
+
+**Execution retry and credential test added (2026-08-03):** two more gaps found on the same
+"ejecución de flujos" / "vault de credenciales" pillars. First, a FAILED execution had no way to be
+retried except re-triggering the whole workflow from scratch, even though the engine already had all
+the resumability machinery (`waitState`, `_resumeExecution`) for a paused one. `_runLevels` now records
+`execution.failedAt = { levelIndex, subWorkflowChain }` at the moment a node failure stops a run; new
+`retryExecution()` reconstructs context from already-successful `nodeResults` and re-dispatches from
+that level (same level-boundary granularity `_resumeExecution` already uses), preserving an unrelated
+`continueOnError` error from an earlier level instead of wiping it. New
+`POST /api/workflows/executions/:execId/retry`. Second, there was no way to verify a credential is
+usable without running a whole workflow — `get()`'s OAuth2 refresh failures are deliberately logged and
+swallowed (falls back to the stale token so the real API call fails naturally instead), which is
+correct for a node handler but hides the failure from an agent proactively checking a credential. New
+`CredentialVault.testCredential()` confirms decryption and, only for an OAuth2 credential genuinely
+at/near expiry, forces a refresh and reports whether it actually succeeded. New
+`POST /api/workflows/credentials/:name/test`. Both registered in the `GET /api/schema` catalog. 18 new
+regression tests. Verified: 20 isolated runs of each touched test file and 2 full-suite runs, all
+clean. Also verified live over a real spawned server for both endpoints.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly
