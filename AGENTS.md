@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1165 tests | 0 deps | 27 core modules
+By automators.work | 1172 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -1191,8 +1191,9 @@ bun cli.js seed --file seed.json
 - POST /api/workflows/validate - lint a raw, unsaved node list (dangling {{ref}}s, duplicate ids, cycles, DAG level breakdown + wait.* pause-point warnings)
 - GET /api/workflows/:id/validate - same lint, run against an already-stored workflow
 - POST /api/workflows/:id/run - execute manually (project-gated: editor+ if the workflow has a projectId, open to any authenticated user if unassigned)
-- POST /api/workflows/:id/toggle - activate/deactivate
-- GET /api/workflows/:id/executions - execution history
+- POST /api/workflows/:id/toggle - activate/deactivate (project-gated: editor+ if the workflow has a projectId)
+- GET /api/workflows/:id/executions - execution history (project-gated: viewer+ if the workflow has a projectId)
+- GET /api/workflows/executions/:execId - get one execution (project-gated via its owning workflow's projectId, viewer+)
 - POST /api/workflows/executions/:execId/retry - retry a FAILED execution from the DAG level where it failed
 - POST /api/workflows/webhook/:path - trigger via webhook
 - GET /api/workflows/nodes/list - available nodes
@@ -2395,15 +2396,16 @@ Current posture:
 - Webhook HMAC-SHA256 signing + optional per-webhook secret
 - Rate limiting in triggers
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
-- Workflow read/run gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
+- Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (both resolved)
+## Known Security Gaps (all resolved)
 
-Found 2026-08-03 by an independent, no-prior-context audit (a fresh GLM instance given only the repo + this
-file, no knowledge of any work done in the session that built the features around it), then independently
-re-verified against the source by the session that requested the audit — both confirmed by reading the
-exact code paths, not taken on the auditor's word alone. Documented first, on request, before any code
-change; both fixed shortly after in separate, explicitly-requested passes.
+Found across two rounds of independent, no-prior-context audits (fresh GLM instances given only the repo
++ this file, no knowledge of any work done in the session that built the features around them — the second
+round, right after H1/H2 shipped, also had no knowledge those fixes had just landed), then independently
+re-verified against the source by the session that requested each audit — every item confirmed by reading
+the exact code paths, not taken on the auditor's word alone. Documented first, on request, before any code
+change each time; all fixed shortly after in separate, explicitly-requested passes.
 
 1. **RESOLVED (2026-08-03).** Unauthenticated privilege escalation via registration. `POST
    /api/auth/register`'s `RegisterSchema` (`routes/auth.js`) allowed the caller to set `role` to any of
@@ -2439,8 +2441,25 @@ change; both fixed shortly after in separate, explicitly-requested passes.
    same underlying gap but weren't part of this finding; noted, not bundled into this fix. 8 new
    regression tests covering non-member/viewer/editor/owner access levels, the unassigned-workflow
    no-regression case, and confirming the `PUT` escape hatch stays intact.
+3. **RESOLVED (2026-08-03).** `POST /api/workflows/:id/toggle` was not gated by project membership either
+   — found by a second independent audit run right after item 2 shipped, exploiting exactly the follow-up
+   gap that fix's own doc comment had already called out. A non-member could flip a project-owned
+   workflow's active state (controlling whether its triggers fire) despite getting 403 just reading that
+   same workflow. Fixed: gated with the same `requireWorkflowProjectRole`, editor+ (matching `run`'s bar
+   — toggling is a real state change, not a read). 3 new regression tests.
+4. **RESOLVED (2026-08-03).** `GET /api/workflows/:id/executions` and `GET
+   /api/workflows/executions/:execId` were not gated by project membership — found by the same second
+   audit. A non-member could read a project-owned workflow's full execution history, including
+   `nodeResults` (real data the workflow processed, often more sensitive than the definition itself),
+   despite the definition itself being gated by item 2. Fixed: `GET /:id/executions` reuses
+   `requireWorkflowProjectRole`; new `requireExecutionProjectRole(engine, projectManager, minRole)`
+   (`routes/middleware.js`) resolves an execution id to its owning workflow's `projectId` for the
+   `:execId` case, mirroring the same shape. Both viewer+, matching `GET /:id`'s bar. `POST
+   /api/workflows/executions/:execId/retry` has the same underlying gap but wasn't part of this finding;
+   noted, not bundled in. 7 new regression tests, including confirming an unassigned workflow's
+   toggle/executions stay open to any authenticated user, unchanged.
 
-Both verified: 2 full-suite runs + 20 isolated runs of `integration.test.js` each, all clean. Also
+All four verified: 2 full-suite runs + 20 isolated runs of `integration.test.js` each, all clean. Also
 verified live over real spawned servers, each reproducing the exact exploit before the fix and confirming
 it's blocked after.
 
