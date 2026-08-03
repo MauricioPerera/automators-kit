@@ -148,10 +148,12 @@ export async function createApp(opts = {}) {
     masterKey: opts.secret || 'akit-dev-secret',
   });
   await workflowEngine.init();
-  router.route('/api/workflows', workflowRoutes(cms, workflowEngine));
 
-  // Projects -> Folders -> Workflows, project-scoped roles
+  // Projects -> Folders -> Workflows, project-scoped roles. Constructed
+  // before workflowRoutes() (moved up from below) because that route file
+  // now needs it too, to gate a project-owned workflow's read/run.
   const projectManager = new ProjectManager(cms.db);
+  router.route('/api/workflows', workflowRoutes(cms, workflowEngine, projectManager));
   router.route('/api/projects', projectRoutes(cms, projectManager, workflowEngine));
 
   // Agent Shell (command gateway)

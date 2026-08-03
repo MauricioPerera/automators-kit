@@ -940,6 +940,82 @@ describe('Projects', () => {
     expect(names).toContain('scoped-cred');
     expect(names).toContain('global-cred-http');
   });
+
+  // Security (2026-08-03, H2 from an independent audit): GET /api/workflows/:id
+  // and POST /api/workflows/:id/run used to require only `auth` -- any
+  // authenticated instance user could read or run ANY workflow, including
+  // one belonging to a project they're not a member of.
+  describe('workflow read/run is gated by project membership (H2)', () => {
+    async function makeProjectWorkflow() {
+      const { project } = await json(await app.handle(req('POST', '/api/projects', { name: `H2-${Date.now()}-${Math.random()}` }, adminToken)));
+      const { workflow } = await json(await app.handle(req('POST', '/api/workflows', {
+        name: 'Scoped WF', nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }],
+      }, adminToken)));
+      const { folder } = await json(await app.handle(req('POST', `/api/projects/${project._id}/folders`, { name: 'F' }, adminToken)));
+      await app.handle(req('POST', `/api/projects/${project._id}/folders/${folder._id}/workflows`, { workflowId: workflow._id }, adminToken));
+      return { project, workflow };
+    }
+
+    it('a non-member gets 403 on both GET and run', async () => {
+      const { workflow } = await makeProjectWorkflow();
+      const getRes = await app.handle(req('GET', `/api/workflows/${workflow._id}`, null, memberToken));
+      expect(getRes.status).toBe(403);
+      const runRes = await app.handle(req('POST', `/api/workflows/${workflow._id}/run`, {}, memberToken));
+      expect(runRes.status).toBe(403);
+      expect((await json(runRes)).error).toContain(workflow._id);
+      expect((await json(await app.handle(req('GET', `/api/workflows/${workflow._id}`, null, memberToken)))).error).toContain('viewer');
+    });
+
+    it('a project viewer can GET but not run (run requires editor+)', async () => {
+      const { project, workflow } = await makeProjectWorkflow();
+      await app.handle(req('POST', `/api/projects/${project._id}/members`, { userId: memberId, role: 'viewer' }, adminToken));
+
+      const getRes = await app.handle(req('GET', `/api/workflows/${workflow._id}`, null, memberToken));
+      expect(getRes.status).toBe(200);
+
+      const runRes = await app.handle(req('POST', `/api/workflows/${workflow._id}/run`, {}, memberToken));
+      expect(runRes.status).toBe(403);
+      expect((await json(runRes)).error).toContain('editor');
+    });
+
+    it('a project editor can both GET and run', async () => {
+      const { project, workflow } = await makeProjectWorkflow();
+      await app.handle(req('POST', `/api/projects/${project._id}/members`, { userId: memberId, role: 'editor' }, adminToken));
+
+      expect((await app.handle(req('GET', `/api/workflows/${workflow._id}`, null, memberToken))).status).toBe(200);
+      const runRes = await app.handle(req('POST', `/api/workflows/${workflow._id}/run`, {}, memberToken));
+      expect(runRes.status).toBe(200);
+      expect((await json(runRes)).execution.status).toBe('success');
+    });
+
+    it('a project owner can both GET and run (owner outranks editor)', async () => {
+      const { project, workflow } = await makeProjectWorkflow();
+      await app.handle(req('POST', `/api/projects/${project._id}/members`, { userId: memberId, role: 'owner' }, adminToken));
+
+      expect((await app.handle(req('GET', `/api/workflows/${workflow._id}`, null, memberToken))).status).toBe(200);
+      expect((await app.handle(req('POST', `/api/workflows/${workflow._id}/run`, {}, memberToken))).status).toBe(200);
+    });
+
+    it('a workflow with NO projectId (unassigned) stays open to any authenticated user -- unchanged, not a regression', async () => {
+      const { workflow } = await json(await app.handle(req('POST', '/api/workflows', {
+        name: 'Unassigned WF', nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }],
+      }, adminToken)));
+
+      expect((await app.handle(req('GET', `/api/workflows/${workflow._id}`, null, memberToken))).status).toBe(200);
+      expect((await app.handle(req('POST', `/api/workflows/${workflow._id}/run`, {}, memberToken))).status).toBe(200);
+    });
+
+    it("PUT /:id (the already-documented, separate escape hatch) is untouched -- a global editor can still edit a project's workflow without being a member", async () => {
+      const { workflow } = await makeProjectWorkflow();
+      const res = await app.handle(req('PUT', `/api/workflows/${workflow._id}`, { name: 'Renamed by global admin' }, adminToken));
+      expect(res.status).toBe(200);
+    });
+
+    it('GET /:id for a genuinely nonexistent workflow still 404s (the project-role check does its own not-found first)', async () => {
+      const res = await app.handle(req('GET', '/api/workflows/does-not-exist', null, adminToken));
+      expect(res.status).toBe(404);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

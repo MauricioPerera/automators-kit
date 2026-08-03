@@ -5,7 +5,7 @@
 
 import { Router, json, error } from '../core/http.js';
 import { validateBody } from '../core/validate.js';
-import { createAuth, requireRole } from './middleware.js';
+import { createAuth, requireRole, requireWorkflowProjectRole } from './middleware.js';
 import { validateWorkflowDefinition } from '../core/workflow.js';
 
 export const CreateSchema = {
@@ -19,8 +19,9 @@ export const CreateSchema = {
 /**
  * @param {import('../core/cms.js').CMS} cms
  * @param {import('../core/workflow.js').WorkflowEngine} engine
+ * @param {import('../core/projects.js').ProjectManager} projectManager
  */
-export function workflowRoutes(cms, engine) {
+export function workflowRoutes(cms, engine, projectManager) {
   const r = new Router();
   const auth = createAuth(cms);
 
@@ -51,10 +52,13 @@ export function workflowRoutes(cms, engine) {
     return json(validateWorkflowDefinition(body.nodes || []));
   });
 
-  r.get('/:id', auth, async (ctx) => {
-    const wf = engine.get(ctx.params.id);
-    if (!wf) return error('Workflow not found', 404);
-    return json({ workflow: wf });
+  // SECURITY (2026-08-03, H2): requireWorkflowProjectRole gates a
+  // project-owned workflow's read on that project's membership (viewer+);
+  // a workflow with no projectId stays open to any authenticated user,
+  // unchanged. See that middleware's doc comment for the full context and
+  // exactly what's deliberately NOT included in this fix.
+  r.get('/:id', auth, requireWorkflowProjectRole(engine, projectManager, 'viewer'), async (ctx) => {
+    return json({ workflow: ctx.state.workflow });
   });
 
   // Same lint as POST /validate above, run against an already-stored
@@ -100,7 +104,11 @@ export function workflowRoutes(cms, engine) {
 
   // ─── EXECUTION ────────────────────────────────────────────
 
-  r.post('/:id/run', auth, async (ctx) => {
+  // SECURITY (2026-08-03, H2): editor+ (not viewer+) -- running has real
+  // side effects (external API calls, credential use, data-table writes),
+  // matching this codebase's existing "view = viewer, act = editor"
+  // convention (e.g. routes/projects.js's own folder-assignment routes).
+  r.post('/:id/run', auth, requireWorkflowProjectRole(engine, projectManager, 'editor'), async (ctx) => {
     try {
       const body = await ctx.json() || {};
       const result = await engine.run(ctx.params.id, body);

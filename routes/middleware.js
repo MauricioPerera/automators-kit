@@ -89,3 +89,50 @@ export function requireProjectRole(projectManager, minRole) {
     return next();
   };
 }
+
+/**
+ * Like requireProjectRole, but for a route whose `:id` param is a WORKFLOW
+ * id, not a project id directly (routes/workflows.js's GET /:id, POST
+ * /:id/run). Looks up the workflow's own `projectId` and gates on THAT
+ * project's membership instead. A workflow with no `projectId`
+ * (unassigned/global) is left fully open to any authenticated user,
+ * unchanged -- same "project scoping is additive, never retroactively
+ * restricts a pre-existing unscoped resource" pattern used elsewhere
+ * (credential project-tagging's `list({projectId})` still returns every
+ * untagged/global credential too).
+ *
+ * SECURITY (2026-08-03, H2 from an independent audit): before this,
+ * `GET /api/workflows/:id` and `POST /api/workflows/:id/run` required only
+ * `auth` -- ANY authenticated instance user could read or run ANY
+ * workflow, including one that belongs to a project they're not a member
+ * of. Deliberately scoped to exactly those two routes, matching what the
+ * finding named: `PUT /api/workflows/:id` stays untouched (a SEPARATE,
+ * already-documented intentional escape hatch -- see the Projects section
+ * above), and `DELETE`/`toggle`/`executions` were not part of this finding
+ * either (same underlying gap, worth a follow-up, not bundled in here).
+ *
+ * Attaches the looked-up workflow onto `ctx.state.workflow` so the route
+ * handler doesn't have to fetch it a second time.
+ * @param {import('../core/workflow.js').WorkflowEngine} engine
+ * @param {import('../core/projects.js').ProjectManager} projectManager
+ * @param {'owner'|'editor'|'viewer'} minRole
+ */
+export function requireWorkflowProjectRole(engine, projectManager, minRole) {
+  return async (ctx, next) => {
+    const user = ctx.state.user;
+    if (!user) return error('Authorization required', 401);
+
+    const wf = engine.get(ctx.params.id);
+    if (!wf) return error('Workflow not found', 404);
+    ctx.state.workflow = wf;
+
+    if (!wf.projectId) return next(); // unassigned workflow -- any authenticated user, unchanged
+
+    if (!projectManager.hasProjectRole(wf.projectId, user._id, minRole)) {
+      const actual = projectManager.getMemberRole(wf.projectId, user._id);
+      const have = actual ? `'${actual}'` : 'no membership';
+      return error(`Insufficient project permissions: workflow '${ctx.params.id}' belongs to project '${wf.projectId}', requires '${minRole}' or higher, you have ${have}`, 403);
+    }
+    return next();
+  };
+}
