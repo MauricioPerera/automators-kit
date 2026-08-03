@@ -95,6 +95,11 @@ import { buildLevels } from './dag.js';
 // (including `undefined`/`null`, which a handler can legitimately return).
 const SKIPPED = Symbol('workflow-node-skipped');
 
+// Job type this engine registers on `opts.executionQueue` (see the
+// constructor and `_dispatchExecution` below). Namespaced so it doesn't
+// collide with an application's own job types on a shared queue instance.
+const EXECUTION_JOB_TYPE = 'akit:execute-workflow';
+
 // ---------------------------------------------------------------------------
 // WORKFLOW ENGINE
 // ---------------------------------------------------------------------------
@@ -133,6 +138,25 @@ export class WorkflowEngine {
    *   of its own set (see `create()`/`update()`'s `errorWorkflow` field).
    * @param {number} [opts.waitPollInterval] - How often (ms) to scan for
    *   due `wait.until` pauses to resume. Default 1000.
+   * @param {object} [opts.executionQueue] - A `core/queue.js` `JobQueue` or
+   *   `integrations/postgres-queue.js` `PostgresJobQueue` instance (both
+   *   share the same `register`/`enqueue`/`start`/`stop` shape, used here
+   *   duck-typed so either works transparently). When set, TRIGGER-fired
+   *   executions (webhook/cron/poll) and error-workflow triggering are
+   *   enqueued instead of run in-process directly, so any worker process
+   *   sharing that queue (via `PostgresJobQueue`, genuinely multi-process/
+   *   multi-machine) can pick them up -- real horizontal scaling for
+   *   triggered load. Default unset: zero behavior change, everything
+   *   runs in-process exactly as before. Deliberately does NOT affect
+   *   `run()`/`retryExecution()`/`resumeWebhook()` (an explicit caller
+   *   waiting for a real synchronous result) or the `workflow.execute`/
+   *   `loop.forEach` nodes (a sub-workflow the parent must await directly)
+   *   -- see `_dispatchExecution`'s doc comment. This distributes
+   *   EXECUTION DISPATCH only; the underlying `db` (workflow/execution/
+   *   credential storage) still needs to be genuinely shared for true
+   *   multi-machine deployment (e.g. `integrations/postgres-collection.js`,
+   *   not wired in here) -- a single-machine `FileStorageAdapter` on local
+   *   disk works fine for multi-PROCESS scaling on one box, not multiple.
    */
   constructor(db, opts = {}) {
     this.db = db;
@@ -143,6 +167,19 @@ export class WorkflowEngine {
     this._defaultErrorWorkflow = opts.defaultErrorWorkflow || null;
     this._waitPollInterval = opts.waitPollInterval || 1000;
     this._waitTimer = null;
+    this._executionQueue = opts.executionQueue || null;
+    if (this._executionQueue) {
+      this._executionQueue.register(EXECUTION_JOB_TYPE, async (data) => {
+        const result = await this.execute(data.workflowId, data.triggerData);
+        // Deliberately a small summary, not the full result -- the real
+        // record already lives in `_executions` (via _finalizeExecution,
+        // same as any other execution), reachable through the normal
+        // getExecution()/getExecutions() API regardless of whether this
+        // ran via the queue or in-process. Keeps the queue's own `result`
+        // column from bloating with potentially large nodeResults.
+        return { executionId: result._id, status: result.status };
+      });
+    }
 
     try { this._workflows.createIndex('name'); } catch {}
     try { this._workflows.createIndex('active'); } catch {}
@@ -335,16 +372,21 @@ export class WorkflowEngine {
     // Trigger manager
     this._triggers = new TriggerManager({
       onTrigger: (workflowId, triggerData) => {
-        this.execute(workflowId, triggerData).catch(err => {
+        this._dispatchExecution(workflowId, triggerData).catch(err => {
           console.error(`[Workflow] Auto-execution failed for ${workflowId}:`, err.message);
         });
       },
     });
   }
 
-  /** Initialize vault */
+  /** Initialize vault (and the execution queue's tables, for PostgresJobQueue) */
   async init() {
     await this._vault.init();
+    // PostgresJobQueue needs init() to create its tables; core/queue.js's
+    // JobQueue has no init() at all -- duck-typed check, harmless either way.
+    if (typeof this._executionQueue?.init === 'function') {
+      await this._executionQueue.init();
+    }
     // Re-register triggers for active workflows
     const active = this._workflows.find({ active: true }).toArray();
     for (const wf of active) {
@@ -354,21 +396,43 @@ export class WorkflowEngine {
     }
   }
 
-  /** Start triggers (cron, polling) and the wait.until resume poller */
+  /**
+   * Fire-and-forget execution dispatch, shared by trigger firing and
+   * error-workflow triggering (see both call sites) -- the two places
+   * that never had an explicit caller waiting on the result even before
+   * `executionQueue` existed. When `opts.executionQueue` is configured,
+   * enqueues a job instead of running in-process directly; otherwise
+   * (the default) calls `execute()` exactly as before. Returns whatever
+   * the chosen path returns so each caller can attach its OWN `.catch()`
+   * with a message specific to its own context (a genuinely failed
+   * WORKFLOW never rejects this -- `execute()` resolves with `status:
+   * 'failed'` for a node-level failure; only an unexpected exception, or
+   * a failure to enqueue, reaches that `.catch()`).
+   */
+  _dispatchExecution(workflowId, triggerData) {
+    if (this._executionQueue) {
+      return Promise.resolve(this._executionQueue.enqueue(EXECUTION_JOB_TYPE, { workflowId, triggerData }));
+    }
+    return this.execute(workflowId, triggerData);
+  }
+
+  /** Start triggers (cron, polling), the wait.until resume poller, and the execution queue if configured */
   start() {
     this._triggers.start();
     if (!this._waitTimer) {
       this._waitTimer = setInterval(() => this._pollWaitingExecutions(), this._waitPollInterval);
     }
+    this._executionQueue?.start();
   }
 
-  /** Stop all triggers and the wait.until resume poller */
+  /** Stop all triggers, the wait.until resume poller, and the execution queue if configured */
   stop() {
     this._triggers.stop();
     if (this._waitTimer) {
       clearInterval(this._waitTimer);
       this._waitTimer = null;
     }
+    this._executionQueue?.stop();
   }
 
   // ─── CRUD ────────────────────────────────────────────────
@@ -1027,7 +1091,7 @@ export class WorkflowEngine {
       trigger: triggerData,
     };
 
-    this.execute(errorWorkflowId, errorContext).catch((err) => {
+    this._dispatchExecution(errorWorkflowId, errorContext).catch((err) => {
       console.error(`[Workflow] Error workflow '${errorWorkflowId}' (for failed workflow '${wf._id}') itself failed:`, err.message);
     });
   }

@@ -8,6 +8,7 @@ import { WorkflowEngine, validateWorkflowDefinition } from '../core/workflow.js'
 import { NodeRegistry } from '../core/nodes.js';
 import { CredentialVault } from '../core/credentials.js';
 import { TriggerManager, TriggerType } from '../core/triggers.js';
+import { JobQueue } from '../core/queue.js';
 
 let db, engine;
 
@@ -1899,5 +1900,140 @@ describe('Execution timeout (settings.executionTimeoutMs)', () => {
     const exec = await engine.run(wf._id);
     expect(exec.status).toBe('failed');
     await expect(engine.retryExecution(exec._id)).rejects.toThrow(/no recorded failure point/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Execution queue wiring (opts.executionQueue) -- horizontal scaling for
+// triggered/error-workflow load. Uses core/queue.js's zero-dependency
+// JobQueue as the test double: it shares the exact register/enqueue/start/
+// stop shape with integrations/postgres-queue.js's PostgresJobQueue (the
+// real multi-process one), so proving the wiring here proves it works with
+// either -- PostgresJobQueue's OWN correctness is tested separately.
+// ---------------------------------------------------------------------------
+
+describe('Execution queue wiring (opts.executionQueue)', () => {
+  it('with no executionQueue configured (default), a trigger still runs in-process directly -- zero behavior change', async () => {
+    // Reuses the real engine (no queue) from the top-level beforeEach.
+    const wf = engine.create({
+      name: 'DirectDefault', trigger: { type: 'webhook', config: { path: 'direct-default' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }], active: true,
+    });
+    engine.webhookTrigger('direct-default', {}, null);
+    await new Promise((r) => setTimeout(r, 20));
+    const execs = engine.getExecutions(wf._id, 5);
+    expect(execs.length).toBe(1);
+    expect(execs[0].status).toBe('success');
+  });
+
+  it('with an executionQueue configured, a webhook trigger enqueues a job instead of running immediately', async () => {
+    const qdb = new DocStore(new MemoryStorageAdapter());
+    const queue = new JobQueue(qdb, { pollInterval: 50 });
+    const qEngine = new WorkflowEngine(qdb, { masterKey: 'q-master-key!!!', executionQueue: queue });
+    await qEngine.init();
+
+    const wf = qEngine.create({
+      name: 'QueuedHook', trigger: { type: 'webhook', config: { path: 'queued-hook' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 'queued' } }], active: true,
+    });
+
+    qEngine.webhookTrigger('queued-hook', {}, null);
+    // The queue is NOT started yet -- nothing should have executed.
+    await new Promise((r) => setTimeout(r, 20));
+    expect(qEngine.getExecutions(wf._id, 5).length).toBe(0);
+    expect(queue.stats().pending).toBe(1);
+
+    qEngine.start(); // starts the queue too (see start()'s doc comment)
+    await new Promise((r) => setTimeout(r, 150));
+
+    const execs = qEngine.getExecutions(wf._id, 5);
+    expect(execs.length).toBe(1);
+    expect(execs[0].status).toBe('success');
+    expect(execs[0].nodeResults.n.data).toBe('queued');
+    expect(queue.stats().completed).toBe(1);
+
+    qEngine.stop();
+  });
+
+  it('run() stays synchronous and in-process even with an executionQueue configured -- never queued', async () => {
+    const qdb = new DocStore(new MemoryStorageAdapter());
+    const queue = new JobQueue(qdb, { pollInterval: 50 });
+    const qEngine = new WorkflowEngine(qdb, { masterKey: 'q-master-key2!!!', executionQueue: queue });
+    await qEngine.init();
+
+    const wf = qEngine.create({ name: 'ManualStaysDirect', nodes: [{ id: 'n', type: 'set.value', inputs: { value: 'direct' } }] });
+    const exec = await qEngine.run(wf._id); // awaited, must return the REAL result immediately
+
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.n.data).toBe('direct');
+    expect(queue.stats().pending).toBe(0); // never touched the queue at all
+  });
+
+  it('a sub-workflow (workflow.execute node) stays direct, not queued -- the parent must await it synchronously', async () => {
+    const qdb = new DocStore(new MemoryStorageAdapter());
+    const queue = new JobQueue(qdb, { pollInterval: 50 });
+    const qEngine = new WorkflowEngine(qdb, { masterKey: 'q-master-key3!!!', executionQueue: queue });
+    await qEngine.init();
+
+    const child = qEngine.create({ name: 'Child', nodes: [{ id: 'c', type: 'set.value', inputs: { value: 'child-result' } }] });
+    const parent = qEngine.create({
+      name: 'Parent',
+      nodes: [{ id: 'call', type: 'workflow.execute', inputs: { workflowId: child._id, data: {} } }],
+    });
+    const exec = await qEngine.run(parent._id);
+
+    expect(exec.status).toBe('success');
+    expect(exec.nodeResults.call.data.status).toBe('success');
+    expect(queue.stats().pending).toBe(0); // the sub-workflow call never touched the queue
+  });
+
+  it('a failed workflow with an errorWorkflow set enqueues the error workflow too, when a queue is configured', async () => {
+    const qdb = new DocStore(new MemoryStorageAdapter());
+    const queue = new JobQueue(qdb, { pollInterval: 50 });
+    const qEngine = new WorkflowEngine(qdb, { masterKey: 'q-master-key4!!!', executionQueue: queue });
+    await qEngine.init();
+    qEngine.start();
+
+    const errorHandler = qEngine.create({
+      name: 'ErrHandler',
+      nodes: [{ id: 'log', type: 'set.value', inputs: { value: '{{_trigger.error.message}}' } }],
+    });
+    const wf = qEngine.create({
+      name: 'FailsWithHandler',
+      errorWorkflow: errorHandler._id,
+      trigger: { type: 'webhook', config: { path: 'fails-with-handler' } },
+      nodes: [{ id: 'n', type: 'http.request', credentials: 'does-not-exist', inputs: { url: 'http://example.com' } }],
+      active: true,
+    });
+
+    qEngine.webhookTrigger('fails-with-handler', {}, null);
+    await new Promise((r) => setTimeout(r, 150));
+
+    const mainExecs = qEngine.getExecutions(wf._id, 5);
+    expect(mainExecs.length).toBe(1);
+    expect(mainExecs[0].status).toBe('failed');
+
+    const errorExecs = qEngine.getExecutions(errorHandler._id, 5);
+    expect(errorExecs.length).toBe(1);
+    expect(errorExecs[0].nodeResults.log.data).toContain("Credential 'does-not-exist' not found");
+
+    qEngine.stop();
+  });
+
+  it('init() awaits the queue\'s own init() when present (PostgresJobQueue-shaped), and is a harmless no-op when absent (JobQueue-shaped)', async () => {
+    let initCalled = false;
+    const fakeQueueWithInit = {
+      register: () => {}, enqueue: async () => ({}), start: () => {}, stop: () => {},
+      init: async () => { initCalled = true; },
+    };
+    const qdb = new DocStore(new MemoryStorageAdapter());
+    const qEngine = new WorkflowEngine(qdb, { masterKey: 'q-master-key5!!!', executionQueue: fakeQueueWithInit });
+    await qEngine.init();
+    expect(initCalled).toBe(true);
+
+    // core/queue.js's real JobQueue has no init() at all -- must not throw.
+    const qdb2 = new DocStore(new MemoryStorageAdapter());
+    const qEngine2 = new WorkflowEngine(qdb2, { masterKey: 'q-master-key6!!!', executionQueue: new JobQueue(qdb2) });
+    await expect(qEngine2.init()).resolves.toBeUndefined();
   });
 });

@@ -93,6 +93,10 @@ via the standard tools/list method.`;
  * @param {object} opts.plugins - Plugin config: { plugins: [...] }
  * @param {boolean} opts.cors - Enable CORS (default: true)
  * @param {boolean} opts.logger - Enable request logging (default: false)
+ * @param {object} [opts.workflowExecutionQueue] - A JobQueue/PostgresJobQueue
+ *   instance to distribute triggered/error-workflow execution across
+ *   worker processes. See WorkflowEngine's `opts.executionQueue` doc
+ *   comment (core/workflow.js). Unset by default.
  * @returns {Promise<{ handle: (req: Request) => Promise<Response>, cms: CMS, router: Router }>}
  */
 export async function createApp(opts = {}) {
@@ -146,6 +150,12 @@ export async function createApp(opts = {}) {
   // Workflow engine (n8n-style)
   const workflowEngine = new WorkflowEngine(cms.db, {
     masterKey: opts.secret || 'akit-dev-secret',
+    // Optional: a core/queue.js JobQueue or integrations/postgres-queue.js
+    // PostgresJobQueue instance, for distributing triggered/error-workflow
+    // execution across worker processes. Unset by default -- everything
+    // runs in-process exactly as before. See WorkflowEngine's own opts
+    // doc comment for what this does and does not cover.
+    executionQueue: opts.workflowExecutionQueue,
   });
   await workflowEngine.init();
 
