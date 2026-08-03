@@ -213,6 +213,14 @@ describe('BUILTIN_NODES outputs metadata', () => {
     }
   });
 
+  it("text.template documents that its own {{var}} substitution (via `data`) is dead inside a real workflow -- {{...}} in `template` is already consumed by the engine's own {{ref}} resolution before this handler runs", () => {
+    const node = BUILTIN_NODES.find(n => n.type === 'text.template');
+    expect(node.description).toContain('standalone');
+    expect(node.description).toContain('WorkflowEngine');
+    const dataInput = node.inputs.find(i => i.name === 'data');
+    expect(dataInput.note).toContain('dead');
+  });
+
   it('wait.until and wait.forWebhook are genuinely correct as declared -- no note needed, their outputs are real object keys', () => {
     const waitUntil = BUILTIN_NODES.find(n => n.type === 'wait.until');
     expect(waitUntil.outputs).toEqual([{ name: 'resumeAt', type: 'number' }]);

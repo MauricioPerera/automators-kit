@@ -491,11 +491,32 @@ const BUILTIN_NODES = [
   {
     type: 'text.template',
     name: 'Text Template',
+    // Found live (2026-08-03 full system test): this node's own {{variable}}
+    // substitution (below, driven by `data`) and a WorkflowEngine's {{ref}}
+    // resolution use the IDENTICAL {{...}} delimiter, and the engine's
+    // `_resolveInputs` always resolves EVERY string input -- including
+    // `template` -- before a handler ever runs. Inside a real workflow, any
+    // {{name}} in `template` is therefore already gone (replaced with the
+    // matching node's/`_trigger`'s value, or silently blanked to '' if
+    // `name` isn't a real node id) by the time this handler's own loop
+    // runs -- `data`'s placeholders never get a chance to substitute.
+    // Reproduced live: template "calc={{n}}, sw={{s}}" with data
+    // { n: '{{doubled}}', s: '{{sw}}' } rendered "calc=, sw=" -- both
+    // placeholders silently blanked, not an error. `data`'s own
+    // substitution is only ever actually exercised standalone, via
+    // NodeRegistry.execute() directly, outside a WorkflowEngine.
     category: 'data',
-    description: 'Render text with {{variable}} placeholders',
+    description: 'Render text with {{variable}} placeholders from `data` -- but ONLY when run standalone ' +
+      'via NodeRegistry.execute() outside a WorkflowEngine. Inside a real workflow, {{...}} in `template` ' +
+      "is resolved by the engine's OWN {{ref}} syntax before this handler ever runs, so `data`'s " +
+      'placeholders never get a chance to substitute (silently blanked to \'\', not an error). Inside a ' +
+      "workflow, reference {{_trigger.x}}/{{otherNodeId}} directly in `template` instead of using `data`.",
     inputs: [
       { name: 'template', type: 'string', required: true },
-      { name: 'data', type: 'object' },
+      { name: 'data', type: 'object', note:
+        "Only takes effect standalone (NodeRegistry.execute() outside a WorkflowEngine) -- inside a " +
+        "workflow, the engine's own {{ref}} resolution already consumed every {{...}} in `template` " +
+        'before this handler runs, so anything here is dead. See the node-level description.' },
     ],
     outputs: [{ name: 'text', type: 'string', note: BARE_VALUE_NOTE('text') }],
     handler: async (inputs) => {

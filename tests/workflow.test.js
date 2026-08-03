@@ -88,6 +88,26 @@ describe('NodeRegistry', () => {
     expect(result).toBe('Hello Alice, you have 5 items');
   });
 
+  it("text.template's OWN {{var}} substitution (via `data`) is dead inside a real workflow -- documented, not a regression: the engine's {{ref}} resolution already consumed every {{...}} in `template` before this handler ran", async () => {
+    // Found live (2026-08-03 full system test). Locks in the documented
+    // behavior so it can't silently change without deliberate awareness --
+    // the standalone case just above still works correctly and is
+    // unaffected; only the WorkflowEngine._runLevels path is dead.
+    const wf = engine.create({
+      name: 'TemplateInsideWorkflow',
+      nodes: [{
+        id: 'tpl', type: 'text.template',
+        inputs: { template: 'Hello {{name}}, you have {{count}} items', data: { name: 'Alice', count: 5 } },
+      }],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    // Both placeholders silently blanked -- 'name'/'count' aren't real node
+    // ids, so the engine's own {{ref}} resolution replaces them with ''
+    // before text.template's handler ever sees them.
+    expect(exec.nodeResults.tpl.data).toBe('Hello , you have  items');
+  });
+
   it('execute math.calc', async () => {
     expect(await engine.nodes.execute('math.calc', { a: 10, operation: 'add', b: 5 })).toBe(15);
     expect(await engine.nodes.execute('math.calc', { a: 10, operation: 'multiply', b: 3 })).toBe(30);
