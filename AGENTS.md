@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1361 tests | 0 deps | 27 core modules
+By automators.work | 1369 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry, persistent per-workflow scratch space (workflow.staticData), instance-wide concurrency cap with backpressure, optional execution queue for horizontal scaling, synchronous webhook response (respond: 'whenFinished'), createdBy/updatedBy attribution
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry, persistent per-workflow scratch space (workflow.staticData), instance-wide concurrency cap with backpressure, execution-history retention, optional execution queue for horizontal scaling, synchronous webhook response (respond: 'whenFinished'), createdBy/updatedBy attribution
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -1672,6 +1672,38 @@ in `execution.status`, not the HTTP status code) -- a genuine failure to even ru
 was deleted mid-flight) still falls through to 500. The secret check (`X-Webhook-Secret`) still applies
 before dispatch either way. Default unset: zero behavior change for every existing webhook.
 
+### Execution history retention
+
+Every execution persists its full `nodeResults` — the actual data the workflow processed, not a summary
+— so history grows forever unless something trims it. Two bounds, both **off by default**:
+
+```javascript
+const engine = new WorkflowEngine(db, {
+  executionRetentionMs: 30 * 24 * 60 * 60 * 1000,  // drop FINISHED runs older than 30 days
+  maxStoredExecutions: 10000,                       // and keep at most this many, newest first
+  retentionIntervalMs: 3600000,                     // pass frequency (default hourly)
+});
+engine.retentionStats();    // { total, finished, inFlight, retentionMs, maxStored, enabled }
+engine.pruneExecutions();   // run a pass by hand -> { byAge, byCount, removed }
+```
+
+Or `createApp({ executionRetentionMs, maxStoredExecutions, retentionIntervalMs })`.
+
+**Both bounds are needed.** Age alone does not cap a burst: a workflow firing every second fills the
+store long before anything is old enough to expire.
+
+**Only TERMINAL executions are ever eligible** (`success`, `failed`). `waiting`, `running` and
+`resuming` are still in flight — deleting one throws away work that can still complete, along with the
+`waitState` holding its resume secret. This was a real bug, not a hypothetical: `purgeExecutions()`
+used to filter on age alone and deleted all of them (see Known Security Gaps item 28).
+
+**Why this defaults OFF while the concurrency cap above defaults ON.** Backpressure only delays work;
+retention DELETES it irreversibly. Turning that on silently at upgrade could destroy history someone
+depends on, which is a worse failure than the growth it prevents. Growth is made observable instead —
+`retentionStats()` separates `finished` (what retention may touch) from `inFlight` (what it may not),
+so the need for it is visible rather than guessed at. When no bound is configured, `start()` installs
+no timer at all.
+
 ### Concurrent execution limit (backpressure)
 
 Trigger-fired executions (webhook/cron/poll) and error-workflow triggering are capped instance-wide, so
@@ -2667,6 +2699,19 @@ enumerating them. A shared schema registry (`getTableSchema`/`setTableSchema`/`r
 "Typed columns (optional)" above for the full contract and why sharing it matters. Additive
 throughout. 20 new tests; `/api/schema` synced.
 
+**Execution-history retention (2026-08-04):** continuing the n8n comparison — every execution persists
+its full `nodeResults` (the real data processed, not a summary) and NOTHING ever trimmed them.
+`purgeExecutions()` existed in both `WorkflowEngine` and `PostgresExecutionLog` with no caller anywhere:
+no timer, no route, no option. New `opts.executionRetentionMs` (age) and `opts.maxStoredExecutions`
+(count) with an hourly pass, both reachable through `createApp()`, plus `pruneExecutions()` and
+`retentionStats()`. Both bounds are needed — age alone cannot cap a burst. Both default OFF, and the
+asymmetry with the concurrency cap's default-ON is deliberate: see "Execution history retention" above.
+Automating it surfaced a data-loss bug in the function itself, filed as gap item 28: it deleted
+in-flight executions, including a `waiting` one and the `waitState` needed to resume it. This is the
+fourth time in this stretch the gap was "the mechanism exists and nothing drives it" — after `Table`
+(exported, unused), the concurrency cap (`PostgresJobQueue` had one, the default path did not), and
+this. Worth checking for directly when looking for what is missing. 8 new tests.
+
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
 - AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
@@ -2682,11 +2727,12 @@ Current posture:
 - Query filters and schemas fail CLOSED, never open: an unknown/misspelled query operator throws rather than being treated as satisfied, non-array `$in`/`$nin` targets are rejected, and `validate.js`'s `enum`/`min`/`max` apply to every rule shape, not just explicitly-typed strings
 - Session auto-cleanup
 - Webhook HMAC-SHA256 signing + optional per-webhook secret
+- Optional execution-history retention (age and/or count bounded, off by default since it deletes irreversibly; in-flight executions are never eligible)
 - Rate limiting in triggers, plus an instance-wide cap on concurrently running trigger-fired executions (default 100, overflow queued, backlog bounded) so a burst cannot exhaust the process
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-27 resolved; open items listed at the end)
+## Known Security Gaps (items 1-28 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -3154,7 +3200,19 @@ to expose" are different questions, and a clean audit of the former says nothing
    module's read model), but the value the update is applied to always comes from the locked row, which
    is what makes concurrent operators correct.
 
-Items 1-4 and 6-27 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+28. **RESOLVED (2026-08-04), HIGH (data loss).** `purgeExecutions()` deleted executions that were still
+   IN FLIGHT. It filtered on `startedAt` alone, ignoring status, so a `waiting` execution — a
+   `wait.forWebhook` parked for an external callback, together with the `waitState` holding its resume
+   secret — was deleted along with `running` and `resuming` ones. A workflow legitimately parked for
+   longer than the retention window was destroyed mid-flight and could never be resumed; the caller saw
+   only a count of rows removed. Verified before the fix: five executions, one per status, **all five
+   deleted**. Found while automating retention (the function had never had a caller, so the bug had
+   never been reachable in practice — automating it would have made it reachable on a timer, which is
+   the more alarming half). Fixed: only `success` and `failed` are eligible, in both the age-based purge
+   and the new count-based trim. 8 new regression tests, including one asserting exactly which statuses
+   survive.
+
+Items 1-4 and 6-28 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
