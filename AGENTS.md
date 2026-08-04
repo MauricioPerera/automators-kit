@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1333 tests | 0 deps | 27 core modules
+By automators.work | 1336 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -2589,7 +2589,7 @@ Current posture:
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-24 resolved; open items listed at the end)
+## Known Security Gaps (items 1-25 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -2601,7 +2601,7 @@ section) were spot-checked against current source rather than trusted at face va
 held. Item 7 found yet another way: comparing the platform directly against a specific n8n concept
 (the protected instance owner) rather than an audit or a claims check. Item 8 was found reasoning about a
 small, unrelated feature (listing data-table collection names) and stress-testing the design decision it
-exposed. Items 9-24 came from the full-codebase audit described below — including item 9, which found
+exposed. Items 9-25 came from the full-codebase audit described below — including item 9, which found
 that item 8's own fix was bypassable. Documented first, on request, before any code change each time; all
 fixed shortly after in separate, explicitly-requested passes.
 
@@ -3002,7 +3002,28 @@ to expose" are different questions, and a clean audit of the former says nothing
    returning nothing. 6 new tests, including a randomized 120-vector / 40-delete recall check against an
    exact scan.
 
-Items 1-4 and 6-24 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+25. **RESOLVED (2026-08-03), HIGH.** Error-workflow cascades were unbounded, and the `depth >= 5` cap
+   that existed to stop them never engaged. Two independent leaks, both fixed because they defend
+   different shapes: (a) `_errorDepth` did not survive a hop through a sub-workflow —
+   `_maybeTriggerErrorWorkflow` reads the depth off the triggerData it is handed, but the
+   `workflow.execute` node built its `subTriggerData` without it, so every lap reset it to 0; (b) the
+   error-workflow dispatch passed no call chain at all, so the cycle detection `execute()` already has
+   could not see the hop. With `A` failing into error workflow `B` and `B` calling `A` back, that is an
+   unbounded cascade — measured **6720 executions of A in 20 seconds**, ended only by killing the child
+   process from outside.
+   `_errorDepth` now travels in the node ctx alongside the call chain, and the error context carries the
+   chain with the failing workflow appended — so an `A -> B -> A` cycle is refused on the FIRST lap
+   (the likely shape of a misconfigured error workflow), while the depth cap still bounds a long chain
+   of DISTINCT error workflows, where there is no cycle to detect. Verified: `A -> B -> A` runs A once
+   (was 6720 and climbing), a normal error workflow still runs exactly once, and a chain of ten distinct
+   workflows stops at six. 3 new tests.
+   **Method note worth keeping:** this could not be verified in-process. The cascade starves the event
+   loop, so a `setTimeout` watchdog never fires — the auditor reported it killed their process twice for
+   exactly that reason. It needs an out-of-process timeout (a spawned child killed from outside), and
+   the regression tests assert on execution COUNTS after a bounded sleep rather than with a timer, for
+   the same reason.
+
+Items 1-4 and 6-25 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
@@ -3021,15 +3042,13 @@ and has not been attempted.
 
 **Other audit findings confirmed but not yet fixed** — recorded here rather than dropped, since a finding
 that is real and unlisted is worse than one that is real and known:
-- Reported by auditors, NOT independently reproduced here (so treat as leads, not conclusions): an
-  unbounded error-workflow loop, and the rest of the Postgres integrations (audited by reading only —
-  `pg` is not installed here, the same limitation the auditors had on that file).
-  **Track record: 8 of the 8 leads checked so far turned out to be real bugs** (items 19-24), several
-  of them severe. The remaining ones deserve the same treatment rather than being assumed noise.
-  Note on the error-workflow one: the auditor reported that instrumenting it killed their process
-  twice — two `setTimeout` watchdogs never fired at all, because the cascade starves the event loop.
-  Verifying it needs an out-of-process timeout (a spawned child killed from outside), not an in-process
-  watchdog, or it will just hang whoever tries.
+- The Postgres integrations, audited by READING ONLY — `pg` is not installed here, the same limitation
+  the auditors had on that file. This also covers the Postgres half of item 19's fix: it parses and is
+  reasoned line by line, but was never executed. Treat it as unverified, not as resolved.
+  **Track record: 9 of the 9 leads checked turned out to be real bugs** (items 19-25), several of them
+  severe, and none was noise. That is the reason the Postgres items are left listed rather than assumed
+  fine: the sample so far says an unchecked auditor lead in this codebase is more likely real than not.
+  Verifying them needs a live Postgres, which this environment does not have.
 - `core/db.js`'s `$elemMatch` does not match an array of PRIMITIVES against an operator target
   (`{x: [1]}` vs `{x: {$elemMatch: {$gt: 0}}}` → false): the handler wraps each primitive as
   `{'': elem}`, so the target's `$gt` is looked up as a FIELD on that wrapper and resolves to
