@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1236 tests | 0 deps | 27 core modules
+By automators.work | 1284 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -31,7 +31,7 @@ cron.js            Cron scheduler: 5-field expressions, tick, enable/disable
 connector.js       HTTP client: auth presets, retries, timeout (Slack/Discord/REST)
 memory.js          Agent memory: semantic + episodic + working, recall with decay
 parallel.js        Task orchestration: race/merge/all strategies, timeout, weighted scoring
-net-guard.js       SSRF guard: blocks loopback/RFC1918/link-local/cloud-metadata destinations
+net-guard.js       SSRF guard: blocks loopback/RFC1918/link-local/cloud-metadata destinations, IPv4 + IPv6 (incl. IPv4-mapped and unique-local)
 log.js             Structured logging: leveled, JSON-per-line entries, pluggable sink
 metrics.js         In-process metrics: counters/gauges/histograms, Prometheus text exposition format
 csv.js             CSV parsing: RFC-4180 quoted fields, embedded delimiters/newlines, escaped quotes
@@ -2576,8 +2576,10 @@ Current posture:
 - Workflow credential-vault master key: random per-instance unless `opts.secret` is configured explicitly, via `createApp()` or `WorkflowEngine` directly (no hardcoded fallback either way)
 - Timing-safe password comparison (byte-level XOR)
 - Credential vault with encrypted storage, random per-installation PBKDF2 salt
-- SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions, plus a real, enforced HTTP header for webhook secrets
-- RBAC: 4 roles (CMS, with `:own`-scope enforcement) + 4 agent profiles (Shell, fail-closed default, `profile` alone now actually restricts)
+- SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions, covering IPv4 and IPv6 (including IPv4-mapped/compatible forms and unique-local `fc00::/7`), plus a real, enforced HTTP header for webhook secrets. Does NOT cover redirects or DNS resolution — see the open item at the end of Known Security Gaps
+- RBAC: 4 roles (CMS, with `:own`-scope enforcement genuinely wired through the entry routes) + 4 agent profiles (Shell, fail-closed default, `profile` alone now actually restricts)
+- Collection names validated at the `DocStore.collection()` chokepoint (positive allowlist), so no caller can turn one into a path traversal; internal (`_`-prefixed) collections unreachable from both untrusted surfaces (`/api/db/:col` and the `data.table` node) via one shared check
+- Prototype-chain segments (`__proto__`/`constructor`/`prototype`) refused on every user-influenced path write/read: `db.js` dot-paths, `workflow.js` `{{ref}}`s, `shell.js` projections, `a2e.js` `outputPath`/`StoreData` keys
 - Plugin capability manifest, gated `database`/collection access, path-traversal guard on local plugin loading
 - ReDoS guards on user-supplied `$regex`/pattern input (db.js, vector.js, a2e.js)
 - Session auto-cleanup
@@ -2586,7 +2588,7 @@ Current posture:
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (all resolved)
+## Known Security Gaps (items 1-14 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -2596,10 +2598,39 @@ confirmed by reading the exact code paths, not taken on the auditor's word alone
 way: this session's own audit-summary claims (the "3 full security audits" list in README.md's Security
 section) were spot-checked against current source rather than trusted at face value, and one no longer
 held. Item 7 found yet another way: comparing the platform directly against a specific n8n concept
-(the protected instance owner) rather than an audit or a claims check. Item 8 — the most severe finding
-in this entire list — was found reasoning about a small, unrelated feature (listing data-table
-collection names) and stress-testing the design decision it exposed. Documented first, on request,
-before any code change each time; all fixed shortly after in separate, explicitly-requested passes.
+(the protected instance owner) rather than an audit or a claims check. Item 8 was found reasoning about a
+small, unrelated feature (listing data-table collection names) and stress-testing the design decision it
+exposed. Items 9-14 came from the full-codebase audit described below — including item 9, which found
+that item 8's own fix was bypassable. Documented first, on request, before any code change each time; all
+fixed shortly after in separate, explicitly-requested passes.
+
+### Full-codebase audit (2026-08-03)
+
+~18.6k lines audited by six auditors running in parallel, split by slice: the whole HTTP boundary (13
+`routes/*.js` + `core/http.js`); `core/db.js`; the workflow engine (`workflow`/`triggers`/`nodes`/
+`credentials`/`projects`/`dag`); CMS + agent surfaces (`cms`/`plugins`/`shell`/`shell-mcp`/`mcp`); the
+data/AI modules (`vector`/`hnsw`/`memory`/`a2e`/`portable-text`); and wiring + utilities (`index.js`,
+`integrations/*`, `adapters/*`, queue/cron/connector/validate/net-guard). Each was required to give
+`file:line`, a concrete exploit or failure scenario, and an honest evidence tag distinguishing
+"verified by running something" from "inferred by reading code", and was explicitly barred from
+reporting style nits or deliberate decisions already documented in comments.
+
+~80 raw findings came back. **Every finding acted on was re-verified from the source and reproduced
+directly before being reported or fixed — never taken on an auditor's word.** That caught two
+overclaims worth recording, because they show the failure mode:
+- One auditor rated the agent shell CRITICAL with a working privilege-escalation transcript — using a
+  `users:promote` command **it had registered itself**. A stock `createApp()` shell registers only benign
+  builtins (`set`/`get`/`filter`/`calc`/`template`/`base64`/`now`). The real issue is a genuine footgun
+  (the shell is mounted with no auth and `createApp` overrides `core/shell.js`'s fail-closed
+  `'restricted'` default with `'admin'`/`['*']`), dangerous the moment any real command is registered as
+  the `examples/` do — but not shipped privilege escalation.
+- Another reported that `sort()` over a SortedIndex silently drops documents missing the sort field.
+  It did not reproduce in either insertion order tried.
+
+Also worth recording: the second independent audit (items 3-4 above) had explicitly verified generic
+`/api/db` "holds up". It tested that the CRUD mechanics worked correctly and never that its
+authorization boundary existed at all — a reminder that "this feature works" and "this feature is safe
+to expose" are different questions, and a clean audit of the former says nothing about the latter.
 
 1. **RESOLVED (2026-08-03).** Unauthenticated privilege escalation via registration. `POST
    /api/auth/register`'s `RegisterSchema` (`routes/auth.js`) allowed the caller to set `role` to any of
@@ -2741,11 +2772,119 @@ before any code change each time; all fixed shortly after in separate, explicitl
    `integration.test.js`, all clean. Also verified live over a real spawned server reproducing the exact
    passwordHash-leak and self-promotion exploits, confirming both now return 403 and the account is still
    just a `'viewer'` afterward.
+9. **RESOLVED (2026-08-03), CRITICAL.** Item 8's fix was itself BYPASSABLE — and item 8 had a second door.
+   Found by the full-codebase audit (see "Full-codebase audit" below), which three independent auditors
+   flagged and this session then reproduced directly.
+   (a) **Encoded path traversal.** `_blockInternalCollections` string-matched a leading `_` on
+   `ctx.params.col`, but `core/http.js:343` runs `decodeURIComponent` on path params AFTER segment
+   matching — so `GET /api/db/x%2F..%2F_users` arrived as the literal `x/../_users`, which does not start
+   with `_`, passed the guard, and collapsed straight back to `_users.docs.json` inside
+   `FileStorageAdapter`'s `join()`. Reproduced live from a self-registered `'viewer'`: every
+   `passwordHash` returned, and the `PUT` equivalent wrote `role: 'admin'` onto their own row — confirmed
+   present in `_users.docs.json` on disk, surviving a restart. `_credentials` was equally readable.
+   (b) **The `data.table` workflow node** (`core/workflow.js`) did `db.collection(inputs.collection)` with
+   no filter at all, despite being documented as "the same data exposed at `/api/db/:col`". Reproduced
+   live: a user with only the global `editor` role (enough to `POST /api/workflows`) read `_users` —
+   dumping every `passwordHash` into the execution record, which is itself readable — and set their own
+   `role` to `'admin'` in a second node.
+   Fixed at the CHOKEPOINT rather than per-route: new `assertSafeCollectionName()` runs inside
+   `DocStore.collection()` (`core/db.js`), which every collection access in the system funnels through
+   (routes, the `data.table` node, plugins, memory scopes, `$lookup`'s `from`, relation definitions, the
+   `db.foo` proxy), so callers that don't exist yet are covered too. It uses a positive allowlist
+   (`[A-Za-z0-9_-]+`) rather than a denylist, because a denylist has to anticipate every separator,
+   encoding and control character while `join()`/the OS may normalize forms it never considered. The
+   access-control half moved to a shared exported `isInternalCollectionName()` used by BOTH untrusted
+   surfaces, specifically so they can never drift apart again — that drift is precisely what made the
+   node a second path to the same escalation. 18 new regression tests.
+10. **RESOLVED (2026-08-03), CRITICAL.** Prototype pollution via `core/a2e.js`'s `setPath`. Path segments
+   come from the workflow DEFINITION (an operation's `outputPath`, a `StoreData` `key`, an inline
+   `{/ref}`) and were walked straight onto a live object, so `outputPath: '/__proto__/isAdmin'` wrote to
+   `Object.prototype` for the whole process — reproduced live, `({}).isAdmin === 'PWNED'` after a single
+   `execute()`. This module already treats definitions as untrusted (it SSRF-guards `config.url`), so it
+   was squarely inside the stated threat model. Fixed by refusing `__proto__`/`constructor`/`prototype`:
+   writes throw, reads return `undefined` — the same three segments and the same treatment `core/db.js`
+   (dot-path updates), `core/workflow.js` (`{{ref}}` resolution) and `core/shell.js` (filter projection)
+   already applied, so this closes the one module that had been missed rather than inventing a new
+   convention. 5 new regression tests.
+11. **RESOLVED (2026-08-03), CRITICAL.** `core/portable-text.js`'s `fromMarkdown` hung forever — a
+   single-string denial of service on any surface that parses user-submitted Markdown. The heading branch
+   requires `#{1,6}\s+(.+)` while the paragraph collector excludes anything starting with `#`, so a line
+   matching neither (`#hashtag`, `####### deep`, a bare `#` or `###`) left the index un-advanced and spun
+   the `while` loop, wedging the event loop. Fixed as a CLASS rather than by special-casing `#`: every
+   prefix the paragraph collector excludes is a potential hole whenever its exclusion and the
+   corresponding branch's match condition disagree, so instead of re-aligning those pairwise (and
+   re-breaking them on the next edit), an unconsumable line is now emitted as an ordinary paragraph and
+   the index advances unconditionally. Termination no longer depends on the branches agreeing with each
+   other. 8 new regression tests — note they fail by timing out the whole suite if the guarantee
+   regresses, which is the only honest way to test "does not hang".
+12. **RESOLVED (2026-08-03), HIGH.** `core/net-guard.js`'s SSRF guard let every IPv6 internal destination
+   through. The IPv6 branch read `host.split(':')[0]`, which is the EMPTY STRING for any `::`-compressed
+   address, so `parseInt('', 16)` produced `NaN` and every range check was skipped. Verified ALLOWED
+   before the fix: `[::ffff:169.254.169.254]` (**the cloud-metadata endpoint this guard exists to block**),
+   `[::ffff:127.0.0.1]`, `[fd00::1]`, `[fc00::1]`. Matching the dotted form alone would not have sufficed
+   either — WHATWG `new URL()` normalizes `[::ffff:127.0.0.1]` to `[::ffff:7f00:1]`. Fixed by expanding
+   the literal to its 8 numeric hextets and running IPv4-mapped (`::ffff:0:0/96`) and IPv4-compatible
+   (`::/96`) forms through the *same* checks a literal IPv4 gets (factored into `isInternalIPv4`), plus
+   unique-local `fc00::/7` (the IPv6 RFC1918, previously unchecked entirely) and CGNAT `100.64/10`.
+   Public IPv6 (`[2606:4700:4700::1111]`) still passes — the guard must not over-block. 9 new regression
+   tests in a new `tests/net-guard.test.js` (the module had none).
+13. **RESOLVED (2026-08-03), HIGH.** Cross-tenant IDOR on the project folder/workflow routes
+   (`routes/projects.js`). Three routes take BOTH a `:id` (project) and a `:folderId`/`:workflowId`, and
+   gated on the project alone — `requireProjectRole` proves the caller controls the project named in the
+   URL, and nothing then checked the folder or workflow they named actually lives in it. Since any
+   authenticated user may create their own project and becomes its owner, an attacker simply passed THEIR
+   project id in `:id` and a VICTIM's id in the trailing param. All three reproduced live: deleted a
+   folder inside another user's project; stole their workflow into the attacker's project (locking the
+   real owner out with a 403 on their own workflow); and unassigned a workflow, which per the documented
+   "unassigned is open to any authenticated user" rule strips its protection entirely. Fixed: the folder
+   must belong to the project; moving a workflow OUT of another project requires `editor` there;
+   unassigning requires the workflow to currently belong to the project named in the URL. An unassigned
+   workflow stays claimable by anyone, unchanged. 5 new regression tests.
+14. **RESOLVED (2026-08-03), HIGH.** The `author` role was completely dead, and FIX-30's `:own`
+   enforcement was dead code. `hasPermission` collapsed `X:Y:Z` to `X:Y` but not the reverse, and every
+   route asks for the BASE permission (`routes/entries.js`), so a role whose entire entry permission set
+   is `entries:write:own`/`entries:delete:own` got 403 on its OWN entries — it could do nothing at all.
+   Granting the base is only HALF the fix and is unsafe alone: it says "this caller may attempt the
+   action", not "on any document". The ownership comparison lives in `EntryService._enforceOwnScope`,
+   which short-circuits ("legacy: no check") unless the route passes a `caller` — and no route in the
+   codebase did, which is why FIX-30 shipped as dead code. Both halves landed together:
+   `hasPermission` now accepts a `:own` holder for the base, and `routes/entries.js` passes
+   `ctx.state.user` on every mutating entry route, so a `:own` holder reaching a document they don't own
+   is rejected there. `unpublish` — the one mutating entry method that never accepted a `caller` at all,
+   an inconsistency rather than a scoping decision — is aligned with `publish`. 10 new regression tests,
+   including HTTP-level ones proving an author can edit their own entry and is refused on another
+   author's.
 
-Items 1-4 and 6-8 verified: 2 full-suite runs + 20 isolated runs of `integration.test.js`/`cms.test.js`
-each, all clean. Also verified live over real spawned servers/instances, each reproducing the exact
-exploit (or lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately
-as described above (its own test file).
+Items 1-4 and 6-14 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
+lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
+described above (its own test file).
+
+**Still open, disclosed rather than quietly carried:** `fetch` follows redirects with its default
+`redirect: 'follow'` at every outbound call site (`core/nodes.js`, `core/connector.js`, `core/a2e.js`,
+`core/triggers.js`), so a public host that answers `302 Location: http://127.0.0.1/` still reaches an
+internal destination — `net-guard` validates only the URL it is handed, and its own scope note previously
+disclaimed DNS resolution but not redirects. Item 12 closed the literal-parsing hole; this is a separate
+fix across four call sites and is NOT done.
+
+**Other audit findings confirmed but not yet fixed** — recorded here rather than dropped, since a finding
+that is real and unlisted is worse than one that is real and known:
+- `core/db.js`: an unknown or misspelled query operator MATCHES EVERYTHING (`{age: {$gtt: 100}}` returned
+  every document; `$nin` with a non-array target likewise) — a typo in an access-control filter inverts
+  it. Reproduced directly.
+- `core/db.js`: `$in` resolved through a HashIndex returns duplicate rows and an inflated `count()`
+  (3 rows for a single matching document with `$in: ['a','a','a']`), so indexed and non-indexed
+  collections disagree. Reproduced directly.
+- `core/validate.js`: `enum` and `min`/`max` are silently ignored unless `type: 'string'` is set
+  explicitly — `validate({role: {enum: ['user','editor']}}, {role: 'superadmin'})` returns valid.
+  Reproduced directly.
+- Reported by auditors, NOT independently reproduced here (so treat as leads, not conclusions):
+  lease-based double execution in `core/queue.js` (one job's handler invoked repeatedly for any handler
+  outrunning `leaseMs`), `core/cron.js` ANDing day-of-month with day-of-week where POSIX cron ORs them,
+  `core/connector.js`'s timeout not covering body reading, IVF index misalignment after deletes,
+  `searchAcross`'s per-collection normalization tying irrelevant results with perfect matches, an
+  unbounded error-workflow loop, nodes without an `id` silently running twice, and the Postgres
+  integrations (audited by reading only — `pg` is not installed).
 
 ## Known Agent-UX Friction Points
 
