@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1420 tests | 0 deps | 27 core modules
+By automators.work | 1430 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -1998,6 +1998,26 @@ ex.load({ operations: [...], execute: 'first' });
 const result = await ex.execute();
 ```
 
+**Constructor guards** — both bound a caller-supplied value, both configurable, both with a safe default:
+
+| Option | Default | What it bounds |
+|---|---|---|
+| `maxDepth` | `50` | `_executeOp` recursion, against cyclic `Conditional`/`onError`/`Loop` definitions |
+| `maxWaitMs` | `30_000` | A single `Wait`'s `duration`. `0` disables. See Known Security Gaps item 34 |
+
+`Wait` **refuses** a duration over the cap rather than clamping it — a shorter-than-requested pause
+would leave the author believing something happened that did not. The refusal surfaces as a normal
+per-operation error in `execute()`'s `errors`, so `onError` handles it like any other failure. Negative,
+non-numeric and `Infinity` durations are refused too; `setTimeout` accepted all three and fired
+immediately.
+
+This matters because `POST /api/a2e/execute` is deliberately unauthenticated (`auth: 'none'` in
+`GET /api/schema`'s catalog), so an unbounded `Wait` was an anonymous resource hold.
+
+Handlers are called as `handler(config, state, limits)`. The third argument carries executor-level
+limits (currently just `maxWaitMs`) and is purely additive — a custom handler registered as
+`(config, state) => …` ignores it and keeps working.
+
 Concurrent `execute()` calls on the same instance are safe (fixed
 2026-07-31): `state`/`results`/`errors` live in a context local to each
 call, not on `this`. `executor.state`/`.results`/`.errors` still exist as
@@ -2964,6 +2984,35 @@ its module can reach does not get reused, it gets reimplemented — badly, and w
 When a helper exists because it is careful about something, export it, or accept that every caller
 outside its module will write a careless version.
 
+**2026-08-04 — the same sweep applied to the remaining security helpers, and why a mostly-NEGATIVE
+result is the point.** After `plugins/`, the shape-2 question was put to the rest of the exported
+security helpers (`assertSafeCollectionName`, `hasPermission`, `requireRole`/`requirePermission`,
+`validateBody`, `assertPublicUrl`, `createAuth`) plus the secret-comparison paths. Nine surfaces
+examined, **eight clean**:
+
+- The two webhook-secret checks (`triggers.js`, `workflow.js`) are duplicated but have **not drifted** —
+  the best drift candidate in the repo, and it held.
+- JWT verification uses `crypto.subtle.verify`, constant-time by the platform.
+- `updateProject` whitelists `['name','description']` at the MODEL layer, so `PUT /api/projects/:id`
+  handing it a raw body cannot rewrite `members` — the chokepoint is in the right place.
+- `requirePermission` is applied consistently; `content-types`' `requireRole('admin')` is the
+  established "structural changes are admin-only" decision, not an inconsistency.
+- Collection names are chokepointed in `DocStore.collection()`.
+
+The one real finding was item 34. Two things worth keeping:
+
+**A negative sweep is a result, not a wasted pass.** After three serious findings in `plugins/`, the
+tempting conclusion was that the repo was full of this. It was not — the problem was concentrated in one
+directory, and the core withstood the same scrutiny. Recording that stops the next reader from treating
+every duplicated-looking helper as suspect.
+
+**`GET /api/schema` worked as an oracle.** `routes/shell.js` and `routes/a2e.js` have no auth on any
+route and are mounted unconditionally — which looked exactly like the plugin hole. The catalog resolves
+it: it declares `auth: 'none'` per endpoint and says of the shell "All routes public by design." That is
+a documented decision, not an oversight, and item 34 is a defect *within* it rather than an argument
+against it. A catalog that records the auth requirement per endpoint is what lets that distinction be
+made by checking rather than guessing — worth keeping accurate for exactly this reason.
+
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
 - AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
@@ -2977,6 +3026,7 @@ Current posture:
 - Plugin capability manifest, gated `database`/collection access, path-traversal guard on local plugin loading
 - Plugin ROUTES gated at the mount point, `admin` by default, with explicit `publicRoutes`/`authRoutes` opt-outs per plugin — every plugin route was reachable with no token at all until 2026-08-04 (Known Security Gaps item 31)
 - ReDoS guards on user-supplied `$regex`/pattern input (db.js, vector.js, a2e.js)
+- Bounded caller-supplied resource holds: `a2e.js`'s `Wait` capped at 30s by default (`maxWaitMs`, `0` disables) — unbounded until 2026-08-04 on a deliberately unauthenticated endpoint (Known Security Gaps item 34)
 - Query filters and schemas fail CLOSED, never open: an unknown/misspelled query operator throws rather than being treated as satisfied, non-array `$in`/`$nin` targets are rejected, and `validate.js`'s `enum`/`min`/`max` apply to every rule shape, not just explicitly-typed strings
 - Session auto-cleanup
 - Webhook HMAC-SHA256 signing + optional per-webhook secret
@@ -2986,7 +3036,7 @@ Current posture:
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-33 resolved; open items listed at the end)
+## Known Security Gaps (items 1-34 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -3551,15 +3601,36 @@ to expose" are different questions, and a clean audit of the former says nothing
    so the mistake is reported instead of quietly matching nothing; verified that `executeWorkflow`'s
    existing `try`/`catch` records it as a failed run before claiming as much.
 
-Items 1-4 and 6-33 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+34. **RESOLVED (2026-08-04), MEDIUM.** `a2e.js`'s `Wait` operation had no upper bound —
+   `setTimeout(resolve, config.duration || 0)` — and `POST /api/a2e/execute` is documented `auth: 'none'`,
+   public by design per `GET /api/schema`'s own catalog. Verified over real HTTP with **no Authorization
+   header**: a one-operation workflow asking for 4000ms held the request for 4020ms, and nothing stopped
+   it asking for 24 hours. An anonymous caller could pin server resources for as long as it liked, a few
+   bytes of request at a time; repeated, that is a trivial denial of service against a default-mounted
+   endpoint. (The practical pre-fix ceiling was ~24.8 days rather than unlimited, since `setTimeout`
+   delays above 2^31-1 ms overflow and fire immediately — a detail of the damage, not a mitigation.)
+   Fixed with `maxWaitMs`, following the `maxDepth ?? 50` guard two lines above it in the same
+   constructor: default 30s, configurable per executor, `0` disables — the same 0-disables convention
+   the concurrency cap uses. Configurable rather than hard-coded, because a hard limit with no escape
+   hatch is what this codebase already declined to do to `connector.js`'s internal-host guard. It
+   **refuses rather than clamps**: waiting less than asked would leave the author believing a pause
+   happened that did not, the same fail-quietly shape as items 15-17, 30 and 33. Negative, non-numeric
+   and `Infinity` durations — all previously accepted by `setTimeout`, firing immediately — are refused
+   too. Handlers now receive a third argument carrying executor limits; it is additive, and a test
+   asserts a custom `registerHandler((config, state) => …)` still works, since breaking that would have
+   been a silent cost of the fix. **This is a defect within the public-by-design decision, not an
+   argument against it** — the auth choice is documented and deliberate; an unbounded resource hold is
+   not something that decision implies. 11 new tests.
+
+Items 1-4 and 6-34 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
 
-**A note on what items 15-17, 30 and 33 have in common:** all five failed OPEN. A typo'd operator, a
+**A note on what items 15-17, 30, 33 and 34 have in common:** all six failed OPEN. A typo'd operator, a
 missing `type`, an `enum` on the wrong rule shape, a cap that bounded only one side, a condition whose
-`default` branch returned `true` — each made a filter, schema, limit or rule accept MORE than the author
-wrote, silently, while reading correctly. That is the more
+`default` branch returned `true`, a duration with no ceiling at all — each made a filter, schema, limit,
+rule or pause accept MORE than the author wrote, silently, while reading correctly. That is the more
 dangerous default than failing closed, and it is worth checking for deliberately in anything new: when a
 constraint can't be applied, refuse rather than ignore.
 
