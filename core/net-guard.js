@@ -10,6 +10,10 @@
  * does NOT perform DNS resolution, so a public-looking hostname that resolves
  * to a private IP is not caught here. Real DNS-based blocking (resolve then
  * check) is a future improvement, intentionally out of scope for this fix.
+ *
+ * Redirects ARE covered, but only for callers that use `safeFetch` below --
+ * `assertPublicUrl` alone validates a single URL and cannot see where the
+ * server later points you (see `safeFetch`'s own comment).
  */
 
 const ALLOWED_SCHEMES = new Set(['http:', 'https:']);
@@ -159,4 +163,86 @@ export function assertPublicUrl(rawUrl) {
   }
 
   return parsed;
+}
+
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+// Dropped when a redirect crosses to a different origin, so a workflow's
+// credentials are never handed to a host the caller never named.
+const CREDENTIAL_HEADERS = ['authorization', 'cookie', 'proxy-authorization'];
+
+/**
+ * `fetch` with the SSRF guard applied to EVERY hop, not just the first.
+ *
+ * SECURITY (2026-08-03, full-codebase audit): `assertPublicUrl` validates the
+ * URL it is handed and nothing more, while `fetch` defaults to
+ * `redirect: 'follow'`. Every outbound call site in this codebase used that
+ * default, so a workflow definition pointing at an attacker-controlled PUBLIC
+ * host — which the guard happily allows — reached any internal destination
+ * the moment that host answered `302 Location: http://127.0.0.1/`. Verified
+ * live: the guard blocked the direct attempt and the redirect delivered the
+ * same internal body anyway, into the node result.
+ *
+ * This follows redirects manually so each hop's destination faces the same
+ * check as the original URL. Two details that are easy to get wrong and are
+ * handled here:
+ *  - **Method/body rewriting** matches what `fetch` itself would have done,
+ *    so switching to manual following is not a behavior change for ordinary
+ *    traffic: 303 always becomes GET; 301/302 turn POST into GET (historical
+ *    browser behavior); 307/308 preserve method and body.
+ *  - **Credential headers are dropped on a cross-origin hop.** Without this,
+ *    following a redirect would forward `Authorization` (which
+ *    `core/nodes.js` fills from the credential vault) to whatever host the
+ *    redirect names — turning an SSRF probe into credential exfiltration.
+ *    Same-origin redirects keep them, since that is the common real case.
+ *
+ * @param {string} url
+ * @param {RequestInit} [init]
+ * @param {{ maxRedirects?: number }} [opts]
+ * @returns {Promise<Response>} the first non-redirect response
+ */
+export async function safeFetch(url, init = {}, opts = {}) {
+  const maxRedirects = opts.maxRedirects ?? 5;
+  let current = assertPublicUrl(String(url));
+  let request = { ...init };
+
+  for (let hop = 0; ; hop++) {
+    const res = await fetch(current.toString(), { ...request, redirect: 'manual' });
+    if (!REDIRECT_STATUSES.has(res.status)) return res;
+
+    const location = res.headers.get('location');
+    // A 3xx with no Location is not actionable -- hand it back rather than
+    // inventing a destination.
+    if (!location) return res;
+
+    if (hop >= maxRedirects) {
+      throw new Error(`net-guard: too many redirects (>${maxRedirects}) starting from ${url}`);
+    }
+
+    let next;
+    try {
+      next = new URL(location, current);
+    } catch {
+      throw new Error(`net-guard: invalid redirect target '${location}' from ${current}`);
+    }
+    // The whole point: the hop's destination is validated exactly like the
+    // original URL, so an internal target is refused however many public
+    // hosts were chained in front of it.
+    assertPublicUrl(next.toString());
+
+    if (next.origin !== current.origin && request.headers) {
+      const headers = { ...request.headers };
+      for (const key of Object.keys(headers)) {
+        if (CREDENTIAL_HEADERS.includes(key.toLowerCase())) delete headers[key];
+      }
+      request = { ...request, headers };
+    }
+
+    const method = (request.method || 'GET').toUpperCase();
+    if (res.status === 303 || ((res.status === 301 || res.status === 302) && method === 'POST')) {
+      request = { ...request, method: 'GET' };
+      delete request.body;
+    }
+
+    current = next;
+  }
 }

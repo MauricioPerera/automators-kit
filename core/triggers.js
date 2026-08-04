@@ -5,7 +5,7 @@
  */
 
 import { CronScheduler } from './cron.js';
-import { assertPublicUrl } from './net-guard.js';
+import { assertPublicUrl, safeFetch } from './net-guard.js';
 
 // ---------------------------------------------------------------------------
 // TRIGGER TYPES
@@ -244,7 +244,10 @@ export class TriggerManager {
     const poller = this._pollers.get(workflowId);
     if (!poller) return; // unregistered
     try {
-      const res = await fetch(poller.config.url, {
+      // safeFetch: a poll trigger URL is guarded once at register() time,
+      // so without per-hop validation a public host could redirect every
+      // poll into an internal destination.
+      const res = await safeFetch(poller.config.url, {
         headers: poller.config.headers || {},
       });
       // An HTTP-level error (4xx/5xx) with a valid JSON error body used to

@@ -11,7 +11,7 @@
  *   const result = await registry.execute('slack.send', inputs, credentials);
  */
 
-import { assertPublicUrl } from './net-guard.js';
+import { assertPublicUrl, safeFetch } from './net-guard.js';
 
 // ---------------------------------------------------------------------------
 // NODE REGISTRY
@@ -160,7 +160,11 @@ export class NodeRegistry {
     const timer = setTimeout(() => controller.abort(), inputs.timeout || 30000);
     let res;
     try {
-      res = await fetch(url, { method, headers, body, signal: controller.signal });
+      // safeFetch, not fetch: the guard above validates only THIS url, and
+      // fetch would follow a redirect from it into an internal destination
+      // (and forward these credential-filled headers there). Each hop is
+      // re-validated and cross-origin credential headers are dropped.
+      res = await safeFetch(url, { method, headers, body, signal: controller.signal });
     } finally {
       clearTimeout(timer);
     }

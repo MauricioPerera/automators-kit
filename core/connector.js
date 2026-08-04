@@ -34,7 +34,7 @@
  * the resolved result, `.details.attempts` on the thrown error.
  */
 
-import { assertPublicUrl } from './net-guard.js';
+import { assertPublicUrl, safeFetch } from './net-guard.js';
 
 // ---------------------------------------------------------------------------
 // CONNECTOR
@@ -148,7 +148,16 @@ export class Connector {
         const timeoutMs = opts.timeout || this.timeout;
         const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-        const response = await fetch(url, {
+        // safeFetch ONLY when the caller opted into host blocking. That flag
+        // defaults to false by documented design (this connector is also used
+        // for trusted, operator-configured endpoints), and switching redirect
+        // handling for everyone would change behavior for callers who never
+        // asked for the guard. When it IS on, per-hop validation is what makes
+        // it complete: without it, an allowed public host could redirect the
+        // request straight to the internal destination the flag exists to
+        // block.
+        const doFetch = this.blockInternalHosts ? safeFetch : fetch;
+        const response = await doFetch(url, {
           method,
           headers,
           body: fetchBody,

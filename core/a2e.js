@@ -11,7 +11,7 @@
  *   const result = await executor.execute();
  */
 
-import { assertPublicUrl } from './net-guard.js';
+import { assertPublicUrl, safeFetch } from './net-guard.js';
 import { buildLevels } from './dag.js';
 
 // ---------------------------------------------------------------------------
@@ -265,7 +265,9 @@ async function handleApiCall(config, state) {
   // or be resolved from external trigger state. Same guard as core/nodes.js.
   assertPublicUrl(url);
 
-  const res = await fetch(url, opts);
+  // safeFetch: assertPublicUrl above covers only the first URL; a redirect
+  // from an allowed public host would otherwise reach an internal one.
+  const res = await safeFetch(url, opts);
   const ct = res.headers.get('content-type') || '';
   const data = ct.includes('json') ? await res.json() : await res.text();
   return data;
@@ -284,7 +286,7 @@ async function handleExecuteN8nWorkflow(config, state) {
   // co-located n8n must now expose it via a public N8N_URL; see FIX-11 report.
   assertPublicUrl(n8nUrl);
 
-  const res = await fetch(`${n8nUrl}/api/v1/workflows/${config.workflowId}/run`, {
+  const res = await safeFetch(`${n8nUrl}/api/v1/workflows/${config.workflowId}/run`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-N8N-API-KEY': apiKey },
     body: JSON.stringify({ data: payload }),
