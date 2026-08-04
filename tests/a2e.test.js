@@ -1163,3 +1163,100 @@ describe('Concurrent execute() on a shared instance', () => {
     expect(r1.results.tag).not.toBe(r2.results.tag);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Wait duration cap (2026-08-04)
+//
+// `handleWait` was `setTimeout(resolve, config.duration || 0)` with no upper
+// bound, and POST /api/a2e/execute is documented `auth: 'none'` — public by
+// design. Verified over real HTTP with no Authorization header before this
+// cap: a one-operation workflow asking for 4000ms held the request for 4020ms,
+// and nothing stopped it asking for 24 hours. These tests fail without the cap.
+// ---------------------------------------------------------------------------
+describe('Wait duration cap', () => {
+  const waitFlow = (duration) => ({ operations: [{ id: 'w', op: 'Wait', duration }], execute: 'w' });
+
+  it('refuses a duration above the default cap instead of honouring it', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load(waitFlow(86_400_000)); // 24 hours
+    const start = performance.now();
+    const r = await ex.execute();
+    expect(r.errors.w).toContain('exceeds the maximum');
+    // Refused, not slept: this must return immediately.
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
+  it('still honours a duration under the cap', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load(waitFlow(50));
+    const start = performance.now();
+    const r = await ex.execute();
+    expect(r.errors.w).toBeUndefined();
+    expect(performance.now() - start).toBeGreaterThanOrEqual(40);
+  });
+
+  // Refuse rather than clamp: silently waiting less than asked would leave the
+  // author believing a pause happened that did not.
+  it('reports the refusal as a per-operation error rather than waiting less', async () => {
+    const ex = new WorkflowExecutor({ maxWaitMs: 100 });
+    ex.load(waitFlow(5000));
+    const r = await ex.execute();
+    expect(r.errors.w).toContain('100ms');
+    expect(r.results.w).toBeUndefined();
+  });
+
+  // Configurability upward can only be asserted on the property itself: proving
+  // it by execution would mean a test that really sleeps past the 30s default.
+  // The enforced-custom-cap direction is covered by the maxWaitMs:100 test above.
+  it('is configurable per executor, like maxDepth', async () => {
+    expect(new WorkflowExecutor().maxWaitMs).toBe(30_000);
+    expect(new WorkflowExecutor({ maxWaitMs: 120_000 }).maxWaitMs).toBe(120_000);
+    expect(new WorkflowExecutor().maxDepth).toBe(50);
+  });
+
+  it('treats maxWaitMs: 0 as disabled, matching the concurrency cap convention', async () => {
+    const ex = new WorkflowExecutor({ maxWaitMs: 0 });
+    ex.load(waitFlow(60));
+    const r = await ex.execute();
+    expect(r.errors.w).toBeUndefined();
+  });
+
+  it('refuses a negative duration', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load(waitFlow(-5));
+    const r = await ex.execute();
+    expect(r.errors.w).toContain('negative');
+  });
+
+  it('refuses a non-numeric duration rather than firing immediately', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load(waitFlow('abc'));
+    const r = await ex.execute();
+    expect(r.errors.w).toContain('finite number');
+  });
+
+  it('refuses Infinity', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load(waitFlow(Infinity));
+    const r = await ex.execute();
+    expect(r.errors.w).toContain('finite number');
+  });
+
+  it('leaves a missing duration working as a zero wait', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load({ operations: [{ id: 'w', op: 'Wait' }], execute: 'w' });
+    const r = await ex.execute();
+    expect(r.errors.w).toBeUndefined();
+  });
+
+  // The third handler argument must not disturb custom handlers, which are
+  // documented as taking (config, state).
+  it('does not break a custom handler registered with the two-argument shape', async () => {
+    const ex = new WorkflowExecutor();
+    ex.registerHandler('Shout', (config, state) => ({ said: String(config.text).toUpperCase(), sawState: !!state }));
+    ex.load({ operations: [{ id: 's', op: 'Shout', text: 'hi' }], execute: 's' });
+    const r = await ex.execute();
+    expect(r.results.s.said).toBe('HI');
+    expect(r.results.s.sawState).toBe(true);
+  });
+});

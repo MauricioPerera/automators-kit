@@ -566,8 +566,47 @@ function handleEncodeDecode(config, state) {
 
 // ─── FLOW ───
 
-function handleWait(config) {
-  return new Promise(resolve => setTimeout(resolve, config.duration || 0));
+/**
+ * Default ceiling for a single Wait, in milliseconds. Override per executor
+ * with `new WorkflowExecutor({ maxWaitMs })`.
+ *
+ * SECURITY (2026-08-04): `config.duration` had no upper bound at all, and
+ * `POST /api/a2e/execute` is documented as `auth: 'none'` — public by design,
+ * per GET /api/schema's own catalog. Verified live with no Authorization
+ * header: a one-operation workflow asking for 4000ms held the request for
+ * 4020ms, and nothing stopped it asking for 24 hours. Anonymous callers could
+ * therefore pin server resources for as long as they liked, a few bytes of
+ * request at a time. (The practical pre-fix ceiling was ~24.8 days rather than
+ * unlimited: `setTimeout` delays above 2^31-1 ms overflow and fire
+ * immediately. That is a detail of the damage, not a mitigation.)
+ *
+ * 30s is chosen to sit well above real uses — Wait exists for pacing between
+ * API calls, which is seconds — while keeping a held request within the range
+ * of an ordinary HTTP timeout. It is configurable rather than hard-coded
+ * because a hard limit with no escape hatch is what this codebase already
+ * declined to do to `connector.js`'s internal-host guard.
+ */
+const DEFAULT_MAX_WAIT_MS = 30_000;
+
+function handleWait(config, _state, opts = {}) {
+  const max = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
+  const raw = config.duration ?? 0;
+
+  // Refuse rather than clamp. Silently waiting less than asked would leave a
+  // workflow author believing a pause happened that did not — the same
+  // fail-quietly shape as items 15-17/30/33 — and `_executeOp` already records
+  // a per-operation error cleanly, with `onError` available as a fallback.
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+    throw new Error(`Wait: duration must be a finite number of milliseconds, got ${JSON.stringify(config.duration)}`);
+  }
+  if (raw < 0) {
+    throw new Error(`Wait: duration must not be negative, got ${raw}`);
+  }
+  if (max > 0 && raw > max) {
+    throw new Error(`Wait: duration ${raw}ms exceeds the maximum of ${max}ms (configure with new WorkflowExecutor({ maxWaitMs }))`);
+  }
+
+  return new Promise(resolve => setTimeout(resolve, raw));
 }
 
 function handleConditional(config, state) {
@@ -627,6 +666,12 @@ export class WorkflowExecutor {
     // Max recursion depth for _executeOp (guards against cyclic Conditional /
     // onError / Loop definitions that would otherwise hang or overflow the stack).
     this.maxDepth = opts.maxDepth ?? 50;
+    // Ceiling for a single Wait operation. Same shape as maxDepth: a guard
+    // against a caller-supplied value, configurable, with a safe default.
+    // See DEFAULT_MAX_WAIT_MS for what was reproduced without it. Set 0 to
+    // disable the cap, matching the concurrency cap's own 0-disables
+    // convention in core/workflow.js.
+    this.maxWaitMs = opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS;
     // Informational snapshot of the last COMPLETED execute() call, written
     // once at the end of execute() from its local ctx — never read or
     // written mid-execution, so concurrent execute() calls on this instance
@@ -783,7 +828,11 @@ export class WorkflowExecutor {
           await this._executeOp(result.executeOperationId, executionId, depth + 1, ctx);
         }
       } else {
-        result = await handler(config, ctx.state);
+        // Third argument carries executor-level limits to handlers that need
+        // them (currently Wait's maxWaitMs). Additive: every existing handler,
+        // including any registered through registerHandler(), takes
+        // (config, state) and simply ignores it.
+        result = await handler(config, ctx.state, { maxWaitMs: this.maxWaitMs });
       }
 
       // Store result
