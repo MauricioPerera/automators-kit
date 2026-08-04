@@ -2686,7 +2686,7 @@ Current posture:
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-25 resolved; open items listed at the end)
+## Known Security Gaps (items 1-27 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -2698,7 +2698,7 @@ section) were spot-checked against current source rather than trusted at face va
 held. Item 7 found yet another way: comparing the platform directly against a specific n8n concept
 (the protected instance owner) rather than an audit or a claims check. Item 8 was found reasoning about a
 small, unrelated feature (listing data-table collection names) and stress-testing the design decision it
-exposed. Items 9-25 came from the full-codebase audit described below — including item 9, which found
+exposed. Items 9-27 came from the full-codebase audit described below — including item 9, which found
 that item 8's own fix was bypassable. Documented first, on request, before any code change each time; all
 fixed shortly after in separate, explicitly-requested passes.
 
@@ -3130,7 +3130,31 @@ to expose" are different questions, and a clean audit of the former says nothing
    the regression tests assert on execution COUNTS after a bounded sleep rather than with a timer, for
    the same reason.
 
-Items 1-4 and 6-25 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+26. **RESOLVED (2026-08-04), CRITICAL.** SQL injection through a table name in
+   `integrations/postgres-collection.js`. The name is interpolated into DDL/DML and, decisively, into
+   `LISTEN ${channel}` — which CANNOT take a bind parameter, so it went in completely raw. This was an
+   audit lead carrying no evidence; standing up a real Postgres confirmed it and showed it was worse
+   than it read: a collection named `x; DROP TABLE canary; --` **DROPPED the canary table** on `init()`.
+   The `"${this.table}"` quoting used elsewhere in the file is no defence either — a name containing a
+   double quote breaks straight out of it. Fixed with a Postgres identifier allowlist
+   (`[a-zA-Z_][a-zA-Z0-9_]*`), deliberately stricter than `assertSafeCollectionName`'s
+   `[A-Za-z0-9_-]`, because an UNQUOTED identifier — which `LISTEN` requires — may not contain a hyphen
+   or start with a digit. Refused rather than escaped: escaping invites a second bug the first time
+   someone edits the escaping. Reachability note: `table` is a constructor argument, so this is only
+   reachable by a caller that derives collection names from request data — which is exactly the shape
+   this repo's own `/api/db/:col` has, so it is a live footgun rather than a theoretical one.
+27. **RESOLVED (2026-08-04), HIGH.** Lost update in `PostgresCollection.update()`. It read the target
+   from the LOCAL CACHE, computed the new document in JS, and blind-wrote the whole thing back, so two
+   processes updating the same row both read the same starting value and both wrote their own result.
+   Also an unevidenced audit lead; verified against a real Postgres: two concurrent
+   `$inc: { views: 1 }` from separate processes left `views = 1`, not 2. Worse than a plain race — the
+   `NOTIFY` that follows then made BOTH caches agree on the wrong value, so nothing anywhere surfaced
+   the loss. The row is now re-read inside a transaction holding `FOR UPDATE`, so Postgres serializes
+   the read-modify-write per row; the filter still selects the candidate from cache (that is this
+   module's read model), but the value the update is applied to always comes from the locked row, which
+   is what makes concurrent operators correct.
+
+Items 1-4 and 6-27 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
@@ -3149,16 +3173,17 @@ and has not been attempted.
 
 **Other audit findings confirmed but not yet fixed** — recorded here rather than dropped, since a finding
 that is real and unlisted is worse than one that is real and known:
-- `integrations/postgres-collection.js` and `integrations/postgres-execution-log.js`, still audited by
-  READING ONLY. `integrations/postgres-queue.js` is NO LONGER in this list — it was verified on
-  2026-08-04 against a real Postgres 16 (a throwaway container, torn down afterwards), which is how the
-  broken heartbeat in item 19 was found. The remaining two have not been through that.
-  **Track record: 9 of the 9 leads checked turned out to be real bugs** (items 19-25), several of them
-  severe, and none was noise — and separately, the FIRST piece of read-only-reasoned code that finally
-  got executed turned out to be broken too. Both samples point the same way: in this codebase,
-  unexecuted code and unchecked leads are more likely wrong than fine. `pg` is not installed in the dev
-  environment, so verifying the remaining two means standing up a Postgres, exactly as was done for the
-  queue.
+- **Nothing from the audit is left unverified.** All three Postgres integrations went through a real
+  Postgres 16 on 2026-08-04 (a throwaway container, torn down afterwards, since `pg` is not installed in
+  the dev environment). `postgres-queue.js` and `postgres-collection.js` both turned out to be broken
+  (items 19-follow-up, 26, 27); `postgres-execution-log.js` was clean and needed no changes — records,
+  lists, round-trips `nodeResults` through JSONB, preserves status, purges, and upserts correctly when
+  the same execution id is recorded twice.
+  **Final track record, worth keeping for the next person deciding what to trust:** 9 of the 9 unchecked
+  audit leads turned out to be real bugs, and 2 of the 3 modules that had only ever been REASONED about
+  were broken when finally executed — one of them by an SQL injection that destroyed a table. In this
+  codebase, unexecuted code and unchecked leads were more likely wrong than fine, every single time it
+  was measured. Reasoning is not verification.
 - `core/db.js`'s `$elemMatch` does not match an array of PRIMITIVES against an operator target
   (`{x: [1]}` vs `{x: {$elemMatch: {$gt: 0}}}` → false): the handler wraps each primitive as
   `{'': elem}`, so the target's `$gt` is looked up as a FIELD on that wrapper and resolves to
