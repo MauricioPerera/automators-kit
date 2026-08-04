@@ -1704,6 +1704,13 @@ depends on, which is a worse failure than the growth it prevents. Growth is made
 so the need for it is visible rather than guessed at. When no bound is configured, `start()` installs
 no timer at all.
 
+**Decision, so it is not re-litigated (2026-08-04):** n8n prunes by default (14 days), and defaulting to
+off does leave the gap open for anyone who never opts in — the same criticism that was applied to the
+concurrency cap, which is why it defaults on. Both sides were weighed and OFF was chosen deliberately
+for now, on the grounds that an upgrade should never silently destroy history. It is a candidate to flip
+in a release where the change is announced ahead of time, NOT something to switch on as a quiet
+consistency fix.
+
 ### Concurrent execution limit (backpressure)
 
 Trigger-fired executions (webhook/cron/poll) and error-workflow triggering are capped instance-wide, so
