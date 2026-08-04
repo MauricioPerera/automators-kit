@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1284 tests | 0 deps | 27 core modules
+By automators.work | 1298 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -2582,13 +2582,14 @@ Current posture:
 - Prototype-chain segments (`__proto__`/`constructor`/`prototype`) refused on every user-influenced path write/read: `db.js` dot-paths, `workflow.js` `{{ref}}`s, `shell.js` projections, `a2e.js` `outputPath`/`StoreData` keys
 - Plugin capability manifest, gated `database`/collection access, path-traversal guard on local plugin loading
 - ReDoS guards on user-supplied `$regex`/pattern input (db.js, vector.js, a2e.js)
+- Query filters and schemas fail CLOSED, never open: an unknown/misspelled query operator throws rather than being treated as satisfied, non-array `$in`/`$nin` targets are rejected, and `validate.js`'s `enum`/`min`/`max` apply to every rule shape, not just explicitly-typed strings
 - Session auto-cleanup
 - Webhook HMAC-SHA256 signing + optional per-webhook secret
 - Rate limiting in triggers
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-14 resolved; open items listed at the end)
+## Known Security Gaps (items 1-17 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -2600,7 +2601,7 @@ section) were spot-checked against current source rather than trusted at face va
 held. Item 7 found yet another way: comparing the platform directly against a specific n8n concept
 (the protected instance owner) rather than an audit or a claims check. Item 8 was found reasoning about a
 small, unrelated feature (listing data-table collection names) and stress-testing the design decision it
-exposed. Items 9-14 came from the full-codebase audit described below — including item 9, which found
+exposed. Items 9-17 came from the full-codebase audit described below — including item 9, which found
 that item 8's own fix was bypassable. Documented first, on request, before any code change each time; all
 fixed shortly after in separate, explicitly-requested passes.
 
@@ -2855,10 +2856,43 @@ to expose" are different questions, and a clean audit of the former says nothing
    including HTTP-level ones proving an author can edit their own entry and is refused on another
    author's.
 
-Items 1-4 and 6-14 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+15. **RESOLVED (2026-08-03), MEDIUM.** An unknown or misspelled query operator MATCHED EVERY DOCUMENT.
+   `matchFilter`'s operator switch ended in `default: break`, so anything it didn't recognize counted as
+   satisfied: `find({ age: { $gtt: 100 } })` (a typo for `$gt`) returned the whole collection, as did
+   `{ role: { $eqq: 'admin' } }`. In an access-control filter that inverts the intent completely, with no
+   error anywhere. Reproduced directly. Fixed with a `KNOWN_QUERY_OPERATORS` allowlist kept beside the
+   switch (so adding a `case` without registering it fails loudly on first use rather than silently
+   matching everything); an unknown operator now throws, naming the operator and the field. Two adjacent
+   problems surfaced while fixing it and are included: (a) a plain, non-`$` object reaches the same
+   branch (`find({ meta: { a: 1 } })`) and was ALSO blanket-matching — it is now compared structurally;
+   (b) `$nin` with a non-array target fell through without filtering anything, asymmetric with `$in` —
+   both now require an array. And `$options`, which was reaching the `default` case and being DROPPED, so
+   `{ $regex: 'admin', $options: 'i' }` ran case-SENSITIVELY while reading as case-insensitive, is now
+   actually implemented rather than left listed-but-ignored.
+16. **RESOLVED (2026-08-03), MEDIUM.** `$in` resolved through a HashIndex returned duplicate rows and an
+   inflated `count()`. The fast path concatenated the per-value id lists with no de-duplication and
+   nothing downstream de-duped, so `{ status: { $in: ['a','a','a'] } }` gave 1 row on a scanned
+   collection and 3 rows (`count() === 3`) on an indexed one — the same query, two different answers,
+   depending only on whether an index happened to exist. Reproduced directly. Fixed with a `Set`, keeping
+   the fast path while making it agree with the scan.
+17. **RESOLVED (2026-08-03), MEDIUM.** `core/validate.js` silently dropped constraints. `enum` was
+   evaluated only inside `case 'string'`, and NOTHING ran at all when a rule declared no `type` — so
+   `validate({ role: { enum: ['user','editor'] } }, { role: 'superadmin' })` returned valid, and so did
+   `{ n: { type: 'number', enum: [1,2,3] } }` against `999`. A route gating on such a schema believed it
+   was constrained and was not. Reproduced directly. Fixed by moving `enum` out of the type switch (set
+   membership is type-agnostic, so it now applies to every rule shape) and applying `min`/`max` on a
+   typeless rule by the VALUE's runtime type, matching what each typed branch does for that same type.
+
+Items 1-4 and 6-17 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
+
+**A note on what items 15-17 have in common:** all three failed OPEN. A typo'd operator, a missing
+`type`, an `enum` on the wrong rule shape — each made a filter or schema accept MORE than the author
+wrote, silently, while reading correctly. That is the more dangerous default than failing closed, and it
+is worth checking for deliberately in anything new: when a constraint can't be applied, refuse rather
+than ignore.
 
 **Still open, disclosed rather than quietly carried:** `fetch` follows redirects with its default
 `redirect: 'follow'` at every outbound call site (`core/nodes.js`, `core/connector.js`, `core/a2e.js`,
@@ -2869,15 +2903,6 @@ fix across four call sites and is NOT done.
 
 **Other audit findings confirmed but not yet fixed** — recorded here rather than dropped, since a finding
 that is real and unlisted is worse than one that is real and known:
-- `core/db.js`: an unknown or misspelled query operator MATCHES EVERYTHING (`{age: {$gtt: 100}}` returned
-  every document; `$nin` with a non-array target likewise) — a typo in an access-control filter inverts
-  it. Reproduced directly.
-- `core/db.js`: `$in` resolved through a HashIndex returns duplicate rows and an inflated `count()`
-  (3 rows for a single matching document with `$in: ['a','a','a']`), so indexed and non-indexed
-  collections disagree. Reproduced directly.
-- `core/validate.js`: `enum` and `min`/`max` are silently ignored unless `type: 'string'` is set
-  explicitly — `validate({role: {enum: ['user','editor']}}, {role: 'superadmin'})` returns valid.
-  Reproduced directly.
 - Reported by auditors, NOT independently reproduced here (so treat as leads, not conclusions):
   lease-based double execution in `core/queue.js` (one job's handler invoked repeatedly for any handler
   outrunning `leaseMs`), `core/cron.js` ANDing day-of-month with day-of-week where POSIX cron ORs them,
@@ -2885,6 +2910,12 @@ that is real and unlisted is worse than one that is real and known:
   `searchAcross`'s per-collection normalization tying irrelevant results with perfect matches, an
   unbounded error-workflow loop, nodes without an `id` silently running twice, and the Postgres
   integrations (audited by reading only — `pg` is not installed).
+- `core/db.js`'s `$elemMatch` does not match an array of PRIMITIVES against an operator target
+  (`{x: [1]}` vs `{x: {$elemMatch: {$gt: 0}}}` → false): the handler wraps each primitive as
+  `{'': elem}`, so the target's `$gt` is looked up as a FIELD on that wrapper and resolves to
+  `undefined`. Object elements work. Found while writing tests for item 17 and confirmed against the
+  pre-change code with `git stash`, so it is long-standing rather than newly introduced — recorded in an
+  explicit test (`tests/db.test.js`) instead of being asserted away.
 
 ## Known Agent-UX Friction Points
 
