@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1307 tests | 0 deps | 27 core modules
+By automators.work | 1322 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -2589,7 +2589,7 @@ Current posture:
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-18 resolved; open items listed at the end)
+## Known Security Gaps (items 1-21 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -2601,7 +2601,7 @@ section) were spot-checked against current source rather than trusted at face va
 held. Item 7 found yet another way: comparing the platform directly against a specific n8n concept
 (the protected instance owner) rather than an audit or a claims check. Item 8 was found reasoning about a
 small, unrelated feature (listing data-table collection names) and stress-testing the design decision it
-exposed. Items 9-18 came from the full-codebase audit described below — including item 9, which found
+exposed. Items 9-21 came from the full-codebase audit described below — including item 9, which found
 that item 8's own fix was bypassable. Documented first, on request, before any code change each time; all
 fixed shortly after in separate, explicitly-requested passes.
 
@@ -2908,7 +2908,53 @@ to expose" are different questions, and a clean audit of the former says nothing
    OAuth2 token exchange and `core/vector.js`'s Reranker take operator-supplied config rather than
    workflow input, and were already outside the guard's scope.
 
-Items 1-4 and 6-18 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+19. **RESOLVED (2026-08-03), HIGH.** A job whose handler outran the lease was re-executed, repeatedly.
+   The reclaim arm of `_poll` ("stuck in `processing`, lease expired -> the worker died, take it back")
+   could not tell a DEAD worker from a SLOW one, because `_process` stamped `updatedAt` once at claim
+   time and never renewed it. Any handler outrunning `leaseMs` — default FIVE MINUTES, so a large export,
+   a slow upstream, a transcode — was re-claimed and re-executed by the same process, again every lease
+   period. Reproduced: one enqueued job, a 1000ms handler, `leaseMs: 300` -> the handler ran **4 times**
+   while the queue still reported `completed: 1`. For a non-idempotent job (a charge, an email) that is N
+   side effects with no signal anywhere. It also leaked the `_running` counter (several `_process` calls
+   incrementing/decrementing for one job), permanently shrinking effective concurrency — a consequence
+   the auditor had not noted. `concurrency: 1` masked it by accident, since the cap made `_poll` return
+   before reclaiming.
+   `core/queue.js` is single-process by design, so a job THIS process is running is by definition not
+   orphaned: an `_inFlight` set stops self-reclaim, while a crashed-and-restarted process still recovers
+   (empty `_inFlight`) — the only case that reclaim arm was ever for. A heartbeat renews `updatedAt` so
+   the persisted row stops looking abandoned to anything reading it.
+   `integrations/postgres-queue.js` has the same defect with worse consequences: multi-process, so the
+   second run lands in a DIFFERENT worker in real parallel, and `FOR UPDATE SKIP LOCKED` does not help
+   because the first worker holds no row lock while its handler runs. Fixed there with a heartbeat plus a
+   `lease_token` fencing column rotated on every claim, with every terminal write conditioned on still
+   owning the job. Fencing surfaced a second bug: the dead-letter INSERT was unconditional, so a worker
+   that lost its lease would dead-letter the job while the fenced DELETE no-opped, leaving it alive AND
+   recorded as dead — reordered to `DELETE ... RETURNING` first, dead-lettering only if that removed our
+   row. **Scope honesty: the Postgres half parses and is reasoned line by line but could NOT be executed
+   (`pg` is not installed here). Only the `core/queue.js` half is verified by running.** 5 new tests.
+20. **RESOLVED (2026-08-03), MEDIUM.** `core/cron.js` ANDed day-of-month with day-of-week; POSIX/Vixie
+   cron ORs them when BOTH are restricted. `0 0 1 * 1` means "midnight on the 1st OR any Monday", and it
+   fired **once in 2026 instead of 63 times** — anyone pasting a standard crontab line got a schedule
+   that almost never runs, with no error anywhere. The rule is not "always OR": with only ONE field
+   restricted, an OR would match every day, because the unrestricted field matches everything. That
+   distinction cannot be recovered from the parsed value Sets (`*` and an explicit `0-6` both expand to
+   all seven days), so `parseCron` now records `domRestricted`/`dowRestricted` and `matchesCron` ORs only
+   when both are set. Verified across all four quadrants over a full year: 63 / 52 / 12 / 365. 5 new tests.
+21. **RESOLVED (2026-08-03), MEDIUM.** A workflow node with no `id` made one node never run and another
+   run twice, reported as success. `_validateNodeIds` used to `continue` past a missing id, validating
+   nothing; `_buildWorkflowDAG` then grouped every id-less node in one level under the key `undefined`,
+   `nodeMap` collapsed them to the LAST one, and results were indexed positionally against a level
+   holding the same key twice. Reproduced with two id-less nodes: the FIRST node's handler never ran, the
+   SECOND's ran TWICE, `nodeResults` held a single `"undefined"` key, and the execution reported
+   `success` with no errors — so a node carrying a real side effect could be skipped while another was
+   double-charged, invisibly. An `id` is not optional in this engine: it is the `{{ref}}` name, the DAG
+   vertex and the `nodeResults` key, so `create()`/`update()` now refuse a missing/empty one (all four
+   shapes: absent, `''`, `null`, `undefined`) and persist nothing when they do. `routes/workflows.js`'s
+   `CreateSchema` declares `nodes` as a bare array and cannot express a per-node requirement, so the HTTP
+   surface relies on this check too. Nothing in the suite or examples depended on id-less nodes. 5 new
+   tests.
+
+Items 1-4 and 6-21 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
@@ -2928,12 +2974,12 @@ and has not been attempted.
 **Other audit findings confirmed but not yet fixed** — recorded here rather than dropped, since a finding
 that is real and unlisted is worse than one that is real and known:
 - Reported by auditors, NOT independently reproduced here (so treat as leads, not conclusions):
-  lease-based double execution in `core/queue.js` (one job's handler invoked repeatedly for any handler
-  outrunning `leaseMs`), `core/cron.js` ANDing day-of-month with day-of-week where POSIX cron ORs them,
   `core/connector.js`'s timeout not covering body reading, IVF index misalignment after deletes,
   `searchAcross`'s per-collection normalization tying irrelevant results with perfect matches, an
-  unbounded error-workflow loop, nodes without an `id` silently running twice, and the Postgres
-  integrations (audited by reading only — `pg` is not installed).
+  unbounded error-workflow loop, and the rest of the Postgres integrations (audited by reading only —
+  `pg` is not installed here, the same limitation the auditors had on that file).
+  **Track record so far: 3 of the 3 leads that were checked turned out to be real bugs** (items 19-21),
+  so the remaining ones deserve the same treatment rather than being assumed noise.
 - `core/db.js`'s `$elemMatch` does not match an array of PRIMITIVES against an operator target
   (`{x: [1]}` vs `{x: {$elemMatch: {$gt: 0}}}` → false): the handler wraps each primitive as
   `{'': elem}`, so the target's `$gt` is looked up as a FIELD on that wrapper and resolves to
