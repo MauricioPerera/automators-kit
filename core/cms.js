@@ -917,10 +917,34 @@ class UserService {
     return doc ? this.safeUser(doc) : null;
   }
 
+  /**
+   * How many OTHER active admins exist besides `excludeId`. Used to guard
+   * against demoting/deactivating/deleting the instance's last admin --
+   * mirrors ProjectManager.removeMember's "refuse to strip the last owner"
+   * pattern, at the instance level instead of a project. An inactive admin
+   * doesn't count -- they can't log in to help recover the instance either.
+   */
+  _countOtherActiveAdmins(col, excludeId) {
+    return col.find({ role: 'admin', isActive: { $ne: false } }).toArray()
+      .filter((u) => u._id !== excludeId).length;
+  }
+
   async update(id, input) {
     const col = this.cms.auth._users || this.cms.db.collection('_users');
     const doc = col.findById(id);
     if (!doc) throw new Error(`User '${id}' not found`);
+
+    // SECURITY/SAFETY (2026-08-03, found comparing against n8n's protected
+    // instance-owner concept): without this, an accidental self-demotion or
+    // self-deactivation of the sole admin permanently locks the instance out
+    // of every admin action -- public registration always creates 'viewer'
+    // (see routes/auth.js's H1 fix), and only an existing admin can promote
+    // anyone via this same route.
+    const losingAdminAccess = doc.role === 'admin' &&
+      ((input.role !== undefined && input.role !== 'admin') || input.isActive === false);
+    if (losingAdminAccess && this._countOtherActiveAdmins(col, id) === 0) {
+      throw new Error(`Cannot remove admin access from user '${id}' -- they are the instance's last active admin`);
+    }
 
     await this.cms.hook('user:beforeUpdate', { id, input });
 
@@ -944,6 +968,12 @@ class UserService {
   }
 
   async delete(id) {
+    const col = this.cms.auth._users || this.cms.db.collection('_users');
+    const doc = col.findById(id);
+    if (doc?.role === 'admin' && this._countOtherActiveAdmins(col, id) === 0) {
+      throw new Error(`Cannot delete user '${id}' -- they are the instance's last active admin`);
+    }
+
     await this.cms.hook('user:beforeDelete', { id });
     this.cms.auth.deleteUser(id);
     this.cms.db.flush();

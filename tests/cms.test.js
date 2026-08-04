@@ -260,6 +260,73 @@ describe('Users', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Last admin protection (2026-08-03, found comparing against n8n's
+// protected instance-owner concept)
+// ---------------------------------------------------------------------------
+
+describe('Last admin protection', () => {
+  it('cannot demote the instance\'s sole admin (role change away from admin throws)', async () => {
+    const admin = await cms.users.register('sole-admin@t.com', 'pass12345678', { name: 'Sole', role: 'admin' });
+    await expect(cms.users.update(admin._id, { role: 'editor' })).rejects.toThrow(/last active admin/);
+    expect(cms.users.findById(admin._id).role).toBe('admin'); // unchanged
+  });
+
+  it('cannot deactivate the instance\'s sole admin (isActive: false throws)', async () => {
+    const admin = await cms.users.register('sole-admin2@t.com', 'pass12345678', { name: 'Sole2', role: 'admin' });
+    await expect(cms.users.update(admin._id, { isActive: false })).rejects.toThrow(/last active admin/);
+    expect(cms.users.findById(admin._id).isActive).not.toBe(false);
+  });
+
+  it('cannot delete the instance\'s sole admin', async () => {
+    const admin = await cms.users.register('sole-admin3@t.com', 'pass12345678', { name: 'Sole3', role: 'admin' });
+    await expect(cms.users.delete(admin._id)).rejects.toThrow(/last active admin/);
+    expect(cms.users.findById(admin._id)).not.toBeNull();
+  });
+
+  it('CAN demote/deactivate/delete an admin when another active admin still exists', async () => {
+    const a = await cms.users.register('admin-a@t.com', 'pass12345678', { name: 'A', role: 'admin' });
+    const b = await cms.users.register('admin-b@t.com', 'pass12345678', { name: 'B', role: 'admin' });
+
+    const demoted = await cms.users.update(a._id, { role: 'editor' });
+    expect(demoted.role).toBe('editor');
+
+    // Promote back, then deactivate instead -- b is still there to allow it.
+    await cms.users.update(a._id, { role: 'admin' });
+    const deactivated = await cms.users.update(a._id, { isActive: false });
+    expect(deactivated.isActive).toBe(false);
+
+    await cms.users.update(a._id, { isActive: true, role: 'admin' });
+    await cms.users.delete(a._id);
+    expect(cms.users.findById(a._id)).toBeNull();
+    expect(cms.users.findById(b._id)).not.toBeNull(); // b, the last one, is untouched
+  });
+
+  it('an INACTIVE second admin does not count -- deactivating/deleting the only ACTIVE one still throws', async () => {
+    const activeAdmin = await cms.users.register('active-admin@t.com', 'pass12345678', { name: 'Active', role: 'admin' });
+    const inactiveAdmin = await cms.users.register('inactive-admin@t.com', 'pass12345678', { name: 'Inactive', role: 'admin' });
+    await cms.users.update(inactiveAdmin._id, { isActive: false });
+
+    await expect(cms.users.update(activeAdmin._id, { role: 'viewer' })).rejects.toThrow(/last active admin/);
+    await expect(cms.users.delete(activeAdmin._id)).rejects.toThrow(/last active admin/);
+  });
+
+  it('updating the sole admin without touching role/isActive (e.g. name) is unaffected', async () => {
+    const admin = await cms.users.register('sole-admin4@t.com', 'pass12345678', { name: 'Old Name', role: 'admin' });
+    const updated = await cms.users.update(admin._id, { name: 'New Name' });
+    expect(updated.name).toBe('New Name');
+    expect(updated.role).toBe('admin');
+  });
+
+  it('demoting/deleting a non-admin user is never affected by this guard (existing behavior unchanged)', async () => {
+    const viewer = await cms.users.register('plain-viewer@t.com', 'pass12345678', { name: 'V' });
+    const updated = await cms.users.update(viewer._id, { role: 'editor' });
+    expect(updated.role).toBe('editor');
+    await cms.users.delete(viewer._id);
+    expect(cms.users.findById(viewer._id)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Autosave & Shutdown
 // ---------------------------------------------------------------------------
 
