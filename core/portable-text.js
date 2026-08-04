@@ -364,7 +364,28 @@ export function fromMarkdown(markdown) {
     }
     if (paraLines.length) {
       blocks.push({ type: 'paragraph', text: paraLines.join(' ') });
+      continue;
     }
+
+    // SECURITY (2026-08-03, full-codebase audit): forward-progress guarantee.
+    // Reaching here means NO branch above consumed the line and the paragraph
+    // collector rejected it too -- so `i` never advanced and the while loop
+    // spun forever, hanging the event loop on a single string. Found live
+    // with `fromMarkdown('#hashtag')`: the heading branch requires
+    // `#{1,6}\s+(.+)`, so a `#` with no space (or 7+ hashes, or a bare `###`)
+    // matches nothing, while the paragraph collector excludes anything
+    // starting with `#`. Any user-submitted Markdown containing a `#tag`
+    // wedged the process.
+    //
+    // Fixed as a class rather than by special-casing `#`: every prefix the
+    // paragraph collector excludes is a potential hole whenever its exclusion
+    // and the corresponding branch's match condition disagree, so instead of
+    // re-aligning those conditions pairwise (and re-breaking them on the next
+    // edit), an unconsumable line is emitted as an ordinary paragraph and `i`
+    // is advanced unconditionally. Termination no longer depends on the
+    // branches agreeing with each other.
+    blocks.push({ type: 'paragraph', text: line });
+    i++;
   }
 
   return blocks;

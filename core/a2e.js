@@ -18,12 +18,32 @@ import { buildLevels } from './dag.js';
 // DATA MODEL — path get/set
 // ---------------------------------------------------------------------------
 
+// SECURITY (2026-08-03, full-codebase audit): every path segment here comes
+// from the workflow DEFINITION -- an operation's `outputPath`, a StoreData
+// `key`, a `{/inline/ref}` -- which this module already treats as untrusted
+// (see the SSRF guard on `config.url` and the ReDoS guards below). `setPath`
+// walked those segments straight onto a live object, so a definition
+// carrying `outputPath: '/__proto__/isAdmin'` wrote to `Object.prototype`
+// for the whole process. Reproduced live: after one `execute()`, `({}).
+// isAdmin === 'PWNED'` globally; `{ op: 'StoreData', key: '__proto__/pwn' }`
+// did the same.
+//
+// Same three segments, same treatment as everywhere else in this codebase:
+// `core/db.js`'s DANGEROUS_SEGMENTS (dot-path updates), `core/workflow.js`'s
+// {{ref}} resolution, and `core/shell.js`'s filter projection all refuse
+// exactly these. Writes THROW (a definition asking for one is a bug or an
+// attack, never something to silently half-apply); reads return `undefined`,
+// matching workflow.js's read-side behavior, so a malicious `{/__proto__/x}`
+// reference can't be used to probe prototype internals either.
+const DANGEROUS_PATH_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype']);
+
 function getPath(state, path) {
   if (!path || typeof path !== 'string') return undefined;
   const parts = path.replace(/^\//, '').split('/');
   let current = state;
   for (const p of parts) {
     if (current == null) return undefined;
+    if (DANGEROUS_PATH_SEGMENTS.has(p)) return undefined;
     // Array index
     if (/^\d+$/.test(p)) current = current[parseInt(p)];
     else current = current[p];
@@ -34,6 +54,11 @@ function getPath(state, path) {
 function setPath(state, path, value) {
   if (!path || typeof path !== 'string') return;
   const parts = path.replace(/^\//, '').split('/');
+  for (const p of parts) {
+    if (DANGEROUS_PATH_SEGMENTS.has(p)) {
+      throw new Error(`Unsafe path segment '${p}' in '${path}': __proto__, constructor and prototype cannot be written`);
+    }
+  }
   let current = state;
   for (let i = 0; i < parts.length - 1; i++) {
     const p = parts[i];

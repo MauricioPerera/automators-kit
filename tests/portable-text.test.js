@@ -247,6 +247,37 @@ describe('fromMarkdown', () => {
     expect(blocks[0].type).toBe('paragraph');
   });
 
+  // SECURITY (2026-08-03, full-codebase audit): these inputs used to HANG
+  // forever -- the heading branch requires `#{1,6}\s+(.+)` while the
+  // paragraph collector excludes anything starting with `#`, so a `#` that
+  // matched neither left `i` un-advanced and spun the while loop, wedging
+  // the event loop on a single user-submitted string. Each assertion below
+  // fails by timing out the whole suite if the guarantee regresses.
+  describe('always terminates (forward-progress guarantee)', () => {
+    for (const md of ['#hashtag', '####### deep', '#', '###', '#no-space\nafter']) {
+      it(`returns instead of hanging on ${JSON.stringify(md)}`, () => {
+        const blocks = fromMarkdown(md);
+        expect(Array.isArray(blocks)).toBe(true);
+        expect(blocks.length).toBeGreaterThan(0);
+        // The unconsumable line is emitted verbatim as a paragraph.
+        expect(blocks[0].type).toBe('paragraph');
+        expect(blocks[0].text).toBe(md.split('\n')[0]);
+      });
+    }
+
+    it('a real heading is still parsed as a heading, not swallowed by the fallback', () => {
+      const blocks = fromMarkdown('### Real Heading');
+      expect(blocks[0].type).toBe('heading');
+      expect(blocks[0].level).toBe(3);
+      expect(blocks[0].text).toBe('Real Heading');
+    });
+
+    it('a hashtag line does not stop the rest of the document from parsing', () => {
+      const blocks = fromMarkdown('#tag\n\n# Real Heading\n\nbody text');
+      expect(blocks.map(b => b.type)).toEqual(['paragraph', 'heading', 'paragraph']);
+    });
+  });
+
   it('parses code block', () => {
     const blocks = fromMarkdown('```js\nconsole.log(1)\n```');
     expect(blocks[0].type).toBe('code');

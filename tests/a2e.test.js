@@ -95,6 +95,47 @@ describe('evalCondition', () => {
 // SetData + Calculate
 // ---------------------------------------------------------------------------
 
+// SECURITY (2026-08-03, full-codebase audit): setPath walked workflow-
+// definition-supplied path segments straight onto a live object, so an
+// `outputPath` of '/__proto__/isAdmin' wrote to Object.prototype for the
+// whole process. Reproduced live before the fix: ({}).isAdmin === 'PWNED'.
+describe('path segments cannot reach the prototype chain', () => {
+  const POLLUTION_PATHS = ['/__proto__/isAdmin', '/constructor/prototype/x', '/a/__proto__/b'];
+
+  for (const outputPath of POLLUTION_PATHS) {
+    it(`refuses to write via ${outputPath}`, async () => {
+      const ex = new WorkflowExecutor();
+      ex.load({ operations: [{ id: 'p', op: 'SetData', value: 'PWNED', outputPath }] });
+      const result = await ex.execute();
+      expect(result.errors.p).toContain('Unsafe path segment');
+      expect(({}).isAdmin).toBeUndefined();
+      expect(({}).x).toBeUndefined();
+    });
+  }
+
+  it("StoreData's key cannot pollute either", async () => {
+    const ex = new WorkflowExecutor();
+    ex.load({ operations: [{ id: 's', op: 'StoreData', key: '__proto__/pwn', value: 'POLLUTED' }] });
+    await ex.execute();
+    expect(({}).pwn).toBeUndefined();
+  });
+
+  it('reading a dangerous segment yields undefined instead of prototype internals', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load({ operations: [{ id: 'r', op: 'SetData', value: '{/__proto__/constructor}', outputPath: '/workflow/out' }] });
+    const result = await ex.execute();
+    expect(JSON.stringify(result.state.workflow.out || '')).not.toContain('function');
+  });
+
+  it('an ordinary path still writes normally', async () => {
+    const ex = new WorkflowExecutor();
+    ex.load({ operations: [{ id: 'ok', op: 'SetData', value: 'fine', outputPath: '/workflow/result' }] });
+    const result = await ex.execute();
+    expect(result.state.workflow.result).toBe('fine');
+    expect(result.errors.ok).toBeUndefined();
+  });
+});
+
 describe('SetData + Calculate', () => {
   it('sets literal value', async () => {
     const ex = new WorkflowExecutor();
