@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1369 tests | 0 deps | 27 core modules
+By automators.work | 1377 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -11,7 +11,7 @@ Core (27 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
 db.js              Document DB: MongoDB queries, indices, JWT auth, AES-256-GCM encryption, long-lived API keys, optional typed tables (Table + schema registry)
 vector.js          Vector DB: Float32/Int8/Polar3bit/Binary, IVF (mutation-safe, reports drift via indexStats), Matryoshka, BM25
 hnsw.js            HNSW index: O(log n) approximate nearest neighbor search
-http.js            HTTP router: Request/Response, middleware, params, sub-routers, CORS
+http.js            HTTP router: Request/Response, middleware, params, sub-routers, CORS, request logging + Prometheus instrumentation
 validate.js        Schema validation: types, formats, defaults, middleware
 cms.js             CMS: content types, entries, taxonomies, terms, users, roles, last-admin lockout protection
 plugins.js         Plugins: hooks, capabilities, registry, loader
@@ -1143,6 +1143,7 @@ bun cli.js seed --file seed.json
 ## REST API
 
 ### General
+- GET /metrics - Prometheus text format, mounted only with `createApp({ metrics: true })`, unauthenticated by design (see "Metrics (Prometheus)" above)
 - GET /api/help - dense, single-read, agent-oriented prose walkthrough of the whole REST API (auth flow, where to discover things, known gotchas) — mirrors GET /api/shell/help's pattern, complements GET /api/schema's structured data catalog
 
 ### Auth
@@ -1671,6 +1672,39 @@ if the call itself completed (matching `POST /:id/run`'s own convention: the wor
 in `execution.status`, not the HTTP status code) -- a genuine failure to even run (e.g. the workflow
 was deleted mid-flight) still falls through to 500. The secret check (`X-Webhook-Secret`) still applies
 before dispatch either way. Default unset: zero behavior change for every existing webhook.
+
+### Metrics (Prometheus)
+
+Off by default. `createApp({ metrics: true })` mounts `GET /metrics` in Prometheus text format
+(`version=0.0.4`) and wires the HTTP instrumentation that already existed in `logger()`:
+
+```javascript
+const app = await createApp({ adapter, secret, metrics: true });
+// GET /metrics ->
+//   http_requests_total{method="GET",route="/api/entries/id/:id",status="200"} 42
+//   http_request_duration_ms_bucket{...,le="50"} 40
+//   akit_executions_running / _queued / _stored / _in_flight
+```
+
+Pass an existing `MetricsRegistry` instead of `true` to share one with application code; the registry
+is returned as `app.metrics`. Unset, no registry is created and no route is added.
+
+**Labels are the route PATTERN (`/api/entries/id/:id`), never the concrete path.** That is not
+cosmetic: labelling by concrete path gave every distinct id its own time series — unbounded growth in
+this process and in any scraper — and wrote entry/user/workflow ids into an endpoint that is normally
+scraped WITHOUT authentication. `ctx.routePattern` carries it, including back out of mounted
+sub-routers (a shallow-copied ctx does not return it on its own, and nearly every route is mounted
+under a prefix). A request that genuinely matched nothing is labelled `<unmatched>` rather than by the
+path it asked for.
+
+The `akit_executions_*` gauges are sampled at SCRAPE time from `executionStats()` and
+`retentionStats()` — until this existed those numbers were reachable only from code, so the
+backpressure and retention above were "observable" with nothing to observe them through. A failure to
+sample logs and still serves the HTTP counters rather than failing the whole endpoint.
+
+**No authentication, deliberately**, like n8n's own metrics endpoint: a Prometheus scraper cannot
+present a JWT. It carries no ids or user data, but request volume and error rates are still operational
+information — restrict it at the network layer.
 
 ### Execution history retention
 
@@ -2719,6 +2753,17 @@ fourth time in this stretch the gap was "the mechanism exists and nothing drives
 (exported, unused), the concurrency cap (`PostgresJobQueue` had one, the default path did not), and
 this. Worth checking for directly when looking for what is missing. 8 new tests.
 
+**Prometheus metrics endpoint (2026-08-04):** the fifth gap in a row of the same shape — every piece
+written, nothing assembling them. `MetricsRegistry` (with a Prometheus renderer), `metricsHandler()` in
+`core/http.js` whose own doc comment shows exactly this mounting, and `logger()`'s instrumentation all
+existed; `createApp()` called `logger()` with NO registry, so it wrote to `null`, and no `/metrics`
+route was ever added. New `opts.metrics` (`true`, or an existing registry to share with app code)
+mounts it, and the `akit_executions_*` gauges finally give the concurrency cap and retention added
+above a surface to be observed through. Wiring it surfaced two real bugs in the instrumentation, filed
+as gap item 29: labels used the concrete path (unbounded cardinality + resource ids written into an
+unauthenticated endpoint), and sub-routers dropped the route pattern so nearly all real traffic
+reported as `<unmatched>`. 9 new tests. See "Metrics (Prometheus)" above for the contract.
+
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
 - AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
@@ -2734,12 +2779,13 @@ Current posture:
 - Query filters and schemas fail CLOSED, never open: an unknown/misspelled query operator throws rather than being treated as satisfied, non-array `$in`/`$nin` targets are rejected, and `validate.js`'s `enum`/`min`/`max` apply to every rule shape, not just explicitly-typed strings
 - Session auto-cleanup
 - Webhook HMAC-SHA256 signing + optional per-webhook secret
+- Optional Prometheus metrics endpoint, labelled by route pattern so no resource ids reach it (unauthenticated by design, like n8n's; restrict at the network layer)
 - Optional execution-history retention (age and/or count bounded, off by default since it deletes irreversibly; in-flight executions are never eligible)
 - Rate limiting in triggers, plus an instance-wide cap on concurrently running trigger-fired executions (default 100, overflow queued, backlog bounded) so a burst cannot exhaust the process
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-28 resolved; open items listed at the end)
+## Known Security Gaps (items 1-29 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -3219,7 +3265,23 @@ to expose" are different questions, and a clean audit of the former says nothing
    and the new count-based trim. 8 new regression tests, including one asserting exactly which statuses
    survive.
 
-Items 1-4 and 6-28 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+29. **RESOLVED (2026-08-04), MEDIUM.** The HTTP instrumentation wrote resource ids into metrics and grew
+   time series without bound. `logger()`'s metric labels used `ctx.path`, the CONCRETE request path, so
+   `/api/entries/id/abc123` and `/api/entries/id/def456` became separate series — memory growth
+   proportional to the number of distinct ids ever requested, in this process and in every scraper — and
+   entry, user and workflow ids ended up in an endpoint that is conventionally scraped WITHOUT
+   authentication. Latent until now (nothing assembled the metrics pipeline, so nothing was ever
+   exposed), and it would have shipped the moment `/metrics` was mounted, which is what surfaced it.
+   Fixed by labelling with the route PATTERN, which bounds the series count by the number of routes and
+   contains no ids; unmatched requests get a constant `<unmatched>` instead of the raw path they asked
+   for. Two sub-router dispatch sites also had to propagate the pattern back out of their shallow-copied
+   ctx — without that, nearly every route (they are almost all mounted under a prefix) reported as
+   `<unmatched>`, lumping real traffic in with genuine 404s. Note on why this survived: the existing
+   test asserted the old label using `/ping`, a top-level literal route where path and pattern are
+   identical, so it could not structurally detect the problem — a parameterised-route test was added
+   alongside the corrected assertion. 9 new tests.
+
+Items 1-4 and 6-29 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
