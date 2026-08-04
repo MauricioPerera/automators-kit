@@ -60,7 +60,6 @@ function validateField(name, rule, value) {
         if (rule.max !== undefined && value.length > rule.max) errors.push(`${name} must be at most ${rule.max} characters`);
         if (rule.pattern && !rule.pattern.test(value)) errors.push(`${name} has invalid format`);
         if (rule.format && FORMATS[rule.format] && !FORMATS[rule.format](value)) errors.push(`${name} must be a valid ${rule.format}`);
-        if (rule.enum && !rule.enum.includes(value)) errors.push(`${name} must be one of: ${rule.enum.join(', ')}`);
         break;
 
       case 'number':
@@ -100,6 +99,32 @@ function validateField(name, rule, value) {
         }
         break;
     }
+  } else {
+    // CORRECTNESS (2026-08-03, full-codebase audit): nothing at all ran when
+    // a rule declared no `type`, so constraints on a typeless rule were
+    // silently ignored -- `validate({ s: { required: true, min: 5 } }, { s:
+    // 'x' })` reported valid. `min`/`max` have no single meaning without a
+    // type, so they're applied by the VALUE's runtime type, matching what
+    // each typed branch above does for that same type.
+    if (typeof value === 'string' || Array.isArray(value)) {
+      const unit = typeof value === 'string' ? 'characters' : 'items';
+      if (rule.min !== undefined && value.length < rule.min) errors.push(`${name} must be at least ${rule.min} ${unit}`);
+      if (rule.max !== undefined && value.length > rule.max) errors.push(`${name} must be at most ${rule.max} ${unit}`);
+    } else if (typeof value === 'number' && !isNaN(value)) {
+      if (rule.min !== undefined && value < rule.min) errors.push(`${name} must be >= ${rule.min}`);
+      if (rule.max !== undefined && value > rule.max) errors.push(`${name} must be <= ${rule.max}`);
+    }
+  }
+
+  // CORRECTNESS (2026-08-03, full-codebase audit): `enum` used to live inside
+  // `case 'string'` only, so it was silently DROPPED for every other rule
+  // shape -- `{ role: { enum: ['user','editor'] } }` (no `type`) accepted
+  // `'superadmin'`, and `{ n: { type: 'number', enum: [1,2,3] } }` accepted
+  // 999. A route gating on such a schema believed it was constrained and was
+  // not. Reproduced directly. Set membership is type-agnostic, so it belongs
+  // out here where it applies to every rule.
+  if (rule.enum && !rule.enum.includes(value)) {
+    errors.push(`${name} must be one of: ${rule.enum.join(', ')}`);
   }
 
   return errors;

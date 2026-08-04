@@ -119,6 +119,35 @@ describe('DocStore', () => {
     expect(docs[0].name).toBe('persisted');
   });
 
+  // CORRECTNESS (2026-08-03, full-codebase audit): the HashIndex $in fast
+  // path concatenated per-value id lists without de-duplication, so an
+  // indexed collection and a non-indexed one disagreed on the same query.
+  it('$in through a hash index does not duplicate rows (agrees with the unindexed scan)', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    const plain = db.collection('plain');
+    const indexed = db.collection('indexed');
+    indexed.createIndex('status');
+    for (const col of [plain, indexed]) {
+      col.insert({ _id: 'a', status: 'x' });
+      col.insert({ _id: 'b', status: 'y' });
+    }
+    const filter = { status: { $in: ['x', 'x', 'x'] } };
+    expect(indexed.find(filter).toArray().map((d) => d._id)).toEqual(['a']);
+    expect(indexed.find(filter).toArray()).toEqual(plain.find(filter).toArray());
+    expect(indexed.count(filter)).toBe(plain.count(filter));
+  });
+
+  it('$in through a hash index still returns every distinct match', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    const col = db.collection('multi');
+    col.createIndex('status');
+    col.insert({ _id: 'a', status: 'x' });
+    col.insert({ _id: 'b', status: 'y' });
+    col.insert({ _id: 'c', status: 'z' });
+    const ids = col.find({ status: { $in: ['x', 'z'] } }).toArray().map((d) => d._id).sort();
+    expect(ids).toEqual(['a', 'c']);
+  });
+
   // SECURITY (2026-08-03, full-codebase audit): a collection name becomes a
   // FILE NAME verbatim, and FileStorageAdapter's join() collapses `..` --
   // so an unvalidated name escaped the storage directory entirely. This is
@@ -215,6 +244,61 @@ describe('Cursor', () => {
 // ---------------------------------------------------------------------------
 // Query operators
 // ---------------------------------------------------------------------------
+
+// SECURITY/CORRECTNESS (2026-08-03, full-codebase audit): the operator
+// switch ended in `default: break`, so an operator it didn't recognize was
+// treated as SATISFIED -- a typo turned a restrictive filter into
+// match-everything with no error. In an access-control filter that inverts
+// the intent completely.
+describe('Query operators: unknown operators are rejected, not satisfied', () => {
+  it('a typo\'d operator throws instead of matching everything', () => {
+    expect(() => matchFilter({ age: 5 }, { age: { $gtt: 100 } })).toThrow(/Unknown query operator '\$gtt'/);
+    expect(() => matchFilter({ role: 'viewer' }, { role: { $eqq: 'admin' } })).toThrow(/Unknown query operator/);
+  });
+
+  it('the error names the offending operator and the field', () => {
+    expect(() => matchFilter({ age: 5 }, { age: { $nope: 1 } })).toThrow(/'\$nope'.*'age'/);
+  });
+
+  it('$in / $nin reject a non-array target instead of silently passing', () => {
+    // $nin was asymmetric with $in: a non-array target fell through without
+    // returning false, so this matched EVERY document.
+    expect(() => matchFilter({ role: 'admin' }, { role: { $nin: 'admin' } })).toThrow(/\$nin expects an array/);
+    expect(() => matchFilter({ role: 'admin' }, { role: { $in: 'admin' } })).toThrow(/\$in expects an array/);
+  });
+
+  it('$options is honored rather than silently dropped', () => {
+    // Reached the switch's default and was ignored, so a filter that reads
+    // case-insensitive ran case-SENSITIVELY.
+    expect(matchFilter({ s: 'ADMIN' }, { s: { $regex: 'admin', $options: 'i' } })).toBe(true);
+    expect(matchFilter({ s: 'ADMIN' }, { s: { $regex: 'admin' } })).toBe(false);
+  });
+
+  it('a plain (non-$) object is compared structurally, not blanket-matched', () => {
+    expect(matchFilter({ meta: { a: 1 } }, { meta: { a: 1 } })).toBe(true);
+    expect(matchFilter({ meta: { a: 2 } }, { meta: { a: 1 } })).toBe(false);
+    expect(matchFilter({ other: 1 }, { meta: { a: 1 } })).toBe(false);
+  });
+
+  it('every real operator still works (the allowlist is not over-tight)', () => {
+    expect(matchFilter({ x: 10 }, { x: { $gt: 5 } })).toBe(true);
+    expect(matchFilter({ x: 'a' }, { x: { $in: ['a'] } })).toBe(true);
+    expect(matchFilter({ x: [1, 2] }, { x: { $size: 2 } })).toBe(true);
+    expect(matchFilter({ x: 'abc' }, { x: { $len: 3 } })).toBe(true);
+    expect(matchFilter({ x: 5 }, { x: { $between: [1, 10] } })).toBe(true);
+    expect(matchFilter({ x: [{ a: 1 }] }, { x: { $elemMatch: { a: 1 } } })).toBe(true);
+  });
+
+  it('documents a PRE-EXISTING $elemMatch limitation (not introduced by the operator allowlist)', () => {
+    // `$elemMatch` over an array of PRIMITIVES with an operator target does
+    // not match: the handler wraps each primitive as `{ '': elem }`, so the
+    // target's `$gt` key is looked up as a FIELD on that wrapper and resolves
+    // to undefined. Verified against the pre-change code — this returned
+    // false there too, so it is a separate long-standing gap, recorded here
+    // rather than silently asserted away. Object elements work fine (above).
+    expect(matchFilter({ x: [1] }, { x: { $elemMatch: { $gt: 0 } } })).toBe(false);
+  });
+});
 
 describe('Query operators', () => {
   it('$eq, $ne', () => {

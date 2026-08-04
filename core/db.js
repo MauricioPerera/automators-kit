@@ -63,6 +63,17 @@ function _validateRegexPattern(src) {
 // MATCH FILTER (query engine)
 // ---------------------------------------------------------------------------
 
+/**
+ * Every operator the switch in `matchFilter` implements. Kept beside it so
+ * adding a `case` without adding it here fails loudly on first use rather
+ * than silently matching everything (see the comment at the dispatch site).
+ */
+const KNOWN_QUERY_OPERATORS = new Set([
+  '$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$in', '$nin', '$exists',
+  '$regex', '$options', '$between', '$contains', '$containsAny',
+  '$containsNone', '$size', '$len', '$type', '$finite', '$elemMatch',
+]);
+
 function matchFilter(doc, filter) {
   if (!filter || typeof filter !== 'object') return true;
   if (!doc) doc = {};
@@ -98,8 +109,32 @@ function matchFilter(doc, filter) {
       continue;
     }
 
-    for (const op of Object.keys(cond)) {
+    // SECURITY/CORRECTNESS (2026-08-03, full-codebase audit): the switch
+    // below used to end in `default: break`, i.e. an operator it did not
+    // recognize was treated as SATISFIED. A typo'd or unsupported operator
+    // therefore turned a restrictive filter into match-everything, silently:
+    // `find({ age: { $gtt: 100 } })` returned every document, and so did
+    // `find({ role: { $eqq: 'admin' } })`. In an access-control filter that
+    // inverts the intent completely, with no error anywhere. Reproduced
+    // directly before this fix.
+    //
+    // A `cond` object reaches here for two different reasons, which have to
+    // be told apart before rejecting anything: it is either a set of
+    // `$`-operators, or a plain object being compared by value (`find({ meta:
+    // { a: 1 } })`). Only the former is operator syntax, so only unknown keys
+    // in the former are an error; a `$`-free object is compared structurally
+    // instead of silently matching everything, which is what it did before.
+    const condKeys = Object.keys(cond);
+    if (condKeys.length > 0 && !condKeys.some((k) => k.startsWith('$'))) {
+      if (JSON.stringify(val) !== JSON.stringify(cond)) return false;
+      continue;
+    }
+
+    for (const op of condKeys) {
       const target = cond[op];
+      if (!KNOWN_QUERY_OPERATORS.has(op)) {
+        throw new Error(`Unknown query operator '${op}' (in filter for field '${key}'). Known operators: ${[...KNOWN_QUERY_OPERATORS].sort().join(', ')}`);
+      }
       switch (op) {
         case '$eq':      if (val !== target) return false; break;
         case '$ne':      if (val === target) return false; break;
@@ -107,17 +142,29 @@ function matchFilter(doc, filter) {
         case '$gte':     if (!(val >= target)) return false; break;
         case '$lt':      if (!(val < target)) return false; break;
         case '$lte':     if (!(val <= target)) return false; break;
-        case '$in':      if (!Array.isArray(target) || !target.includes(val)) return false; break;
-        case '$nin':     if (Array.isArray(target) && target.includes(val)) return false; break;
+        case '$in':      if (!Array.isArray(target)) throw new Error(`$in expects an array (field '${key}'), got ${typeof target}`); if (!target.includes(val)) return false; break;
+        // Was asymmetric with $in: a NON-array target fell through without
+        // returning false, so `{ role: { $nin: 'admin' } }` (a plausible typo
+        // for `['admin']`) matched every document instead of excluding any.
+        case '$nin':     if (!Array.isArray(target)) throw new Error(`$nin expects an array (field '${key}'), got ${typeof target}`); if (target.includes(val)) return false; break;
         case '$exists':  if ((val !== undefined) !== target) return false; break;
         case '$regex': {
-          const re = typeof target === 'string' ? new RegExp(target) : target;
+          // `$options` is a sibling key of `$regex` (Mongo syntax), not an
+          // operator of its own -- it used to reach the switch's `default`
+          // and be silently DROPPED, so `{ $regex: 'abc', $options: 'i' }`
+          // ran case-SENSITIVELY while reading as case-insensitive.
+          const flags = typeof cond.$options === 'string' ? cond.$options : '';
+          const re = typeof target === 'string'
+            ? new RegExp(target, flags)
+            : (flags && target instanceof RegExp ? new RegExp(target.source, flags) : target);
           // Validar antes de .test(): el patron viene del filtro (input
           // externo) y un patron catastrofico bloquearia el event loop.
           _validateRegexPattern(re.source);
           if (!re.test(String(val ?? ''))) return false;
           break;
         }
+        // Handled inside $regex above; a no-op on its own.
+        case '$options': break;
         case '$between': {
           if (!Array.isArray(target) || target.length !== 2) return false;
           if (!(val >= target[0] && val <= target[1])) return false;
@@ -1107,9 +1154,18 @@ class Collection {
         }
         if (cond.$eq !== undefined) return index.lookup(cond.$eq);
         if (cond.$in && Array.isArray(cond.$in)) {
-          const ids = [];
-          for (const v of cond.$in) ids.push(...index.lookup(v));
-          return ids;
+          // CORRECTNESS (2026-08-03, full-codebase audit): this concatenated
+          // the per-value id lists with no de-duplication, and nothing
+          // downstream de-duped either -- so a `$in` list containing the same
+          // value twice (or two values a doc matches, e.g. an array field)
+          // returned that document once PER hit. An indexed collection and a
+          // non-indexed one then disagreed: `{status: {$in: ['a','a','a']}}`
+          // gave 1 row unindexed and 3 rows (and count() === 3) indexed.
+          // Reproduced directly. A Set keeps the fast path while making it
+          // agree with the scan.
+          const ids = new Set();
+          for (const v of cond.$in) for (const id of index.lookup(v)) ids.add(id);
+          return [...ids];
         }
       }
 

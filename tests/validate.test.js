@@ -5,6 +5,43 @@
 import { describe, it, expect } from 'bun:test';
 import { validate, createValidator, isValidSemver } from '../core/validate.js';
 
+// CORRECTNESS (2026-08-03, full-codebase audit): `enum` lived inside
+// `case 'string'` only and nothing ran at all for a rule with no `type`, so
+// both were silently dropped -- a route gating on such a schema believed it
+// was constrained and was not.
+describe('constraints are not silently dropped', () => {
+  it('enum applies to a rule with no explicit type', () => {
+    const schema = { role: { enum: ['user', 'editor'] } };
+    expect(validate(schema, { role: 'superadmin' }).valid).toBe(false);
+    expect(validate(schema, { role: 'user' }).valid).toBe(true);
+  });
+
+  it('enum applies to non-string types', () => {
+    expect(validate({ n: { type: 'number', enum: [1, 2, 3] } }, { n: 999 }).valid).toBe(false);
+    expect(validate({ n: { type: 'number', enum: [1, 2, 3] } }, { n: 2 }).valid).toBe(true);
+    expect(validate({ b: { type: 'boolean', enum: [true] } }, { b: false }).valid).toBe(false);
+  });
+
+  it('enum still works on an explicitly-typed string (no regression)', () => {
+    const schema = { role: { type: 'string', enum: ['user', 'editor'] } };
+    expect(validate(schema, { role: 'superadmin' }).valid).toBe(false);
+    expect(validate(schema, { role: 'editor' }).valid).toBe(true);
+  });
+
+  it('reports the enum violation exactly once, not twice', () => {
+    const res = validate({ role: { type: 'string', enum: ['user'] } }, { role: 'nope' });
+    expect(res.errors.filter((e) => e.includes('must be one of')).length).toBe(1);
+  });
+
+  it('min/max apply to a typeless rule, using the value\'s runtime type', () => {
+    expect(validate({ s: { required: true, min: 5 } }, { s: 'x' }).valid).toBe(false);
+    expect(validate({ s: { required: true, min: 5 } }, { s: 'longenough' }).valid).toBe(true);
+    expect(validate({ n: { min: 10 } }, { n: 3 }).valid).toBe(false);
+    expect(validate({ n: { min: 10 } }, { n: 30 }).valid).toBe(true);
+    expect(validate({ a: { max: 2 } }, { a: [1, 2, 3] }).valid).toBe(false);
+  });
+});
+
 describe('validate', () => {
   it('validates required string', () => {
     const schema = { name: { type: 'string', required: true } };
