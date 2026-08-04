@@ -74,7 +74,13 @@ async function _blockInternalCollections(ctx, next) {
 // SECURITY (2026-08-04, found by sweeping for written-but-unwired code --
 // `validateQuery` was exported by core/validate.js and used by exactly zero
 // routes, so every query param on this API arrived unvalidated and
-// uncoerced). The pagination cap below was written as
+// uncoerced). Worth being precise about the shape of that gap: the helper
+// was NOT dead code -- examples/api-validation/setup.js used it and
+// tests/examples-api-validation.test.js covered it, so it was written,
+// wired and proven. It was unused HERE, where each route had instead
+// hand-rolled its own `parseInt(...) || N`. The bug below lived in that
+// hand-rolled copy, not in anything dormant, which is why grepping for the
+// symbol looked reassuring. The pagination cap below was written as
 // `Math.min(parseInt(q._limit) || 50, 500)`, which caps the TOP but not the
 // BOTTOM: any negative number is <= 500, so `Math.min` returns it unchanged
 // and it reaches `cursor.limit(-1)`, where the underlying `slice` treats a

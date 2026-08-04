@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1395 tests | 0 deps | 27 core modules
+By automators.work | 1407 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -1210,6 +1210,22 @@ const created = await cms.users.createApiKey(userId, 'CI pipeline');
   BOTH this API and the `data.table` workflow node. Existing rows are left as they are
 - DELETE /api/db/:col/_schema (admin) - back to schemaless, rows kept
 - Internal (`_`-prefixed) collections are rejected with 403 on every one of these
+
+`GET /api/db/:col` list params, validated since 2026-08-04 (see Known Security Gaps item 30 — a
+negative `_limit` used to bypass the row cap entirely):
+
+| Param | Rules | Notes |
+|---|---|---|
+| `_limit` | number, `>= 1` | Clamped to 500. Asking for more is silently capped, not rejected |
+| `_offset` | number, `>= 0` | |
+| `_sort` | string | Field name |
+| `_order` | `asc` or `desc` | Anything else is now a 400; it used to mean `desc` |
+| `_fields` | string | Comma-separated projection |
+
+Every OTHER query param is a dynamic filter field (`?status=draft`, `?age__gt=18`) and passes through
+untouched — the validator deliberately does not strip unknown keys, since dropping a filter would
+silently return UNFILTERED rows. `GET /api/shell/history` and `GET /api/workflows/:id/executions` take
+the same `limit >= 1` rule.
 
 ### Users (admin)
 - GET/PUT/DELETE /api/users[/:id]
@@ -2845,6 +2861,47 @@ refusal from `setTableSchema` instead of a `DataCloneError` from inside `insert(
 by `PUT /api/db/:col/_schema`. Second time running in this sweep that wiring something disconnected
 revealed the code could never have worked — after the metrics labels. 12 new tests.
 
+**2026-08-04 — query-parameter validation wired (`validateQuery`), and the pagination cap it was
+missing.** Last item of the written-but-unwired sweep: `core/validate.js` exported `validateQuery` and
+**no route used it**, so every query param arrived unvalidated and uncoerced — which is exactly why each
+route had hand-rolled its own `parseInt(...) || N`. One of those hand-rolls was wrong in a way that
+mattered: `/api/db/:col`'s 500-row cap was `Math.min(parseInt(q._limit) || 50, 500)`, which bounds the
+top but not the bottom, so `?_limit=-1` sailed through `Math.min` untouched and `slice` read the
+negative length as "no limit" — all 2000 rows of a test collection, for any authenticated user. Now
+wired on the three limit-taking GET routes using the existing `validateBody` → `ctx.state.body`
+convention. See Known Security Gaps item 30 for the full finding, the two smaller defects that shared
+its root cause, and the two decisions deliberately NOT made (no `$max`, no `stripUnknown`). 12 new
+tests, 7 of which fail against the pre-fix routes.
+
+**Closing note on this sweep (six gaps), including a correction.** Searching for "a mechanism exists and
+nothing drives it" found six disconnected pieces, and wiring them exposed a latent bug in **four**:
+unbounded metric label cardinality with ids leaking into an unauthenticated endpoint, `purgeExecutions`
+deleting live executions, template defaults that made a template impossible to register, and this
+pagination cap. All four were invisible to the six-agent security audit run earlier — an auditor reads
+what the code does, not what happens when it finally runs.
+
+The correction: item 30 does **not** actually fit the "never executed" pattern the other five did, and
+saying so would overstate a tidy story. `validateQuery` had a real consumer all along —
+`examples/api-validation/setup.js`, covered by `tests/examples-api-validation.test.js` — so unlike
+`TEMPLATES` or the metrics chain, it was written, wired and proven. It was unused by `routes/`
+specifically, and that is a different failure: the production routes each hand-rolled
+`parseInt(...) || N` instead of reaching for the tested helper sitting next to them. The bug lived in
+the ad-hoc reimplementations, not in the dormant code.
+
+So the sweep really found two distinct shapes, and both are worth looking for:
+
+1. **Nothing drives this mechanism** (five cases). An export with no consumer anywhere is code that has
+   never run, and more often than not it is broken. Wiring it is a change that needs its own tests,
+   never plumbing.
+2. **Something drives it, but not the code that matters** (item 30). A helper is used by an example or
+   one module while the security-relevant surfaces reimplement it by hand. Nothing looks disconnected —
+   grep finds the symbol in use — and the divergence is invisible until the copies are compared. This is
+   the same shape as the `data.table` node and `/api/db/:col` drifting apart earlier in this audit, which
+   is what made the node a second path to privilege escalation.
+
+Shape 2 is the harder one to hunt, because the reassuring signal (the symbol IS referenced) is exactly
+what hides it.
+
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
 - AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
@@ -2866,7 +2923,7 @@ Current posture:
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-29 resolved; open items listed at the end)
+## Known Security Gaps (items 1-30 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -3362,16 +3419,46 @@ to expose" are different questions, and a clean audit of the former says nothing
    identical, so it could not structurally detect the problem — a parameterised-route test was added
    alongside the corrected assertion. 9 new tests.
 
-Items 1-4 and 6-29 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+30. **RESOLVED (2026-08-04), HIGH.** `/api/db/:col`'s documented 500-row pagination cap was bypassable
+   with a negative number. The cap was written `Math.min(parseInt(q._limit) || 50, 500)`, which bounds
+   the TOP but not the BOTTOM: any negative is already `<= 500`, so `Math.min` returns it unchanged and
+   it reaches `cursor.limit(-1)`, where the underlying `slice` reads a negative length as "no limit at
+   all". Reproduced live over the real routes on a 2000-row collection: `?_limit=99999` correctly
+   returned 500 rows, `?_limit=-1` returned all 2000. Any authenticated user — including a freshly
+   self-registered `viewer` — could dump an entire collection of arbitrary size in a single request.
+   Two smaller defects shared the root cause: `?_limit=1e9` returned a SINGLE row (`parseInt` stops at
+   the `e`), and `/api/shell/history?limit=-5` returned 25 of 30 entries instead of 5 (negative `slice`,
+   counted from the wrong end). Found by sweeping for written-but-unwired code: `core/validate.js`
+   exported `validateQuery` and **no route used it**, so every query param on every route arrived
+   unvalidated and uncoerced — which is why each surface had hand-rolled its own `parseInt(...) || N`.
+   Precisely: the helper was not dead code — `examples/api-validation/setup.js` used it and its own test
+   covered it — it was unused by `routes/`, and the bug lived in the hand-rolled copies rather than in
+   anything dormant. See the sweep's closing note above for why that distinction matters.
+   Fixed by wiring `validateQuery` into the three limit-taking GET routes, following the existing
+   `validateBody` → `ctx.state.body` convention. Note on why this survived: **no test touched
+   `_limit`/`_offset`/`_sort`/`_order`/`_fields` at all** — the generic data API's pagination was
+   entirely uncovered. 12 new tests, 7 of which fail against the pre-fix routes (verified by stashing
+   `routes/`). One deliberate non-change: `_limit` has no `$max` in its schema, so an over-cap request
+   is still silently clamped exactly as before rather than newly returning 400; only nonsensical input
+   (`< 1`) is rejected. One visible behavior change: `_order` is now an `asc|desc` enum, where it
+   previously treated any non-`asc` value as descending.
+
+Items 1-4 and 6-30 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
 
-**A note on what items 15-17 have in common:** all three failed OPEN. A typo'd operator, a missing
-`type`, an `enum` on the wrong rule shape — each made a filter or schema accept MORE than the author
-wrote, silently, while reading correctly. That is the more dangerous default than failing closed, and it
-is worth checking for deliberately in anything new: when a constraint can't be applied, refuse rather
-than ignore.
+**A note on what items 15-17 and 30 have in common:** all four failed OPEN. A typo'd operator, a missing
+`type`, an `enum` on the wrong rule shape, a cap that bounded only one side — each made a filter, schema
+or limit accept MORE than the author wrote, silently, while reading correctly. That is the more
+dangerous default than failing closed, and it is worth checking for deliberately in anything new: when a
+constraint can't be applied, refuse rather than ignore.
+
+Item 30 is the sharpest example because the bound was *visibly there*. `Math.min(x, 500)` reads as "at
+most 500" and is right about that; it says nothing about the other end, and nothing in the expression
+looks missing. A one-sided guard is harder to spot than an absent one — reviewing it means asking what
+the value can be, not whether a check exists. When a parameter has a natural range, constrain BOTH ends
+or state in a comment why one is unbounded.
 
 **Still open, disclosed rather than quietly carried:** `net-guard` performs no DNS resolution, so a
 public-looking HOSTNAME that resolves to a private IP is still not caught — the module's original scope
