@@ -42,6 +42,11 @@ export class JobQueue {
     this._started = false;
     this._dirty = false;
     this._flushTimer = null;
+    // Job ids this process is CURRENTLY executing. See _poll's reclaim query:
+    // the lease exists to recover jobs orphaned by a crash, and a live handler
+    // is not orphaned. Without this, a handler outrunning leaseMs was
+    // re-claimed and re-executed by the very process already running it.
+    this._inFlight = new Set();
   }
 
   /**
@@ -193,6 +198,26 @@ export class JobQueue {
     }).sort({ priority: -1, createdAt: 1 }).limit(this.concurrency - this._running).toArray();
 
     for (const job of available) {
+      // CORRECTNESS (2026-08-03, full-codebase audit): the reclaim arm of the
+      // query above says "stuck in processing, lease expired -> the worker
+      // died, take it back". It could not tell a DEAD worker from a SLOW one,
+      // because _process stamped updatedAt once at claim time and never
+      // renewed it. So any handler outrunning leaseMs (default FIVE MINUTES --
+      // a large export, a slow upstream, a transcode) was re-claimed and
+      // re-executed by this same process, again every lease period, while the
+      // original invocation was still running. Reproduced: one enqueued job,
+      // a 1000ms handler, leaseMs 300 -> the handler ran 4 times and the queue
+      // still reported `completed: 1`. For a non-idempotent job (a charge, an
+      // email) that is N side effects, invisibly. It also corrupted _running,
+      // since several _process calls incremented/decremented for one job,
+      // permanently shrinking effective concurrency.
+      //
+      // This queue is single-process by design (see the class doc comment), so
+      // a job THIS process is currently running is by definition not orphaned
+      // and must never be reclaimed here. After a real crash the process
+      // restarts with an empty _inFlight, so genuine recovery still works --
+      // which is the only case the reclaim arm was ever for.
+      if (this._inFlight.has(job._id)) continue;
       this._process(job);
     }
   }
@@ -207,6 +232,19 @@ export class JobQueue {
     // Mark as processing
     this._jobs.update({ _id: job._id }, { $set: { status: 'processing', updatedAt: Date.now() } });
     this._running++;
+    this._inFlight.add(job._id);
+
+    // Renew the lease while the handler runs, so the PERSISTED row also stops
+    // claiming this job is abandoned. _inFlight already prevents this process
+    // from reclaiming it; this is what keeps the on-disk state honest for
+    // anything that reads it (stats, an operator inspecting the collection,
+    // or a future process that restarts and has to judge from the row alone).
+    // Refreshed at a third of the lease so a single missed tick is harmless.
+    const heartbeat = setInterval(() => {
+      this._jobs.update({ _id: job._id }, { $set: { updatedAt: Date.now() } });
+    }, Math.max(Math.floor(this.leaseMs / 3), 50));
+    // Never let the heartbeat alone hold the event loop open.
+    if (typeof heartbeat.unref === 'function') heartbeat.unref();
 
     try {
       const result = await this._invokeHandler(handlerDef, job);
@@ -232,6 +270,8 @@ export class JobQueue {
         }});
       }
     } finally {
+      clearInterval(heartbeat);
+      this._inFlight.delete(job._id);
       this._running--;
       this.db.flush();
     }

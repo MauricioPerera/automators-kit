@@ -43,8 +43,13 @@ CREATE TABLE IF NOT EXISTS queue_jobs (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   result JSONB,
-  error TEXT
+  error TEXT,
+  -- Fencing token, rotated on every claim. See claimJobs / _process: it is
+  -- what stops a worker whose lease was taken away from writing a result over
+  -- the worker that legitimately owns the job now.
+  lease_token TEXT
 );
+ALTER TABLE queue_jobs ADD COLUMN IF NOT EXISTS lease_token TEXT;
 CREATE INDEX IF NOT EXISTS idx_queue_jobs_poll ON queue_jobs (status, run_at);
 
 CREATE TABLE IF NOT EXISTS queue_dead (
@@ -73,6 +78,7 @@ function rowToJob(row) {
     updatedAt: +row.updated_at,
     result: row.result,
     error: row.error,
+    leaseToken: row.lease_token,
     id: row.id,
   };
 }
@@ -96,7 +102,8 @@ export async function claimJobs(pool, opts) {
        LIMIT $2
        FOR UPDATE SKIP LOCKED
      )
-     UPDATE queue_jobs SET status = 'processing', updated_at = now()
+     UPDATE queue_jobs SET status = 'processing', updated_at = now(),
+       lease_token = md5(random()::text || clock_timestamp()::text)
      WHERE id IN (SELECT id FROM claimed)
      RETURNING *`,
     [opts.leaseMs, opts.limit]
@@ -273,31 +280,66 @@ export class PostgresJobQueue {
     }
 
     this._running++;
+    // CORRECTNESS (2026-08-03, full-codebase audit): claimJobs reclaims any row
+    // whose `updated_at` is older than leaseMs, and `updated_at` was stamped
+    // only at claim time and at completion -- so it could not distinguish a
+    // DEAD worker from a SLOW one. Any handler outrunning leaseMs (default five
+    // minutes) was re-claimed and re-executed. Worse than the in-process queue's
+    // version of this bug (core/queue.js, fixed alongside): here the second run
+    // happens in a DIFFERENT worker, genuinely in parallel, and FOR UPDATE SKIP
+    // LOCKED does not help because the first worker holds no row lock while its
+    // handler runs.
+    //
+    // Two mechanisms, because a heartbeat alone is not enough: it renews the
+    // lease so a live-but-slow worker is not treated as dead, and the fencing
+    // token makes every terminal write conditional on STILL owning the job --
+    // so if this worker ever does stall past its lease and lose the job, its
+    // late result cannot overwrite whichever worker legitimately owns it now.
+    const heartbeat = setInterval(() => {
+      this.pool.query(
+        'UPDATE queue_jobs SET updated_at = now() WHERE id = $1 AND lease_token = $2',
+        [job._id, job.leaseToken]
+      ).catch(() => { /* a missed beat is recoverable; the next one renews */ });
+    }, Math.max(Math.floor(this.leaseMs / 3), 1000));
+    if (typeof heartbeat.unref === 'function') heartbeat.unref();
+
     try {
       const result = await this._invokeHandler(handlerDef, job);
       await this.pool.query(
         `UPDATE queue_jobs SET status = 'completed', result = $2, error = NULL,
-         attempts = attempts + 1, updated_at = now() WHERE id = $1`,
-        [job._id, JSON.stringify(result ?? null)]
+         attempts = attempts + 1, updated_at = now() WHERE id = $1 AND lease_token = $3`,
+        [job._id, JSON.stringify(result ?? null), job.leaseToken]
       );
     } catch (err) {
       const attempts = job.attempts + 1;
       if (attempts >= job.maxRetries) {
-        await this.pool.query(
-          `INSERT INTO queue_dead (id, type, data, attempts, max_retries, error)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [job._id, job.type, JSON.stringify(job.data), attempts, job.maxRetries, err.message]
+        // Delete FIRST, fenced, and dead-letter only if that delete actually
+        // removed our row. Inserting first would dead-letter the job even when
+        // the fenced delete turns out to be a no-op (we no longer own it),
+        // leaving the job both alive in queue_jobs AND recorded as dead.
+        // Ordering it this way makes losing the lease a clean no-op instead.
+        const claimed = await this.pool.query(
+          'DELETE FROM queue_jobs WHERE id = $1 AND lease_token = $2 RETURNING id',
+          [job._id, job.leaseToken]
         );
-        await this.pool.query('DELETE FROM queue_jobs WHERE id = $1', [job._id]);
+        if (claimed.rowCount === 1) {
+          await this.pool.query(
+            `INSERT INTO queue_dead (id, type, data, attempts, max_retries, error)
+             VALUES ($1, $2, $3, $4, $5, $6)`,
+            [job._id, job.type, JSON.stringify(job.data), attempts, job.maxRetries, err.message]
+          );
+        }
       } else {
         const backoff = this.backoffMs * Math.pow(2, attempts);
         await this.pool.query(
           `UPDATE queue_jobs SET status = 'pending', error = $2, attempts = $3,
-           run_at = now() + ($4 || ' milliseconds')::interval, updated_at = now() WHERE id = $1`,
-          [job._id, err.message, attempts, backoff]
+           run_at = now() + ($4 || ' milliseconds')::interval, updated_at = now()
+           WHERE id = $1 AND lease_token = $5`,
+          [job._id, err.message, attempts, backoff, job.leaseToken]
         );
       }
     } finally {
+      clearInterval(heartbeat);
       this._running--;
     }
   }

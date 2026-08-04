@@ -181,3 +181,81 @@ describe('JobQueue', () => {
     expect(flushCalls.length).toBe(flushesAtStop);
   });
 });
+
+// CORRECTNESS (2026-08-03, verified from a full-codebase audit lead): the
+// reclaim arm of _poll ("stuck in processing, lease expired -> the worker
+// died") could not tell a DEAD worker from a SLOW one, because _process
+// stamped updatedAt once at claim time and never renewed it. Any handler
+// outrunning leaseMs -- default FIVE MINUTES, so a large export or a slow
+// upstream -- was re-claimed and re-executed by the same process, again every
+// lease period. Reproduced before the fix: 4 invocations for one enqueued job,
+// with the queue still reporting completed: 1.
+describe('a slow handler is not mistaken for a dead worker', () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  it('runs a handler that outruns the lease exactly ONCE', async () => {
+    const q = new JobQueue(new DocStore(new MemoryStorageAdapter()), { pollInterval: 30, leaseMs: 150 });
+    let calls = 0;
+    q.register('slow', async () => { calls++; await sleep(600); });
+    q.enqueue('slow', {});
+    q.start();
+    await sleep(1000);
+    q.stop();
+    expect(calls).toBe(1);
+  });
+
+  it('does not corrupt the running counter (it used to leak, shrinking concurrency)', async () => {
+    const q = new JobQueue(new DocStore(new MemoryStorageAdapter()), { pollInterval: 30, leaseMs: 150 });
+    q.register('slow', async () => { await sleep(500); });
+    q.enqueue('slow', {});
+    q.start();
+    await sleep(900);
+    q.stop();
+    expect(q.stats().running).toBe(0);
+    expect(q.stats().completed).toBe(1);
+  });
+
+  it('several concurrent slow jobs each still run once', async () => {
+    const q = new JobQueue(new DocStore(new MemoryStorageAdapter()), { pollInterval: 30, leaseMs: 150 });
+    const calls = {};
+    q.register('slow', async (d) => { calls[d.id] = (calls[d.id] || 0) + 1; await sleep(500); });
+    for (const id of ['a', 'b', 'c']) q.enqueue('slow', { id });
+    q.start();
+    await sleep(1000);
+    q.stop();
+    expect(calls).toEqual({ a: 1, b: 1, c: 1 });
+  });
+
+  it('STILL reclaims a job genuinely orphaned by a crashed process', async () => {
+    // The reclaim arm exists for exactly this: a row left in 'processing' by a
+    // process that died. A fresh process has an empty _inFlight, so the fix
+    // must not disable recovery -- only self-reclaim.
+    const db2 = new DocStore(new MemoryStorageAdapter());
+    db2.collection('_queue_jobs').insert({
+      type: 'orphan', data: {}, status: 'processing', attempts: 0, maxRetries: 3,
+      priority: 0, runAt: Date.now() - 10000, createdAt: Date.now() - 10000,
+      updatedAt: Date.now() - 10000, // lease long expired
+    });
+    const q = new JobQueue(db2, { pollInterval: 30, leaseMs: 150 });
+    let ran = 0;
+    q.register('orphan', async () => { ran++; });
+    q.start();
+    await sleep(250);
+    q.stop();
+    expect(ran).toBe(1);
+  });
+
+  it('renews the persisted lease while the handler runs, so the row stops looking abandoned', async () => {
+    const db2 = new DocStore(new MemoryStorageAdapter());
+    const q = new JobQueue(db2, { pollInterval: 30, leaseMs: 150 });
+    q.register('slow', async () => { await sleep(600); });
+    q.enqueue('slow', {});
+    q.start();
+    await sleep(400); // well past one lease period, handler still running
+    const row = db2.collection('_queue_jobs').find({ status: 'processing' }).toArray()[0];
+    expect(row).toBeTruthy();
+    expect(Date.now() - row.updatedAt).toBeLessThan(150); // heartbeat kept it fresh
+    q.stop();
+    await sleep(300);
+  });
+});
