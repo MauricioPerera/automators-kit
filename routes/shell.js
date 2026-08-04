@@ -7,6 +7,15 @@
  */
 
 import { Router, json, error } from '../core/http.js';
+import { validateQuery } from '../core/validate.js';
+
+// `shell.getHistory(n)` slices the tail, so a negative n hits `slice`'s
+// negative-index semantics and returns MORE rows than asked for, counted from
+// the wrong end: on a 30-entry history, `?limit=-5` returned 25 entries
+// instead of 5 (verified before this fix). Not a privilege bypass like the
+// `/api/db` cap -- history is per-shell -- but plainly wrong, and rejecting
+// it costs one schema.
+const HistoryQuerySchema = { limit: { type: 'number', min: 1 } };
 
 /**
  * @param {import('../core/shell.js').Shell} shell
@@ -42,8 +51,8 @@ export function shellRoutes(shell) {
   });
 
   // History
-  r.get('/history', async (ctx) => {
-    const limit = parseInt(ctx.query.limit) || 20;
+  r.get('/history', validateQuery(HistoryQuerySchema), async (ctx) => {
+    const limit = ctx.state.query.limit || 20;
     return json({ history: shell.getHistory(limit) });
   });
 

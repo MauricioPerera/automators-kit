@@ -1793,3 +1793,100 @@ describe('404', () => {
     expect(res.status).toBe(404);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Query-parameter validation (validateQuery wiring, 2026-08-04)
+//
+// Found by sweeping for written-but-unwired code: core/validate.js exported
+// `validateQuery` and NO route used it, so every query param arrived raw. The
+// headline bug that fell out: `/api/db/:col`'s documented 500-row cap was
+// `Math.min(parseInt(q._limit) || 50, 500)`, which bounds the top but not the
+// bottom -- a negative limit is <= 500, survives Math.min untouched, and
+// `slice` reads a negative length as "no limit", dumping the whole collection.
+// No test touched _limit/_offset/_sort/_order/_fields before these.
+// ---------------------------------------------------------------------------
+describe('list query parameter validation', () => {
+  const BIG = 'qptable';
+
+  beforeAll(() => {
+    const col = app.cms.db.collection(BIG);
+    for (let i = 0; i < 700; i++) col.insert({ n: i, status: i % 2 ? 'draft' : 'live' });
+  });
+
+  it('caps a too-large _limit at 500 instead of rejecting it', async () => {
+    const res = await app.handle(req('GET', `/api/db/${BIG}?_limit=99999`, null, adminToken));
+    expect(res.status).toBe(200);
+    expect((await json(res)).data.length).toBe(500);
+  });
+
+  // The actual bug. Fails on the pre-fix code by returning all 700 rows.
+  it('rejects a negative _limit instead of returning the entire collection', async () => {
+    const res = await app.handle(req('GET', `/api/db/${BIG}?_limit=-1`, null, adminToken));
+    expect(res.status).toBe(400);
+    expect((await json(res)).error).toContain('_limit');
+  });
+
+  it('rejects _limit=0', async () => {
+    const res = await app.handle(req('GET', `/api/db/${BIG}?_limit=0`, null, adminToken));
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects a negative _offset', async () => {
+    const res = await app.handle(req('GET', `/api/db/${BIG}?_offset=-5`, null, adminToken));
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects a non-numeric _limit rather than silently defaulting', async () => {
+    const res = await app.handle(req('GET', `/api/db/${BIG}?_limit=abc`, null, adminToken));
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects an _order outside asc/desc', async () => {
+    const res = await app.handle(req('GET', `/api/db/${BIG}?_order=sideways`, null, adminToken));
+    expect(res.status).toBe(400);
+  });
+
+  // parseInt('1e9') stops at the 'e' and yields 1, so this used to return a
+  // SINGLE row. Number('1e9') is 1e9, which clamps to the cap.
+  it('reads _limit=1e9 as a large number and clamps it, not as 1', async () => {
+    const res = await app.handle(req('GET', `/api/db/${BIG}?_limit=1e9`, null, adminToken));
+    expect(res.status).toBe(200);
+    expect((await json(res)).data.length).toBe(500);
+  });
+
+  // validateQuery must NOT strip unknown keys here: every non-reserved param
+  // is a dynamic filter field, and stripping them would silently return
+  // unfiltered data -- a worse failure than rejecting the request.
+  it('still applies dynamic filter params alongside the reserved ones', async () => {
+    const res = await app.handle(req('GET', `/api/db/${BIG}?status=draft&_limit=3`, null, adminToken));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.data.length).toBe(3);
+    expect(body.data.every((d) => d.status === 'draft')).toBe(true);
+  });
+
+  it('operator filter params survive validation', async () => {
+    const res = await app.handle(req('GET', `/api/db/${BIG}?n__gt=697&_limit=10`, null, adminToken));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.data.every((d) => d.n > 697)).toBe(true);
+  });
+
+  it('a valid query still works end to end', async () => {
+    const res = await app.handle(req('GET', `/api/db/${BIG}?_limit=5&_offset=10&_sort=n&_order=asc`, null, adminToken));
+    expect(res.status).toBe(200);
+    expect((await json(res)).data.length).toBe(5);
+  });
+
+  // getHistory(n) slices the tail, so a negative n returned MORE entries than
+  // asked for, counted from the wrong end.
+  it('rejects a negative shell history limit', async () => {
+    const res = await app.handle(req('GET', '/api/shell/history?limit=-5', null, adminToken));
+    expect(res.status).toBe(400);
+  });
+
+  it('accepts a valid shell history limit', async () => {
+    const res = await app.handle(req('GET', '/api/shell/history?limit=5', null, adminToken));
+    expect(res.status).toBe(200);
+  });
+});

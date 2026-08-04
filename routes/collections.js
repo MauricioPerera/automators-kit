@@ -12,6 +12,7 @@
  */
 
 import { Router, json, error } from '../core/http.js';
+import { validateQuery } from '../core/validate.js';
 import { createAuth, requireRole } from './middleware.js';
 import { isInternalCollectionName, assertSafeCollectionName, getTableSchema, setTableSchema, setTableSchemaFromTemplate, removeTableSchema, listTableSchemas, listTableTemplates } from '../core/db.js';
 
@@ -69,6 +70,36 @@ async function _blockInternalCollections(ctx, next) {
   }
   return next();
 }
+
+// SECURITY (2026-08-04, found by sweeping for written-but-unwired code --
+// `validateQuery` was exported by core/validate.js and used by exactly zero
+// routes, so every query param on this API arrived unvalidated and
+// uncoerced). The pagination cap below was written as
+// `Math.min(parseInt(q._limit) || 50, 500)`, which caps the TOP but not the
+// BOTTOM: any negative number is <= 500, so `Math.min` returns it unchanged
+// and it reaches `cursor.limit(-1)`, where the underlying `slice` treats a
+// negative length as "no limit at all". Reproduced live over the real routes
+// before this fix: on a 2000-row collection, `?_limit=99999` correctly
+// returned 500 rows, but `?_limit=-1` returned all 2000 -- any authenticated
+// user (including a freshly self-registered `viewer`) could dump an entire
+// collection of arbitrary size in a single request, defeating the documented
+// cap. No test exercised `_limit`/`_offset`/`_sort`/`_order`/`_fields` at
+// all, which is why it survived; the regression tests added with this fix do.
+//
+// Deliberately does NOT declare `$max: 500` on `_limit`: an over-max value is
+// still silently clamped by the `Math.min` below, exactly as before, so a
+// client asking for more than the cap keeps working instead of newly getting
+// a 400. Only the nonsensical inputs (< 1) are rejected. Nor does it use
+// `stripUnknown` -- every OTHER key in this query string is a dynamic filter
+// field (`?status=draft`, `?age__gt=18`), and `validate()` passes unknown
+// keys through untouched, so the filter loop below still sees them.
+const ListQuerySchema = {
+  _limit: { type: 'number', min: 1 },
+  _offset: { type: 'number', min: 0 },
+  _sort: { type: 'string' },
+  _order: { type: 'string', enum: ['asc', 'desc'] },
+  _fields: { type: 'string' },
+};
 
 /**
  * @param {import('../core/cms.js').CMS} cms
@@ -134,9 +165,13 @@ export function collectionRoutes(cms) {
   });
 
   // List with query filters
-  r.get('/:col', auth, _blockInternalCollections, async (ctx) => {
+  r.get('/:col', auth, _blockInternalCollections, validateQuery(ListQuerySchema), async (ctx) => {
     const col = cms.db.collection(ctx.params.col);
-    const q = ctx.query;
+    // `ctx.state.query`, not `ctx.query`: validateQuery leaves the raw query
+    // untouched and publishes the coerced/validated copy on state, mirroring
+    // validateBody -> ctx.state.body. Reading `ctx.query` here would silently
+    // skip both the coercion and the bounds check.
+    const q = ctx.state.query;
 
     // Build filter from query params (skip reserved keys)
     const reserved = ['_limit', '_offset', '_sort', '_order', '_fields'];
@@ -165,8 +200,12 @@ export function collectionRoutes(cms) {
     const total = col.count(filter);
 
     // Pagination
-    const limit = Math.min(parseInt(q._limit) || 50, 500);
-    const offset = parseInt(q._offset) || 0;
+    // Already coerced to numbers (and bounds-checked) by validateQuery, so no
+    // parseInt here. That also fixes a smaller surprise the old parseInt had:
+    // `parseInt('1e9')` stops at the `e` and yields 1, so `?_limit=1e9` used
+    // to return a single row; `Number('1e9')` is 1e9, which clamps to 500.
+    const limit = Math.min(q._limit || 50, 500);
+    const offset = q._offset || 0;
     const docs = cursor.skip(offset).limit(limit).toArray();
 
     // Project fields

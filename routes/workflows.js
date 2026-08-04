@@ -4,9 +4,22 @@
  */
 
 import { Router, json, error } from '../core/http.js';
-import { validateBody } from '../core/validate.js';
+import { validateBody, validateQuery } from '../core/validate.js';
 import { createAuth, requireRole, requireWorkflowProjectRole, requireExecutionProjectRole } from './middleware.js';
 import { validateWorkflowDefinition } from '../core/workflow.js';
+
+// A negative `limit` here is harmless today (it reaches a `slice` that yields
+// an empty array, so the caller just sees nothing), unlike the `/api/db` cap
+// bypass and the shell-history mis-slice this was written alongside. It is
+// validated anyway so the three limit-taking GET routes agree on what a limit
+// is -- the /api/db bug existed precisely because one surface's idea of the
+// bound was enforced in a way another's was not. `status` is left as a plain
+// string rather than an enum: the engine owns the set of execution statuses,
+// and duplicating it here is exactly the kind of copy that drifts.
+const ExecutionsQuerySchema = {
+  limit: { type: 'number', min: 1 },
+  status: { type: 'string' },
+};
 
 export const CreateSchema = {
   name: { type: 'string', min: 1, max: 128, required: true },
@@ -129,9 +142,10 @@ export function workflowRoutes(cms, engine, projectManager) {
   // data it processed, often more sensitive than the definition itself --
   // so it needs the same project gate GET /:id already has, not just
   // read-vs-write parity with it. viewer+, matching GET /:id's own bar.
-  r.get('/:id/executions', auth, requireWorkflowProjectRole(engine, projectManager, 'viewer'), async (ctx) => {
-    const limit = parseInt(ctx.query.limit) || 50;
-    return json({ executions: engine.getExecutions(ctx.params.id, limit, { status: ctx.query.status }) });
+  r.get('/:id/executions', auth, requireWorkflowProjectRole(engine, projectManager, 'viewer'), validateQuery(ExecutionsQuerySchema), async (ctx) => {
+    const q = ctx.state.query;
+    const limit = q.limit || 50;
+    return json({ executions: engine.getExecutions(ctx.params.id, limit, { status: q.status }) });
   });
 
   r.get('/executions/:execId', auth, requireExecutionProjectRole(engine, projectManager, 'viewer'), async (ctx) => {
