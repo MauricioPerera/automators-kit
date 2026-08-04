@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1430 tests | 0 deps | 27 core modules
+By automators.work | 1438 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -1227,6 +1227,23 @@ untouched — the validator deliberately does not strip unknown keys, since drop
 silently return UNFILTERED rows. `GET /api/shell/history` and `GET /api/workflows/:id/executions` take
 the same `limit >= 1` rule.
 
+For the plain `?limit=` case, `core/validate.js` exports the rule once rather than leaving each surface
+to restate it:
+
+```javascript
+import { validateQuery, LIST_LIMIT_SCHEMA, clampLimit } from './core/validate.js';
+
+r.get('/deliveries', validateQuery(LIST_LIMIT_SCHEMA), async (ctx) => {
+  const limit = clampLimit(ctx.state.query.limit, 50);   // default 50, capped at 500
+  …
+});
+```
+
+`clampLimit(value, fallback, max = 500)` caps silently (`0` disables the cap) while the schema rejects
+anything below 1 — the same split decided for `/api/db/:col`'s `_limit`, so an over-cap request keeps
+working instead of newly returning 400. Shared rather than copied because four plugins each restating
+it produced four *different* wrong answers to `?limit=-1`; see Known Security Gaps item 35.
+
 ### Users (admin)
 - GET/PUT/DELETE /api/users[/:id]
 
@@ -2175,7 +2192,21 @@ Only `webhooks` declares an exemption: `POST /in/:name`, its inbound receiver, c
 service that has no account and no token — the same case as the OAuth2 callback route, where a shared
 secret or signature is the real protection rather than an `Authorization` header.
 
-**Writing a plugin that makes outbound calls: use `safeFetch` from `core/net-guard.js`, not `fetch`.**
+**Writing a plugin: reach for the core helpers rather than rewriting them.** Every finding in
+items 31-36 came from a plugin doing by hand something `core/` already did carefully:
+
+| Instead of | Use | From |
+|---|---|---|
+| `fetch(url, …)` | `safeFetch(url, …)` | `core/net-guard.js` |
+| `parseInt(ctx.query.limit) \|\| N` | `validateQuery(LIST_LIMIT_SCHEMA)` + `clampLimit()` | `core/validate.js` |
+| `path.split('.').reduce(…)` | `getNestedValue(obj, path)` | `core/db.js` |
+| hand-matching a route pattern | `compilePattern(pattern)` | `core/http.js` |
+
+`getNestedValue` **throws** on a `__proto__`/`constructor`/`prototype` segment rather than returning
+`undefined`. If you call it in a loop over user-defined items, catch per item — otherwise one bad path
+aborts the whole batch. That is exactly the trap `plugins/automations`'s hook loop needed handling for.
+
+**Outbound calls: use `safeFetch` from `core/net-guard.js`, not `fetch`.**
 Both bundled plugins that call out originally used raw `fetch`, which is what let an attacker-supplied
 URL reach loopback and cloud-metadata addresses (item 32). Note the consequence for local development:
 a webhook or automation action aimed at `127.0.0.1` is now **refused**, matching how every other
@@ -3013,6 +3044,32 @@ a documented decision, not an oversight, and item 34 is a defect *within* it rat
 against it. A catalog that records the auth requirement per endpoint is what lets that distinction be
 made by checking rather than guessing — worth keeping accurate for exactly this reason.
 
+**2026-08-04 — closing the two deferred plugin items, and what replacing a weak copy actually costs.**
+Items 35 and 36: four plugins' unbounded `?limit=`, and `plugins/automations`'s unguarded dot-path
+getter. Both were known and deliberately left when items 31-33 shipped; both are now closed. Two things
+this pass taught that the earlier ones did not:
+
+**Four copies of one rule produced four different behaviours.** `?limit=-1` returned *every* row through
+`Cursor.limit(-1)` in three plugins and *every row but the last* through `results.slice(0, -1)` in
+`search`. The copies had not merely duplicated a bug — they had each grown their own. That is the
+concrete argument for a shared decision point over a shared convention, and it is why the fix exports
+`LIST_LIMIT_SCHEMA`/`clampLimit()` once instead of adding a fifth, sixth, seventh and eighth identical
+schema. Fixing duplication by creating duplication would have missed the point entirely.
+
+**Swapping in a hardened helper is not mechanical — it inherits the original's failure behaviour.**
+`core/db.js`'s guarded getter THROWS on a `__proto__`/`constructor`/`prototype` segment, where the
+plugin's weak copy silently returned a value. `matchFilter` is called from a hook loop that is not
+inside a `try`, so the drop-in replacement would have let one workflow with a bad filter path abort the
+hook for every OTHER workflow on that event — turning a harmless read bug into an availability failure.
+Caught by reading the call site before shipping, fixed with a per-workflow catch (skip and log the
+offender, keep the rest running), and verified live. **When you replace a permissive helper with a
+strict one, the call sites need re-reading, not just re-pointing.**
+
+One more honesty note on the tests: of the three new path tests, only ONE fails against the pre-fix
+code. The trigger-filter test passes on the old code too, because an unguarded `constructor.prototype`
+simply did not match and the workflow was skipped anyway — that test guards the `try`/`catch` introduced
+here, not the original defect. Counting all three as catching the old bug would have overstated it.
+
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
 - AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
@@ -3036,7 +3093,7 @@ Current posture:
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-34 resolved; open items listed at the end)
+## Known Security Gaps (items 1-36 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -3622,7 +3679,34 @@ to expose" are different questions, and a clean audit of the former says nothing
    argument against it** — the auth choice is documented and deliberate; an unbounded resource hold is
    not something that decision implies. 11 new tests.
 
-Items 1-4 and 6-34 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+35. **RESOLVED (2026-08-04), MEDIUM.** Four bundled plugins (`audit`, `automations`, `search`,
+   `webhooks`) each hand-rolled `parseInt(ctx.query.limit) || N` with no upper bound — item 30
+   reproduced four more times, on surfaces that had already been left alone once when item 30 was
+   fixed in `routes/`. They did not even reproduce it identically, which is the interesting part:
+   `?limit=-1` made `Cursor.limit(-1)` return **every** row in three of them, while `plugins/search`'s
+   `results.slice(0, -1)` returned every row **but the last**. One input, two different wrong answers
+   from four copies of the same intent. Fixed by exporting `LIST_LIMIT_SCHEMA` and `clampLimit()` once
+   from `core/validate.js` and wiring all four to it, rather than adding four identical schemas —
+   fixing duplication by creating duplication would have missed the point. `routes/` deliberately keeps
+   its own richer per-route schemas (`_sort`/`_order`/`_fields`), which are already covered by item 30.
+
+36. **RESOLVED (2026-08-04), LOW.** `plugins/automations` carried its own dot-path getter,
+   `path.split('.').reduce((o, k) => o?.[k], obj)` — byte-for-byte `core/db.js`'s `_getNestedValue`
+   minus its `_checkPathSegment` guard, so a `field` or filter key of `constructor.prototype` walked
+   the prototype chain. Read-only throughout (`matchFilter`, `checkCondition`, `interpolate`), so
+   prototype **pollution** was never reachable and the real impact is small; it is listed because the
+   *cause* is not small. The weak copy existed for exactly one reason: the hardened version was not
+   exported, so nothing outside `core/db.js` could reuse it. Same root cause as `compilePattern` in
+   item 31's fix, now applied a second time — the guarded getter is exported and the plugin's copy is
+   gone. **The swap carried a hazard worth recording:** the guarded getter *throws* on a dangerous
+   segment, and `matchFilter` is called from a hook loop that is NOT inside a `try`, so one workflow
+   with a bad filter path would have aborted the hook for every OTHER workflow registered on that
+   event — trading a harmless read bug for an availability failure. It is now wrapped per workflow:
+   the offender is skipped and logged, the rest keep running, verified live. Replacing a weak copy with
+   the hardened one is not mechanical; it inherits the original's failure behaviour, and that has to be
+   checked at the call site.
+
+Items 1-4 and 6-36 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
