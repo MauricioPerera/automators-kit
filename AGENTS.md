@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1336 tests | 0 deps | 27 core modules
+By automators.work | 1341 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry, persistent per-workflow scratch space (workflow.staticData), optional execution queue for horizontal scaling, synchronous webhook response (respond: 'whenFinished'), createdBy/updatedBy attribution
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry, persistent per-workflow scratch space (workflow.staticData), instance-wide concurrency cap with backpressure, optional execution queue for horizontal scaling, synchronous webhook response (respond: 'whenFinished'), createdBy/updatedBy attribution
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -1480,6 +1480,14 @@ to the useful payload):
 - `update`/`delete`/`count` return `{ count }` with **no** `data` key — the unwrap only triggers when
   `result.data !== undefined`, so this object survives intact and `{{nodeId.count}}` works as expected.
 
+**Known gap — data tables are SCHEMALESS (2026-08-04, from the n8n comparison, NOT fixed):** both this
+node and `/api/db/:col` operate on a raw `Collection`, so any workflow can write any shape into any
+field. n8n's data tables have typed columns. `core/db.js` already contains a `Table` class with typed
+columns, `required`, `unique` and validation — it is even exported from `index.js` — and NOTHING uses
+it: grepping `new Table(` finds only its own definition and its tests. So the piece needed to close
+this gap exists and is tested; it was simply never wired to the surface that needs it. Recorded here
+rather than left as a verbal observation, since an unlisted gap is one nobody can pick up.
+
 ### Per-node Retry
 
 A node can carry `retries: N` (default `0` — no behavior change for any existing workflow) and
@@ -1633,6 +1641,38 @@ if the call itself completed (matching `POST /:id/run`'s own convention: the wor
 in `execution.status`, not the HTTP status code) -- a genuine failure to even run (e.g. the workflow
 was deleted mid-flight) still falls through to 500. The secret check (`X-Webhook-Secret`) still applies
 before dispatch either way. Default unset: zero behavior change for every existing webhook.
+
+### Concurrent execution limit (backpressure)
+
+Trigger-fired executions (webhook/cron/poll) and error-workflow triggering are capped instance-wide, so
+a burst degrades into a slowdown rather than a collapse. Defaults: **100 concurrent, 1000 queued**.
+
+```javascript
+const engine = new WorkflowEngine(db, {
+  maxConcurrentExecutions: 100,  // 0 disables the cap entirely
+  maxQueuedExecutions: 1000,     // past this, dispatch REJECTS rather than growing
+});
+engine.executionStats();  // { running, queued, maxConcurrent, maxQueued }
+```
+
+Or `createApp({ maxConcurrentExecutions, maxQueuedExecutions })`.
+
+**Where the cap sits, and why it matters:** on `_dispatchExecution` — the fire-and-forget path — and
+deliberately NOT on `execute()`. `execute()` is also how a `workflow.execute` / `loop.forEach` node runs
+a SUB-workflow from inside an already-running execution, and how `run()`, `retryExecution()`,
+`resumeWebhook()` and a `respond: 'whenFinished'` webhook run with a caller awaiting the result. Gating
+`execute()` would let a parent hold a slot while waiting for a child that can never get one — a
+self-inflicted deadlock. There is a regression test at `maxConcurrentExecutions: 1`, the most hostile
+setting, that fails by timing out if that gate ever moves.
+
+The default is a real number rather than "unlimited" on purpose: an unlimited default leaves the hole
+open for everyone who does not opt in. Below the cap nothing changes; above it, behavior only changes in
+the regime that was already broken. Overflow QUEUES rather than being dropped; only past
+`maxQueuedExecutions` does dispatch reject — loudly, since every caller already attaches a `.catch` that
+logs, so shed load is visible instead of a silent OOM.
+
+Complements, rather than replaces, the execution queue below: this bounds one process, that one spreads
+work across several. Both can be used together.
 
 ### Execution Queue (horizontal scaling)
 
@@ -2570,6 +2610,20 @@ live over a real spawned server: firing a `whenFinished` webhook returned the re
 same response, and a freshly created workflow correctly carried the creating user's id as both
 `createdBy` and `updatedBy`.
 
+**Instance-wide concurrency cap (2026-08-04):** continuing the n8n comparison on the load pillar —
+nothing limited how many executions ran at once. `_dispatchExecution` called `execute()`
+fire-and-forget for every webhook/cron/poll firing, so N simultaneous triggers meant N simultaneous
+executions, each resolving credentials, issuing outbound fetches and writing to the DB, with no queue
+and no ceiling; a burst collapsed the instance rather than slowing it. The optional `executionQueue`
+had a cap but requires Postgres and is opt-in, so the DEFAULT path had none. New
+`opts.maxConcurrentExecutions` (default 100) / `opts.maxQueuedExecutions` (default 1000), also
+reachable through `createApp()`, plus `executionStats()` for live pressure. See the "Concurrent
+execution limit (backpressure)" section above for the full contract — in particular WHY the gate is on
+`_dispatchExecution` and not on `execute()` (gating `execute()` deadlocks a parent waiting on a
+sub-workflow), which is guarded by a regression test at cap 1. 5 new tests. Verified: 30 simultaneous
+dispatches at cap 5 peak at 5 with all 30 completing; a parent with a sub-workflow completes at cap 1;
+a full backlog sheds the excess with a clear error; `0` restores the previous unbounded behavior.
+
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
 - AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
@@ -2585,7 +2639,7 @@ Current posture:
 - Query filters and schemas fail CLOSED, never open: an unknown/misspelled query operator throws rather than being treated as satisfied, non-array `$in`/`$nin` targets are rejected, and `validate.js`'s `enum`/`min`/`max` apply to every rule shape, not just explicitly-typed strings
 - Session auto-cleanup
 - Webhook HMAC-SHA256 signing + optional per-webhook secret
-- Rate limiting in triggers
+- Rate limiting in triggers, plus an instance-wide cap on concurrently running trigger-fired executions (default 100, overflow queued, backlog bounded) so a burst cannot exhaust the process
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
