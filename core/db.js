@@ -1290,6 +1290,70 @@ class Collection {
 // DOC STORE (main entry point)
 // ---------------------------------------------------------------------------
 
+/**
+ * A collection's name becomes a FILE NAME verbatim (`Collection._dataFile()`
+ * -> `${name}.docs.json`), and `FileStorageAdapter` does a bare
+ * `join(this._dir, filename)` -- `join` COLLAPSES `..`, so a name carrying
+ * any path separator escapes the storage directory entirely.
+ *
+ * SECURITY (2026-08-03, found by a full-codebase audit): this was reachable
+ * from untrusted input. `/api/db/:col` takes the name straight from a URL
+ * segment, and `core/http.js`'s router runs `decodeURIComponent` on path
+ * params AFTER segment matching -- so `%2F` arrives here as a real `/`. A
+ * freshly self-registered 'viewer' calling
+ * `GET /api/db/x%2F..%2F_users` reached `_users.docs.json` and got every
+ * user's `passwordHash`; the `PUT` equivalent wrote `role: 'admin'` onto
+ * their own row, persisted to disk, surviving a restart. That completely
+ * bypassed `routes/collections.js`'s `_blockInternalCollections` guard,
+ * which only string-matched a leading `_` on the decoded name.
+ *
+ * Fixed HERE rather than in that route guard on purpose: this is the single
+ * chokepoint every collection access funnels through (routes, the
+ * `data.table` workflow node, plugins, memory scopes, `$lookup`'s `from`,
+ * relation definitions, the `db.foo` proxy), so one check covers callers
+ * that don't exist yet. A path separator in a collection name is never
+ * legitimate -- every name in this codebase is `[A-Za-z0-9_]+` -- so this
+ * is a hard invariant, NOT an access-control decision (that stays with the
+ * caller; see `isInternalCollectionName`).
+ * @param {string} name
+ */
+function assertSafeCollectionName(name) {
+  if (typeof name !== 'string' || name === '') {
+    throw new Error(`Invalid collection name: expected a non-empty string, got ${typeof name === 'string' ? "''" : typeof name}`);
+  }
+  // Positive allowlist rather than a denylist of dangerous characters: a
+  // denylist has to anticipate every separator, encoding and control
+  // character (and `join()`/the OS may normalize forms it never
+  // considered), whereas this states the only shape a name may take. It
+  // covers every name in this codebase -- literals like `_users`/
+  // `contentTypes`, `core/memory.js`'s `_mem_sem_${agentId}-${userId}`
+  // scopes, and `core/plugins.js`'s `plugin_<name>_<col>` -- and rejects
+  // path separators, `..`, leading dots, drive letters and control
+  // characters as a class, without enumerating them.
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+    throw new Error(`Invalid collection name '${name}': only letters, digits, '_' and '-' are allowed (no path separators, '..', or control characters)`);
+  }
+}
+
+/**
+ * True for a collection this codebase manages as internal system state
+ * (`_users`, `_sessions`, `_api_keys`, `_workflows`, `_executions`,
+ * `_projects`, `_folders`, `_credentials`, `_queue_jobs`, `_mem_*`, ...).
+ * The leading-underscore convention is used consistently by every core
+ * module. Exported so that every UNTRUSTED-input surface -- `/api/db/:col`
+ * and the `data.table` workflow node -- agrees on one definition instead of
+ * each re-implementing it (they previously disagreed: the route blocked
+ * these, the node did not, which is how the node became a second path to
+ * the same privilege escalation). This is an access-control helper for
+ * those callers; it is deliberately NOT enforced inside `DocStore`, since
+ * internal code legitimately opens these collections all the time.
+ * @param {string} name
+ * @returns {boolean}
+ */
+function isInternalCollectionName(name) {
+  return typeof name === 'string' && name.startsWith('_');
+}
+
 class DocStore {
   constructor(dirOrAdapter) {
     this._adapter = typeof dirOrAdapter === 'string'
@@ -1313,6 +1377,7 @@ class DocStore {
   }
 
   collection(name) {
+    assertSafeCollectionName(name);
     if (!this._collections.has(name)) {
       this._collections.set(name, new Collection(name, this._adapter, this));
     }
@@ -2558,4 +2623,6 @@ export {
   matchFilter,
   applyUpdate,
   generateId,
+  isInternalCollectionName,
+  assertSafeCollectionName,
 };

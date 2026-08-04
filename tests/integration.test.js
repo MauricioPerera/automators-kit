@@ -489,6 +489,34 @@ describe('Generic collection API (/api/db) blocks internal collections', () => {
     expect((await json(listRes)).data.length).toBeGreaterThan(0);
   });
 
+  // SECURITY (2026-08-03, full-codebase audit): the first version of the
+  // guard string-matched a leading `_` on ctx.params.col, but core/http.js
+  // decodeURIComponent's path params -- so `%2F..%2F` arrived as a real
+  // `../`, slipped past the prefix check, and collapsed back to the real
+  // internal file inside FileStorageAdapter's join(). Reproduced live:
+  // passwordHash leak AND self-promotion to admin, persisted to disk.
+  it('an ENCODED path traversal cannot reach an internal collection (read)', async () => {
+    const res = await app.handle(req('GET', '/api/db/x%2F..%2F_users', null, lowPrivToken));
+    expect(res.status).toBe(400);
+    const body = await json(res);
+    expect(JSON.stringify(body)).not.toContain('passwordHash');
+  });
+
+  it('an ENCODED path traversal cannot be used to self-promote (write)', async () => {
+    const res = await app.handle(req('PUT', `/api/db/x%2F..%2F_users/${lowPrivId}`, { role: 'admin' }, lowPrivToken));
+    expect(res.status).toBe(400);
+
+    const meRes = await app.handle(req('GET', '/api/auth/me', null, lowPrivToken));
+    expect((await json(meRes)).user.role).toBe('viewer'); // unchanged
+  });
+
+  it('rejects every traversal encoding/shape, and a plain relative name too', async () => {
+    for (const col of ['x%2F..%2F_users', '..%2F..%2Fescaped', '%2e%2e%2f_users', 'a%5C..%5C_users']) {
+      const res = await app.handle(req('GET', `/api/db/${col}`, null, lowPrivToken));
+      expect(res.status).toBe(400);
+    }
+  });
+
   it('GET /api/db/ lists collection names but filters out every internal (underscore-prefixed) one', async () => {
     await app.handle(req('POST', '/api/db/db-guard-discoverable', { x: 1 }, adminToken));
     const res = await app.handle(req('GET', '/api/db/', null, adminToken));

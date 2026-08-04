@@ -1245,6 +1245,67 @@ describe('Data Table node (data.table)', () => {
     expect(def.category).toBe('core');
     expect(def.inputs.some(i => i.name === 'operation' && i.required)).toBe(true);
   });
+
+  // SECURITY (2026-08-03, full-codebase audit): this node is documented as
+  // "the same data exposed at /api/db/:col" but had none of that route's
+  // internal-collection block. Reproduced live: a global `editor` (enough to
+  // create a workflow) read every passwordHash out of `_users` into the
+  // execution record, then set their own role to 'admin'.
+  describe('cannot reach internal system collections', () => {
+    it('refuses to READ an internal collection (no passwordHash into the execution record)', async () => {
+      const wf = engine.create({
+        name: 'ExfilAttempt',
+        nodes: [{ id: 'r', type: 'data.table', inputs: { collection: '_users', operation: 'find' } }],
+      });
+      const exec = await engine.run(wf._id);
+      expect(exec.status).toBe('failed');
+      expect(exec.errors.r).toContain('internal system state');
+      expect(JSON.stringify(exec.nodeResults)).not.toContain('passwordHash');
+    });
+
+    it('refuses to WRITE an internal collection (no self-promotion)', async () => {
+      const wf = engine.create({
+        name: 'EscalateAttempt',
+        nodes: [{ id: 'w', type: 'data.table', inputs: {
+          collection: '_users', operation: 'update', filter: {}, data: { role: 'admin' },
+        } }],
+      });
+      const exec = await engine.run(wf._id);
+      expect(exec.status).toBe('failed');
+      expect(exec.errors.w).toContain('internal system state');
+    });
+
+    it('blocks every internal collection, not just _users', async () => {
+      for (const collection of ['_credentials', '_sessions', '_api_keys', '_workflows', '_executions']) {
+        const wf = engine.create({
+          name: `Probe_${collection}`,
+          nodes: [{ id: 'p', type: 'data.table', inputs: { collection, operation: 'find' } }],
+        });
+        const exec = await engine.run(wf._id);
+        expect(exec.status).toBe('failed');
+      }
+    });
+
+    it('a path-traversal collection name is rejected too (caught a layer down, in DocStore)', async () => {
+      const wf = engine.create({
+        name: 'TraversalAttempt',
+        nodes: [{ id: 't', type: 'data.table', inputs: { collection: 'x/../_users', operation: 'find' } }],
+      });
+      const exec = await engine.run(wf._id);
+      expect(exec.status).toBe('failed');
+      expect(exec.errors.t).toContain('Invalid collection name');
+    });
+
+    it('an ordinary (non-internal) collection still works exactly as before', async () => {
+      const wf = engine.create({
+        name: 'NormalStillWorks',
+        nodes: [{ id: 'i', type: 'data.table', inputs: { collection: 'widgets', operation: 'insert', data: { name: 'ok' } } }],
+      });
+      const exec = await engine.run(wf._id);
+      expect(exec.status).toBe('success');
+      expect(exec.nodeResults.i.data.name).toBe('ok');
+    });
+  });
 });
 
 describe('Workflow Static Data (engine methods + workflow.staticData node)', () => {

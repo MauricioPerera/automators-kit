@@ -13,6 +13,7 @@
 
 import { Router, json, error } from '../core/http.js';
 import { createAuth } from './middleware.js';
+import { isInternalCollectionName, assertSafeCollectionName } from '../core/db.js';
 
 // SECURITY (2026-08-03, found reasoning about a "list data tables" feature,
 // not by an audit): every collection this codebase itself manages
@@ -37,8 +38,30 @@ import { createAuth } from './middleware.js';
 // security-critical fields like a password hash or a role, and blocking
 // them would be a separate, narrower scope decision (bypassing granular
 // CMS permissions like entries:write) not covered by this fix.
+//
+// FOLLOW-UP (2026-08-03, full-codebase audit): the original version of this
+// guard was BYPASSABLE. It string-matched a leading `_` on `ctx.params.col`,
+// but `core/http.js`'s router `decodeURIComponent`s path params, so
+// `GET /api/db/x%2F..%2F_users` arrived here as the literal `x/../_users` --
+// which does not start with `_`, passed the guard, and then collapsed back
+// to `_users.docs.json` inside `FileStorageAdapter`'s `join()`. The
+// passwordHash leak and the self-promotion were both reproduced again
+// through it. Traversal is now rejected at the real chokepoint
+// (`assertSafeCollectionName` in core/db.js, which every collection access
+// funnels through); this guard keeps only the access-control half, and uses
+// the shared `isInternalCollectionName` so it can never drift from the
+// `data.table` workflow node's copy of the same rule again.
 async function _blockInternalCollections(ctx, next) {
-  if (ctx.params.col.startsWith('_')) {
+  // Shape check first, so a traversal attempt gets a clear 400 here rather
+  // than surfacing as a 500 from assertSafeCollectionName's throw deeper in
+  // DocStore.collection(). Either way it's blocked -- this is about the
+  // response, not the protection.
+  try {
+    assertSafeCollectionName(ctx.params.col);
+  } catch (err) {
+    return error(err.message, 400);
+  }
+  if (isInternalCollectionName(ctx.params.col)) {
     return error(
       `Collection '${ctx.params.col}' is internal system state and is not reachable through the generic /api/db API`,
       403

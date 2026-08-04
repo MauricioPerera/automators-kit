@@ -118,6 +118,47 @@ describe('DocStore', () => {
     expect(docs.length).toBe(1);
     expect(docs[0].name).toBe('persisted');
   });
+
+  // SECURITY (2026-08-03, full-codebase audit): a collection name becomes a
+  // FILE NAME verbatim, and FileStorageAdapter's join() collapses `..` --
+  // so an unvalidated name escaped the storage directory entirely. This is
+  // the chokepoint fix; see the integration test for the HTTP-level exploit
+  // it closes.
+  describe('collection name validation', () => {
+    it('rejects every path-traversal shape', () => {
+      const db = new DocStore(new MemoryStorageAdapter());
+      for (const bad of [
+        'x/../_users',      // the exact shape decodeURIComponent produced from %2F..%2F
+        '../escaped',
+        '..\\escaped',
+        'a/b',
+        'a\\b',
+        '..',
+        '.hidden',
+        'C:evil',
+        '',
+      ]) {
+        expect(() => db.collection(bad)).toThrow(/Invalid collection name/);
+      }
+    });
+
+    it('rejects a non-string name instead of coercing it into a filename', () => {
+      const db = new DocStore(new MemoryStorageAdapter());
+      expect(() => db.collection(null)).toThrow(/Invalid collection name/);
+      expect(() => db.collection(42)).toThrow(/Invalid collection name/);
+    });
+
+    it('still accepts every name shape this codebase actually uses', () => {
+      const db = new DocStore(new MemoryStorageAdapter());
+      for (const ok of [
+        '_users', 'contentTypes', 'entries', '_queue_jobs',
+        '_mem_sem_agent1-user2',      // core/memory.js scope format (hyphen)
+        'plugin_my-plugin_widgets',   // core/plugins.js namespaced format
+      ]) {
+        expect(() => db.collection(ok)).not.toThrow();
+      }
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

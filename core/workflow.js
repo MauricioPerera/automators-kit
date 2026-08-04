@@ -87,7 +87,7 @@
 import { NodeRegistry } from './nodes.js';
 import { TriggerManager, TriggerType } from './triggers.js';
 import { CredentialVault } from './credentials.js';
-import { generateId } from './db.js';
+import { generateId, isInternalCollectionName } from './db.js';
 import { buildLevels } from './dag.js';
 
 // Sentinel returned internally when a node's `runIf` guard evaluates false —
@@ -328,6 +328,24 @@ export class WorkflowEngine {
       handler: async (inputs) => {
         const collection = inputs.collection;
         if (!collection) throw new Error("data.table: 'collection' is required");
+        // SECURITY (2026-08-03, full-codebase audit): this node is documented
+        // as "the same data exposed at /api/db/:col", but it was strictly MORE
+        // powerful -- `routes/collections.js` refuses internal (`_`-prefixed)
+        // collections, this handler had no such check. Reproduced live: a user
+        // with only the global `editor` role (enough to POST /api/workflows)
+        // built a workflow whose first node read `_users` -- dumping every
+        // passwordHash into the execution record, which is itself readable --
+        // and whose second node set their own `role` to 'admin'. Also reachable
+        // that way: `_credentials`(+`_credentials_meta`, the FieldCrypto salt),
+        // `_sessions`, `_api_keys`, and `_workflows` itself (editing any
+        // workflow, bypassing project gating). Uses the SAME shared
+        // `isInternalCollectionName` the route uses, specifically so the two
+        // surfaces can't drift apart again -- that drift is what made this a
+        // second door to the same privilege escalation. Traversal is handled a
+        // layer down by `assertSafeCollectionName` in `DocStore.collection()`.
+        if (isInternalCollectionName(collection)) {
+          throw new Error(`data.table: collection '${collection}' is internal system state and cannot be accessed from a workflow`);
+        }
         const col = this.db.collection(collection);
         const filter = inputs.filter || {};
 
