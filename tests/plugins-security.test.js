@@ -58,6 +58,10 @@ beforeAll(async () => {
       plugins: [
         { name: 'webhooks', source: 'local', path: 'webhooks' },
         { name: 'automations', source: 'local', path: 'automations' },
+        // audit and search carry the same hand-rolled ?limit= that the
+        // "plugin list limits" block below asserts is now bounded.
+        { name: 'audit', source: 'local', path: 'audit' },
+        { name: 'search', source: 'local', path: 'search' },
       ],
     },
   });
@@ -220,5 +224,130 @@ describe('plugin route gate rejects a malformed declaration', () => {
   it('throws on a pattern that is not mount-relative', async () => {
     const { createPluginRouteGate } = await import('../routes/middleware.js');
     expect(() => createPluginRouteGate(app.cms, { publicRoutes: ['POST in/:name'] })).toThrow(/start with/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Plugin list limits + guarded path traversal (2026-08-04)
+//
+// Closing the two items deliberately deferred when items 31-33 shipped.
+// ---------------------------------------------------------------------------
+describe('plugin list limits are bounded', () => {
+  // Four plugins each hand-rolled `parseInt(ctx.query.limit) || N` with no
+  // bound — Known Security Gaps item 30 reproduced four more times, and not
+  // even identically: a negative limit made Cursor.limit(-1) return EVERY row,
+  // while search's results.slice(0, -1) returned every row but the LAST. One
+  // input, two different wrong answers.
+  it('rejects a negative limit on the webhook delivery log', async () => {
+    const res = await app.handle(req('GET', '/api/plugins/webhooks/deliveries?limit=-1', null, adminToken));
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects a negative limit on search, which failed differently', async () => {
+    const res = await app.handle(req('GET', '/api/plugins/search/?q=x&limit=-1', null, adminToken));
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects a non-numeric limit on the audit log', async () => {
+    const res = await app.handle(req('GET', '/api/plugins/audit/?limit=abc', null, adminToken));
+    expect(res.status).toBe(400);
+  });
+
+  it('rejects a negative limit on automation run history', async () => {
+    const created = await app.handle(req('POST', '/api/plugins/automations/', {
+      name: 'runs-limit', trigger: { event: 'entry:afterCreate' }, actions: [],
+    }, adminToken));
+    const id = (await created.json()).workflow._id;
+    const res = await app.handle(req('GET', `/api/plugins/automations/${id}/runs?limit=-1`, null, adminToken));
+    expect(res.status).toBe(400);
+    await app.handle(req('DELETE', `/api/plugins/automations/${id}`, null, adminToken));
+  });
+
+  it('still honours a valid limit', async () => {
+    const res = await app.handle(req('GET', '/api/plugins/webhooks/deliveries?limit=5', null, adminToken));
+    expect(res.status).toBe(200);
+    expect((await res.json()).deliveries.length).toBeLessThanOrEqual(5);
+  });
+});
+
+describe('automation paths go through the guarded getter', () => {
+  // The plugin had its own `path.split('.').reduce((o, k) => o?.[k], obj)` —
+  // core/db.js's function minus its prototype-segment guard. Read-only, so
+  // never pollution, but there was no reason for a second weaker copy; it
+  // existed only because the hardened one was not exported. It is now.
+  it('rejects a prototype-chain segment in a trigger filter', async () => {
+    const bad = await app.handle(req('POST', '/api/plugins/automations/', {
+      name: 'bad-path',
+      trigger: { event: 'entry:afterCreate', filter: { 'constructor.prototype': 'x' } },
+      actions: [{ type: 'log', message: 'BAD FIRED' }],
+    }, adminToken));
+    const badId = (await bad.json()).workflow._id;
+
+    const good = await app.handle(req('POST', '/api/plugins/automations/', {
+      name: 'good-path',
+      trigger: { event: 'entry:afterCreate' },
+      actions: [{ type: 'log', message: 'GOOD FIRED' }],
+    }, adminToken));
+    const goodId = (await good.json()).workflow._id;
+
+    await app.handle(req('POST', '/api/entries', {
+      contentTypeSlug: 'post', title: 'guarded path trigger', data: {},
+    }, adminToken));
+    await new Promise((r) => setTimeout(r, 400));
+
+    // The offending workflow is skipped...
+    const badRuns = await (await app.handle(req('GET', `/api/plugins/automations/${badId}/runs`, null, adminToken))).json();
+    expect(badRuns.runs.length).toBe(0);
+
+    // ...and, critically, it does NOT abort the hook for the others. The
+    // filter check sits in a loop that is not inside a try, so an unguarded
+    // throw here would have taken down every other workflow on this event.
+    const goodRuns = await (await app.handle(req('GET', `/api/plugins/automations/${goodId}/runs`, null, adminToken))).json();
+    expect(goodRuns.runs.length).toBeGreaterThan(0);
+    expect(goodRuns.runs[0].status).toBe('success');
+
+    await app.handle(req('DELETE', `/api/plugins/automations/${badId}`, null, adminToken));
+    await app.handle(req('DELETE', `/api/plugins/automations/${goodId}`, null, adminToken));
+  });
+
+  it('rejects a prototype-chain segment in a condition field', async () => {
+    const created = await app.handle(req('POST', '/api/plugins/automations/', {
+      name: 'bad-cond',
+      trigger: { event: 'entry:afterCreate' },
+      conditions: [{ field: '__proto__.polluted', op: 'eq', value: 'x' }],
+      actions: [{ type: 'log', message: 'FIRED' }],
+    }, adminToken));
+    const id = (await created.json()).workflow._id;
+
+    await app.handle(req('POST', '/api/entries', {
+      contentTypeSlug: 'post', title: 'bad condition trigger', data: {},
+    }, adminToken));
+    await new Promise((r) => setTimeout(r, 400));
+
+    const runs = await (await app.handle(req('GET', `/api/plugins/automations/${id}/runs`, null, adminToken))).json();
+    expect(runs.runs[0].status).toBe('error');
+    expect(runs.runs[0].error).toContain('Invalid path segment');
+
+    await app.handle(req('DELETE', `/api/plugins/automations/${id}`, null, adminToken));
+  });
+
+  it('still resolves an ordinary dotted path', async () => {
+    const created = await app.handle(req('POST', '/api/plugins/automations/', {
+      name: 'good-cond',
+      trigger: { event: 'entry:afterCreate' },
+      conditions: [{ field: 'entry.title', op: 'eq', value: 'no-such-title' }],
+      actions: [{ type: 'log', message: 'FIRED' }],
+    }, adminToken));
+    const id = (await created.json()).workflow._id;
+
+    await app.handle(req('POST', '/api/entries', {
+      contentTypeSlug: 'post', title: 'ordinary path trigger', data: {},
+    }, adminToken));
+    await new Promise((r) => setTimeout(r, 400));
+
+    const runs = await (await app.handle(req('GET', `/api/plugins/automations/${id}/runs`, null, adminToken))).json();
+    expect(runs.runs[0].status).toBe('skipped');
+
+    await app.handle(req('DELETE', `/api/plugins/automations/${id}`, null, adminToken));
   });
 });

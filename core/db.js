@@ -2831,4 +2831,14 @@ export {
   removeTableSchema,
   listTableSchemas,
   TABLE_SCHEMA_COLLECTION,
+  // Exported 2026-08-04 so callers outside this module stop writing their own.
+  // `plugins/automations` had `path.split('.').reduce((o, k) => o?.[k], obj)` --
+  // the same function minus `_checkPathSegment`, i.e. minus the whole reason
+  // this one exists. It could not reuse this version because nothing exported
+  // it, which is the same root cause as `compilePattern` in core/http.js: a
+  // hardened helper nothing outside its module can reach gets reimplemented
+  // without the hardening. Throws on a `__proto__`/`constructor`/`prototype`
+  // segment rather than returning undefined, so callers in a loop should catch
+  // per item instead of letting one bad path abort the batch.
+  _getNestedValue as getNestedValue,
 };

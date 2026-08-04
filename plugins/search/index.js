@@ -4,6 +4,7 @@
  */
 
 import { Router, json, error } from '../../core/http.js';
+import { validateQuery, LIST_LIMIT_SCHEMA, clampLimit } from '../../core/validate.js';
 
 export default {
   name: 'search',
@@ -17,11 +18,11 @@ export default {
 
     const r = new Router();
 
-    r.get('/', async (ctx) => {
+    r.get('/', validateQuery(LIST_LIMIT_SCHEMA), async (ctx) => {
       const q = ctx.query.q;
       if (!q) return error('Query parameter "q" is required', 400);
 
-      const limit = parseInt(ctx.query.limit) || 20;
+      const limit = clampLimit(ctx.state.query.limit, 20);
       const contentType = ctx.query.contentType;
 
       const entries = api.services.entries.col.find({}).toArray();

@@ -10,6 +10,7 @@
 
 import { Router, json, error } from '../../core/http.js';
 import { safeFetch } from '../../core/net-guard.js';
+import { validateQuery, LIST_LIMIT_SCHEMA, clampLimit } from '../../core/validate.js';
 
 export default {
   name: 'webhooks',
@@ -146,8 +147,8 @@ export default {
     });
 
     // Delivery log
-    r.get('/deliveries', async (ctx) => {
-      const limit = parseInt(ctx.query.limit) || 50;
+    r.get('/deliveries', validateQuery(LIST_LIMIT_SCHEMA), async (ctx) => {
+      const limit = clampLimit(ctx.state.query.limit, 50);
       const items = deliveries.find({}).sort({ timestamp: -1 }).limit(limit).toArray();
       return json({ deliveries: items });
     });

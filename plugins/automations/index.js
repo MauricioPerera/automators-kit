@@ -12,6 +12,8 @@
 
 import { Router, json, error } from '../../core/http.js';
 import { safeFetch } from '../../core/net-guard.js';
+import { getNestedValue as getGuardedNestedValue } from '../../core/db.js';
+import { validateQuery, LIST_LIMIT_SCHEMA, clampLimit } from '../../core/validate.js';
 
 export default {
   name: 'automations',
@@ -116,8 +118,24 @@ export default {
       api.hooks.on(event, async (payload) => {
         const active = workflows.find({ 'trigger.event': event, active: true }).toArray();
         for (const wf of active) {
-          // Check trigger filter
-          if (wf.trigger.filter && !matchFilter(payload, wf.trigger.filter)) continue;
+          // Check trigger filter. Wrapped per workflow because matchFilter now
+          // walks paths through core/db.js's guarded getter, which THROWS on a
+          // `__proto__`/`constructor`/`prototype` segment -- and this loop is
+          // not inside a try, so one workflow with a bad filter path would
+          // otherwise abort the hook for every OTHER workflow registered on the
+          // same event. Skips the offending workflow (fail closed, same
+          // direction as checkCondition's unknown-operator refusal) and leaves
+          // the rest running.
+          let matched = true;
+          if (wf.trigger.filter) {
+            try {
+              matched = matchFilter(payload, wf.trigger.filter);
+            } catch (err) {
+              api.logger.error(`Workflow '${wf.name}' trigger filter rejected: ${err.message}`);
+              matched = false;
+            }
+          }
+          if (!matched) continue;
           executeWorkflow(wf, payload).catch(err => {
             api.logger.error(`Workflow '${wf.name}' error: ${err.message}`);
           });
@@ -222,8 +240,8 @@ export default {
     });
 
     // Run history
-    r.get('/:id/runs', async (ctx) => {
-      const limit = parseInt(ctx.query.limit) || 50;
+    r.get('/:id/runs', validateQuery(LIST_LIMIT_SCHEMA), async (ctx) => {
+      const limit = clampLimit(ctx.state.query.limit, 50);
       const items = runs.find({ workflowId: ctx.params.id }).sort({ timestamp: -1 }).limit(limit).toArray();
       return json({ runs: items });
     });
@@ -274,9 +292,13 @@ function interpolate(template, data) {
   });
 }
 
+// Was a local `path.split('.').reduce((o, k) => o?.[k], obj)` -- the same
+// function core/db.js already had, minus its `_checkPathSegment` guard, so a
+// `field` of `constructor.prototype` walked the prototype chain. Read-only, so
+// never prototype POLLUTION, but there was no reason to have a second, weaker
+// copy: it existed only because the hardened one was not exported. It is now.
 function getNestedValue(obj, path) {
-  if (!path.includes('.')) return obj?.[path];
-  return path.split('.').reduce((o, k) => o?.[k], obj);
+  return getGuardedNestedValue(obj, path);
 }
 
 function checkCondition(val, op, expected) {

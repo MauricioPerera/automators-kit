@@ -4,6 +4,7 @@
  */
 
 import { Router, json } from '../../core/http.js';
+import { validateQuery, LIST_LIMIT_SCHEMA, clampLimit } from '../../core/validate.js';
 
 export default {
   name: 'audit',
@@ -44,8 +45,8 @@ export default {
     // Routes
     const r = new Router();
 
-    r.get('/', async (ctx) => {
-      const limit = parseInt(ctx.query.limit) || 50;
+    r.get('/', validateQuery(LIST_LIMIT_SCHEMA), async (ctx) => {
+      const limit = clampLimit(ctx.state.query.limit, 50);
       const action = ctx.query.action;
 
       let filter = {};

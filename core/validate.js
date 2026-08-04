@@ -255,3 +255,46 @@ export function validateQuery(schema) {
     return next();
   };
 }
+
+// ---------------------------------------------------------------------------
+// LIST-LIMIT HELPERS
+// ---------------------------------------------------------------------------
+
+/**
+ * Schema for the `?limit=` query param shared by every "give me the last N
+ * rows" endpoint.
+ *
+ * Exported rather than declared per route because four plugins had each
+ * hand-rolled `parseInt(ctx.query.limit) || N` with no bound, reproducing the
+ * defect fixed in Known Security Gaps item 30 four more times -- and, worse,
+ * not even reproducing it identically: `?limit=-1` made a `Cursor.limit(-1)`
+ * return EVERY row, while `plugins/search`'s `results.slice(0, -1)` returned
+ * every row but the LAST. One input, two different wrong answers, which is the
+ * argument for one shared decision point rather than four copies of a rule.
+ *
+ * Deliberately has no `max`: pair it with `clampLimit()` below, which caps
+ * silently. An over-cap request keeps working instead of newly returning 400,
+ * the same call made for `/api/db/:col`'s `_limit`.
+ */
+export const LIST_LIMIT_SCHEMA = {
+  limit: { type: 'number', min: 1 },
+};
+
+/** Upper bound applied by clampLimit() when the caller does not set one. */
+export const DEFAULT_LIST_LIMIT_MAX = 500;
+
+/**
+ * Resolves a validated `?limit=` into a usable row count.
+ *
+ * Expects `value` to have already passed LIST_LIMIT_SCHEMA (so it is either a
+ * number >= 1 or undefined). The clamp is here rather than inline at each call
+ * site so "how big may a page get" is one decision, not four.
+ *
+ * @param {number|undefined} value    ctx.state.query.limit
+ * @param {number} fallback           used when the caller omitted `limit`
+ * @param {number} [max]              upper bound; 0 disables the cap
+ */
+export function clampLimit(value, fallback, max = DEFAULT_LIST_LIMIT_MAX) {
+  const n = value || fallback;
+  return max > 0 ? Math.min(n, max) : n;
+}
