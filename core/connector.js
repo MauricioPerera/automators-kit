@@ -157,25 +157,42 @@ export class Connector {
         // request straight to the internal destination the flag exists to
         // block.
         const doFetch = this.blockInternalHosts ? safeFetch : fetch;
-        const response = await doFetch(url, {
-          method,
-          headers,
-          body: fetchBody,
-          signal: controller.signal,
-        });
-        clearTimeout(timer);
 
-        // Parse response
-        const resHeaders = Object.fromEntries(response.headers);
-        let data;
-        const ct = response.headers.get('content-type') || '';
-        if (opts.raw) {
-          data = await response.text();
-        } else if (ct.includes('json')) {
-          data = await response.json();
-        } else {
-          data = await response.text();
+        // CORRECTNESS (2026-08-03, verified from a full-codebase audit lead):
+        // clearTimeout used to run HERE, right after fetch resolved -- but
+        // fetch resolves as soon as the RESPONSE HEADERS arrive, before a
+        // single byte of the body is read. Clearing the timer at that point
+        // left the AbortController inert for the body read, so an upstream
+        // that sent headers and then stalled the stream hung forever.
+        // Measured: `timeout: 500` still hanging at 3011ms against a server
+        // that sent `{"a":` and never closed. One slowloris-style upstream
+        // could hold a worker (or a queue slot) indefinitely.
+        //
+        // The timer now spans BOTH phases and is cleared in `finally`, which
+        // also guarantees it is cleared when fetch itself rejects -- the old
+        // placement was only reached on the success path.
+        let response, data;
+        try {
+          response = await doFetch(url, {
+            method,
+            headers,
+            body: fetchBody,
+            signal: controller.signal,
+          });
+
+          const ct = response.headers.get('content-type') || '';
+          if (opts.raw) {
+            data = await response.text();
+          } else if (ct.includes('json')) {
+            data = await response.json();
+          } else {
+            data = await response.text();
+          }
+        } finally {
+          clearTimeout(timer);
         }
+
+        const resHeaders = Object.fromEntries(response.headers);
 
         const result = {
           ok: response.ok,

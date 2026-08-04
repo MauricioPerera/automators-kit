@@ -229,3 +229,42 @@ describe('Retry-exhaustion contract', () => {
     }
   });
 });
+
+// CORRECTNESS (2026-08-03, verified from a full-codebase audit lead):
+// clearTimeout ran right after fetch resolved -- but fetch resolves when the
+// response HEADERS arrive, before any of the body is read. That left the
+// AbortController inert for the body read, so an upstream that sent headers
+// and then stalled the stream hung forever. Measured: `timeout: 500` still
+// hanging at 3011ms.
+describe('the timeout covers body reading, not just headers', () => {
+  it('aborts an upstream that sends headers then stalls the body', async () => {
+    const stall = Bun.serve({
+      port: 0,
+      fetch: () => new Response(
+        new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"a":')); /* never closed */ } }),
+        { headers: { 'content-type': 'application/json' } },
+      ),
+    });
+    try {
+      const started = Date.now();
+      const c = new Connector(`http://127.0.0.1:${stall.port}`, { timeout: 300 });
+      await expect(c.get('/')).rejects.toThrow();
+      // The point is that it returns AT ALL, and roughly on schedule rather
+      // than never. Generous upper bound so this can't go flaky on a slow box.
+      expect(Date.now() - started).toBeLessThan(2500);
+    } finally {
+      stall.stop();
+    }
+  }, 10000);
+
+  it('a normal response is completely unaffected', async () => {
+    const ok = Bun.serve({ port: 0, fetch: () => Response.json({ hello: 'world' }) });
+    try {
+      const res = await new Connector(`http://127.0.0.1:${ok.port}`, { timeout: 2000 }).get('/');
+      expect(res.ok).toBe(true);
+      expect(res.data).toEqual({ hello: 'world' });
+    } finally {
+      ok.stop();
+    }
+  });
+});

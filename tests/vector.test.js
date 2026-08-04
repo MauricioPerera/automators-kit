@@ -386,3 +386,55 @@ describe('TopKHeap k=0 / limit=0 no lanza (FIX-36 Hallazgo 2)', () => {
     expect(store.searchAcross(['a', 'b'], [1, 0, 0, 0], 0)).toEqual([]);
   });
 });
+
+// CORRECTNESS (2026-08-03, verified from a full-codebase audit lead):
+// searchAcross min-max normalized EACH collection independently before
+// merging, destroying the only thing that made the scores comparable -- they
+// all come from the same query under the same metric. Every collection's best
+// hit was rescaled to exactly 1.0 no matter how irrelevant, and a collection
+// returning a single result got 1.0 unconditionally.
+describe('searchAcross ranks on true similarity, not per-collection rank', () => {
+  const build = () => {
+    const store = new VectorStore(new MemoryStorageAdapter(), 3);
+    // 'good' is genuinely close to [1,0,0]; 'junk' is orthogonal/opposite.
+    store.set('good', 'g1', [1, 0, 0]);
+    store.set('good', 'g2', [0.99, 0.14, 0]);
+    store.set('good', 'g3', [0.98, 0.20, 0]);
+    store.set('junk', 'j1', [0, 1, 0]);
+    store.set('junk', 'j2', [0, 0.9, 0.4]);
+    store.set('junk', 'j3', [-1, 0, 0]);
+    store.flush();
+    return store;
+  };
+
+  it('does not let an orthogonal vector tie a perfect match', () => {
+    const results = build().searchAcross(['good', 'junk'], [1, 0, 0], 3, 'cosine');
+    // Before the fix this returned junk/j1=1.0, good/g1=1.0, junk/j2=1.0.
+    expect(results.map((r) => r.id)).toEqual(['g1', 'g2', 'g3']);
+    expect(results[0].score).toBeCloseTo(1.0, 3);
+  });
+
+  it('returns the real similarity, not a rescaled rank', () => {
+    const results = build().searchAcross(['good', 'junk'], [1, 0, 0], 6, 'cosine');
+    const byId = Object.fromEntries(results.map((r) => [r.id, r.score]));
+    expect(byId.g2).toBeCloseTo(0.9901, 3);
+    expect(byId.j3).toBeCloseTo(-1.0, 3);   // was rescaled to 0.0 (or 1.0 alone)
+  });
+
+  it('a collection returning ONE result is not forced to 1.0', () => {
+    const store = new VectorStore(new MemoryStorageAdapter(), 3);
+    store.set('a', 'a1', [1, 0, 0]);
+    store.set('a', 'a2', [0.91, 0.41, 0]);
+    store.set('b', 'b1', [-0.9988, 0.05, 0]); // near-opposite
+    store.flush();
+    const results = store.searchAcross(['a', 'b'], [1, 0, 0], 3, 'cosine');
+    // Before: b1 scored 1.0 and outranked a2 (0.91).
+    expect(results.map((r) => r.id)).toEqual(['a1', 'a2', 'b1']);
+    expect(results[2].score).toBeLessThan(0);
+  });
+
+  it('a single collection is unaffected', () => {
+    const store = build();
+    expect(store.searchAcross(['good'], [1, 0, 0], 2, 'cosine').map((r) => r.id)).toEqual(['g1', 'g2']);
+  });
+});

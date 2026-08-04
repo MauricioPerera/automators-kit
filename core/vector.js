@@ -277,31 +277,36 @@ function matchFilter(metadata, filter) {
  * Normaliza scores por colección a [0,1] y mergea con heap.
  * Usado por searchAcross en todos los stores.
  */
-function _normalizedSearchAcross(store, collections, query, limit, metric) {
+function _searchAcross(store, collections, query, limit, metric) {
   if (collections.length <= 1) {
-    // Sin normalización para colección única
     const col = collections[0];
     return store.search(col, query, limit, 0, metric);
   }
 
-  const perCol = [];
-  for (const col of collections) {
-    const results = store.search(col, query, limit, 0, metric);
-    if (results.length > 0) perCol.push(results);
-  }
-
+  // CORRECTNESS (2026-08-03, verified from a full-codebase audit lead): this
+  // used to min-max normalize EACH collection's results independently before
+  // merging. That destroyed the only thing that made the scores comparable in
+  // the first place -- they all come from the SAME query under the SAME
+  // metric, so they are already on one scale. Normalizing per collection
+  // rescaled every collection's best hit to exactly 1.0 no matter how
+  // irrelevant it was, and its worst to 0.0 no matter how good.
+  //
+  // Measured before the fix, querying [1,0,0] over a 'good' collection
+  // (cosines 1.000 / 0.990 / 0.980) and a 'junk' one (0.000 / 0.000 / -1.000):
+  // the top 3 came back as junk/j1 = 1.0, good/g1 = 1.0, junk/j2 = 1.0 --
+  // two orthogonal vectors tied with the perfect match, and the 0.99 and 0.98
+  // hits were dropped entirely. The `range > 0 ? ... : 1.0` fallback was worse
+  // still: a collection returning a SINGLE result got 1.0 unconditionally, so
+  // a near-opposite vector (cosine -0.9987) tied with a perfect match.
+  //
+  // Merging on the raw score is both simpler and correct. Nothing here needs
+  // rescaling; if collections ever use different embedding models (the only
+  // case normalization could have been aiming at), min-max over the top-`limit`
+  // window is not a valid estimator for that either -- it would need score
+  // calibration, which is a different feature, not this one.
   const heap = new TopKHeap(limit);
-  for (const results of perCol) {
-    let min = Infinity, max = -Infinity;
-    for (const r of results) {
-      if (r.score < min) min = r.score;
-      if (r.score > max) max = r.score;
-    }
-    const range = max - min;
-    for (const r of results) {
-      const normalized = range > 0 ? (r.score - min) / range : 1.0;
-      heap.push({ ...r, score: normalized });
-    }
+  for (const col of collections) {
+    for (const r of store.search(col, query, limit, 0, metric)) heap.push(r);
   }
   return heap.sorted();
 }
@@ -586,7 +591,7 @@ class VectorStore {
   }
 
   searchAcross(collections, query, limit = 5, metric = 'cosine') {
-    return _normalizedSearchAcross(this, collections, query, limit, metric);
+    return _searchAcross(this, collections, query, limit, metric);
   }
 
   static normalize      = normalize;
@@ -815,7 +820,7 @@ class QuantizedStore {
   }
 
   searchAcross(collections, query, limit = 5, metric = 'cosine') {
-    return _normalizedSearchAcross(this, collections, query, limit, metric);
+    return _searchAcross(this, collections, query, limit, metric);
   }
 
   import(col, records) {
@@ -1115,7 +1120,7 @@ class BinaryQuantizedStore {
   }
 
   searchAcross(collections, query, limit = 5, metric = 'cosine') {
-    return _normalizedSearchAcross(this, collections, query, limit, metric);
+    return _searchAcross(this, collections, query, limit, metric);
   }
 
   import(col, records) {
@@ -1493,7 +1498,7 @@ class PolarQuantizedStore {
   }
 
   searchAcross(collections, query, limit = 5, metric = 'cosine') {
-    return _normalizedSearchAcross(this, collections, query, limit, metric);
+    return _searchAcross(this, collections, query, limit, metric);
   }
 
   import(col, records) {
