@@ -104,6 +104,16 @@ via the standard tools/list method.`;
  *   collapse. Read live pressure via `workflowEngine.executionStats()`.
  * @param {number} [opts.maxQueuedExecutions] - Cap on that backlog (default
  *   1000). Past it, dispatch rejects rather than growing without bound.
+ * @param {number} [opts.executionRetentionMs] - Delete FINISHED executions
+ *   older than this. Off by default: every execution stores its full
+ *   nodeResults, so history grows forever without it, but enabling it deletes
+ *   data irreversibly — hence opt-in. In-flight executions (waiting/running/
+ *   resuming) are never touched. Inspect growth via
+ *   `workflowEngine.retentionStats()`.
+ * @param {number} [opts.maxStoredExecutions] - Also keep at most this many
+ *   FINISHED executions, newest first. Age alone does not bound a burst.
+ * @param {number} [opts.retentionIntervalMs] - How often the retention pass
+ *   runs when either bound is set (default hourly).
  * @param {object} [opts.workflowExecutionQueue] - A JobQueue/PostgresJobQueue
  *   instance to distribute triggered/error-workflow execution across
  *   worker processes. See WorkflowEngine's `opts.executionQueue` doc
@@ -188,6 +198,13 @@ export async function createApp(opts = {}) {
     // dispatch path and not on execute() itself.
     maxConcurrentExecutions: opts.maxConcurrentExecutions,
     maxQueuedExecutions: opts.maxQueuedExecutions,
+    // Execution-history retention. BOTH default to off -- unlike the
+    // concurrency cap above, retention deletes data irreversibly, so it is
+    // opted into rather than applied silently at upgrade. See the
+    // WorkflowEngine constructor for that reasoning.
+    executionRetentionMs: opts.executionRetentionMs,
+    maxStoredExecutions: opts.maxStoredExecutions,
+    retentionIntervalMs: opts.retentionIntervalMs,
   });
   await workflowEngine.init();
 

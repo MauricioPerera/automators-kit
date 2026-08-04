@@ -100,6 +100,15 @@ const SKIPPED = Symbol('workflow-node-skipped');
 // collide with an application's own job types on a shared queue instance.
 const EXECUTION_JOB_TYPE = 'akit:execute-workflow';
 
+/**
+ * Statuses at which an execution is FINISHED and therefore history. Anything
+ * else -- `waiting` (paused on a wait.* node), `running`, `resuming` -- is
+ * still in flight and must never be touched by retention: deleting one throws
+ * away work that can still complete, along with the `waitState` needed to
+ * resume it.
+ */
+const TERMINAL_EXECUTION_STATUSES = new Set(['success', 'failed']);
+
 // ---------------------------------------------------------------------------
 // WORKFLOW ENGINE
 // ---------------------------------------------------------------------------
@@ -187,6 +196,25 @@ export class WorkflowEngine {
     this._maxQueuedExecutions = opts.maxQueuedExecutions ?? 1000;
     this._activeDispatched = 0;
     this._dispatchQueue = [];
+
+    // Execution-history retention. Every execution persists its full
+    // `nodeResults` -- the actual data the workflow processed, not a summary
+    // -- so an instance running a workflow on a schedule accumulates content
+    // forever. `purgeExecutions()` existed for this and NOTHING ever called
+    // it: no timer, no route, no option (verified across the whole repo, the
+    // only references were its own definition and the Postgres mirror's).
+    //
+    // Both bounds default to OFF, unlike the concurrency cap next to it,
+    // which defaults ON. The asymmetry is deliberate: backpressure only
+    // delays work, whereas retention DELETES it irreversibly. Turning that on
+    // silently at upgrade could destroy history someone depends on, which is
+    // a worse failure than the unbounded growth it prevents. Growth is made
+    // observable instead (`retentionStats()`), so the need is visible rather
+    // than guessed at.
+    this._executionRetentionMs = opts.executionRetentionMs ?? 0;
+    this._maxStoredExecutions = opts.maxStoredExecutions ?? 0;
+    this._retentionIntervalMs = opts.retentionIntervalMs ?? 3600000; // hourly
+    this._retentionTimer = null;
 
     this._executionQueue = opts.executionQueue || null;
     if (this._executionQueue) {
@@ -584,12 +612,25 @@ export class WorkflowEngine {
     if (!this._waitTimer) {
       this._waitTimer = setInterval(() => this._pollWaitingExecutions(), this._waitPollInterval);
     }
+    // Retention runs only when a bound is configured -- an unconfigured
+    // engine installs no timer at all, so this costs nothing by default.
+    if (!this._retentionTimer && (this._executionRetentionMs > 0 || this._maxStoredExecutions > 0)) {
+      this._retentionTimer = setInterval(() => {
+        try { this.pruneExecutions(); }
+        catch (err) { console.error('[Workflow] Execution retention pass failed:', err.message); }
+      }, this._retentionIntervalMs);
+      if (typeof this._retentionTimer.unref === 'function') this._retentionTimer.unref();
+    }
     this._executionQueue?.start();
   }
 
   /** Stop all triggers, the wait.until resume poller, and the execution queue if configured */
   stop() {
     this._triggers.stop();
+    if (this._retentionTimer) {
+      clearInterval(this._retentionTimer);
+      this._retentionTimer = null;
+    }
     if (this._waitTimer) {
       clearInterval(this._waitTimer);
       this._waitTimer = null;
@@ -1348,12 +1389,76 @@ export class WorkflowEngine {
     return this._executions.findById(executionId);
   }
 
+  /**
+   * Deletes FINISHED executions older than `olderThanMs`.
+   *
+   * DATA LOSS (2026-08-04): this used to filter on age alone, so it deleted
+   * every matching row regardless of status -- including `waiting` (a
+   * `wait.forWebhook` execution paused for an external callback, together
+   * with the `waitState` holding its resume secret), `running`, and
+   * `resuming`. A workflow legitimately parked for longer than the retention
+   * window was destroyed mid-flight and could never be resumed. Verified
+   * before the fix: five executions, one per status, all five deleted.
+   *
+   * Only terminal statuses are eligible now. An execution that is still in
+   * flight is not history and is never retention's business.
+   */
   purgeExecutions(olderThanMs = 7 * 24 * 60 * 60 * 1000) {
     const cutoff = Date.now() - olderThanMs;
-    const old = this._executions.find({ startedAt: { $lt: cutoff } }).toArray();
+    const old = this._executions.find({
+      startedAt: { $lt: cutoff },
+      status: { $in: [...TERMINAL_EXECUTION_STATUSES] },
+    }).toArray();
     for (const e of old) this._executions.removeById(e._id);
     this.db.flush();
     return old.length;
+  }
+
+  /**
+   * Trims stored history to the newest `keep` FINISHED executions. Age alone
+   * does not bound a burst -- a workflow firing every second fills the store
+   * long before anything is old enough to expire -- so retention needs a
+   * count bound too.
+   */
+  trimExecutions(keep) {
+    if (!Number.isFinite(keep) || keep < 0) return 0;
+    const finished = this._executions
+      .find({ status: { $in: [...TERMINAL_EXECUTION_STATUSES] } })
+      .sort({ startedAt: -1 }).toArray();
+    const excess = finished.slice(keep);
+    for (const e of excess) this._executions.removeById(e._id);
+    if (excess.length) this.db.flush();
+    return excess.length;
+  }
+
+  /**
+   * One retention pass: age first, then the count cap. Called by the timer
+   * `start()` installs when either bound is configured, and safe to call by
+   * hand at any time.
+   */
+  pruneExecutions() {
+    let byAge = 0, byCount = 0;
+    if (this._executionRetentionMs > 0) byAge = this.purgeExecutions(this._executionRetentionMs);
+    if (this._maxStoredExecutions > 0) byCount = this.trimExecutions(this._maxStoredExecutions);
+    return { byAge, byCount, removed: byAge + byCount };
+  }
+
+  /**
+   * Stored-history pressure. `finished` is what retention can act on;
+   * `inFlight` is what it must never touch. Exposed so unbounded growth is
+   * observable rather than something you discover as a full disk.
+   */
+  retentionStats() {
+    const total = this._executions.count({});
+    const finished = this._executions.count({ status: { $in: [...TERMINAL_EXECUTION_STATUSES] } });
+    return {
+      total,
+      finished,
+      inFlight: total - finished,
+      retentionMs: this._executionRetentionMs,
+      maxStored: this._maxStoredExecutions,
+      enabled: this._executionRetentionMs > 0 || this._maxStoredExecutions > 0,
+    };
   }
 
   // ─── NODES & CREDENTIALS ────────────────────────────────

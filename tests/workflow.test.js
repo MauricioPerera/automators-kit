@@ -625,6 +625,106 @@ describe('concurrent execution limit', () => {
   }, 20000);
 });
 
+// Execution-history retention (2026-08-04, from the n8n comparison):
+// purgeExecutions() existed and NOTHING ever called it -- no timer, no route,
+// no option -- so history grew forever, and every execution persists its full
+// nodeResults (the real data processed, not a summary). n8n prunes by default
+// (EXECUTIONS_DATA_MAX_AGE / _PRUNE).
+describe('execution retention', () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const seed = (store, n, status, ageMs) => {
+    for (let i = 0; i < n; i++) {
+      store.collection('_executions').insert({
+        workflowId: 'w', status, startedAt: Date.now() - ageMs - i, nodeResults: {}, errors: {},
+      });
+    }
+  };
+  const engineWith = async (opts) => {
+    const d = new DocStore(new MemoryStorageAdapter());
+    const e = new WorkflowEngine(d, { masterKey: 'test-master-key!!!', ...opts });
+    await e.init();
+    return { d, e };
+  };
+
+  // DATA LOSS: purgeExecutions filtered on age alone, so it deleted `waiting`
+  // executions too -- a wait.forWebhook parked for an external callback, along
+  // with the waitState holding its resume secret. Verified before the fix:
+  // five executions, one per status, all five deleted.
+  it('never purges an execution that is still in flight', async () => {
+    const { d, e } = await engineWith({});
+    const old = 30 * 24 * 60 * 60 * 1000;
+    for (const status of ['success', 'failed', 'waiting', 'running', 'resuming']) seed(d, 1, status, old);
+
+    expect(e.purgeExecutions(7 * 24 * 60 * 60 * 1000)).toBe(2); // only the terminal ones
+    const left = d.collection('_executions').find({}).toArray().map((x) => x.status).sort();
+    expect(left).toEqual(['resuming', 'running', 'waiting']);
+  });
+
+  it('the count cap keeps the newest finished executions', async () => {
+    const { d, e } = await engineWith({});
+    seed(d, 10, 'success', 0);
+    expect(e.trimExecutions(3)).toBe(7);
+    expect(d.collection('_executions').count({})).toBe(3);
+  });
+
+  it('the count cap also refuses to evict in-flight work', async () => {
+    const { d, e } = await engineWith({});
+    seed(d, 5, 'success', 0);
+    seed(d, 3, 'waiting', 0);
+    e.trimExecutions(1);
+    const left = d.collection('_executions').find({}).toArray();
+    expect(left.filter((x) => x.status === 'waiting').length).toBe(3);
+    expect(left.filter((x) => x.status === 'success').length).toBe(1);
+  });
+
+  // Deliberately opt-in, unlike the concurrency cap: backpressure only delays
+  // work, retention DELETES it irreversibly, so it is never turned on silently.
+  it('is disabled by default -- start() installs no timer and deletes nothing', async () => {
+    const { d, e } = await engineWith({});
+    seed(d, 5, 'success', 30 * 24 * 60 * 60 * 1000);
+    e.start();
+    await sleep(120);
+    e.stop();
+    expect(d.collection('_executions').count({})).toBe(5);
+    expect(e.retentionStats().enabled).toBe(false);
+  }, 10000);
+
+  it('when enabled, the timer actually prunes -- and still spares in-flight rows', async () => {
+    const { d, e } = await engineWith({ executionRetentionMs: 1000, retentionIntervalMs: 100 });
+    seed(d, 6, 'success', 5000);
+    seed(d, 2, 'waiting', 5000);
+    e.start();
+    await sleep(400);
+    e.stop();
+    const left = d.collection('_executions').find({}).toArray();
+    expect(left.filter((x) => x.status === 'success').length).toBe(0);
+    expect(left.filter((x) => x.status === 'waiting').length).toBe(2);
+  }, 10000);
+
+  it('pruneExecutions reports both bounds separately', async () => {
+    const { d, e } = await engineWith({ executionRetentionMs: 1000, maxStoredExecutions: 2 });
+    seed(d, 3, 'success', 5000); // expire by age
+    seed(d, 5, 'success', 0);    // trimmed by count
+    expect(e.pruneExecutions()).toEqual({ byAge: 3, byCount: 3, removed: 6 });
+    expect(d.collection('_executions').count({})).toBe(2);
+  });
+
+  it('retentionStats separates what retention may touch from what it may not', async () => {
+    const { d, e } = await engineWith({ executionRetentionMs: 5000 });
+    seed(d, 4, 'success', 0);
+    seed(d, 2, 'waiting', 0);
+    expect(e.retentionStats()).toMatchObject({ total: 6, finished: 4, inFlight: 2, enabled: true });
+  });
+
+  it('stop() clears the retention timer', async () => {
+    const { e } = await engineWith({ executionRetentionMs: 1000, retentionIntervalMs: 50 });
+    e.start();
+    expect(e._retentionTimer).not.toBeNull();
+    e.stop();
+    expect(e._retentionTimer).toBeNull();
+  });
+});
+
 describe('Webhook path collision guard', () => {
   it('create() rejects a webhook path already owned by another ACTIVE workflow', () => {
     engine.create({
