@@ -30,7 +30,23 @@ function parseCron(expr) {
     dom:    parseField(parts[2], 1, 31),
     month:  parseField(parts[3], 1, 12),
     dow:    parseField(parts[4], 0, 6),  // 0=Sunday
+    // Whether day-of-month / day-of-week were left unrestricted. `matchesCron`
+    // needs this to apply POSIX's OR rule, which cannot be recovered from the
+    // value Sets alone: `*` and an explicit `0-6` both expand to every value,
+    // but only the former means "unrestricted". See matchesCron.
+    domRestricted: !isWildcard(parts[2]),
+    dowRestricted: !isWildcard(parts[4]),
   };
+}
+
+/**
+ * True for a field that places no restriction on its own — `*`, or a pure
+ * step over the whole range (`*​/2` still restricts, so only a bare `*` and
+ * `*​/1` qualify). Anything else (a value, a list, a range, a step over a
+ * sub-range) is a restriction.
+ */
+function isWildcard(field) {
+  return field === '*' || field === '*/1';
 }
 
 function parseField(field, min, max) {
@@ -75,13 +91,30 @@ function parseField(field, min, max) {
  * Check if a Date matches a parsed cron schedule.
  */
 function matchesCron(date, schedule) {
-  return (
-    schedule.minute.has(date.getMinutes()) &&
-    schedule.hour.has(date.getHours()) &&
-    schedule.dom.has(date.getDate()) &&
-    schedule.month.has(date.getMonth() + 1) &&
-    schedule.dow.has(date.getDay())
-  );
+  if (
+    !schedule.minute.has(date.getMinutes()) ||
+    !schedule.hour.has(date.getHours()) ||
+    !schedule.month.has(date.getMonth() + 1)
+  ) return false;
+
+  const domHit = schedule.dom.has(date.getDate());
+  const dowHit = schedule.dow.has(date.getDay());
+
+  // CORRECTNESS (2026-08-03, verified from a full-codebase audit lead): this
+  // used to AND day-of-month with day-of-week unconditionally. POSIX/Vixie
+  // cron ORs them when BOTH are restricted -- `0 0 1 * 1` means "midnight on
+  // the 1st OR any Monday", not "only when the 1st falls on a Monday".
+  // Measured before the fix: that expression fired ONCE in 2026 instead of 63
+  // times, so anyone pasting a standard crontab line got a schedule that
+  // almost never runs, with no error anywhere.
+  //
+  // When only one of the two is restricted the OR would wrongly match every
+  // day (the unrestricted field matches everything), so the rule is
+  // specifically: both restricted -> OR, otherwise -> AND. `schedule.
+  // dom/dowRestricted` carry that distinction because the value Sets cannot:
+  // `*` and an explicit `0-6` both expand to every value.
+  if (schedule.domRestricted && schedule.dowRestricted) return domHit || dowHit;
+  return domHit && dowHit;
 }
 
 // ---------------------------------------------------------------------------

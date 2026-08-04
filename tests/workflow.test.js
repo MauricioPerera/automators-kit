@@ -403,6 +403,62 @@ describe('Triggers', () => {
 // up front instead.
 // ---------------------------------------------------------------------------
 
+// CORRECTNESS (2026-08-03, verified from a full-codebase audit lead):
+// _validateNodeIds used to `continue` past a missing id, validating nothing.
+// _buildWorkflowDAG then put every id-less node in one level under the key
+// `undefined`, nodeMap collapsed them to the LAST one, and results were
+// indexed positionally against a level holding the same key twice.
+// Reproduced with two id-less nodes: the FIRST node's handler never ran, the
+// SECOND's ran TWICE, nodeResults had one "undefined" key, and the execution
+// reported success with no errors.
+describe('every node must have an id', () => {
+  it('rejects a workflow with an id-less node instead of silently misrunning it', () => {
+    expect(() => engine.create({
+      name: 'NoIds',
+      nodes: [
+        { type: 'set.value', inputs: { value: 'FIRST' } },
+        { type: 'set.value', inputs: { value: 'SECOND' } },
+      ],
+    })).toThrow(/needs a non-empty `id`/);
+  });
+
+  it('rejects every empty-id shape, not just a missing key', () => {
+    for (const id of ['', null, undefined]) {
+      expect(() => engine.create({
+        name: `Empty_${String(id)}`,
+        nodes: [{ id, type: 'set.value', inputs: { value: 1 } }],
+      })).toThrow(/needs a non-empty `id`/);
+    }
+  });
+
+  it('persists nothing when it rejects', () => {
+    const before = engine.list().length;
+    expect(() => engine.create({ name: 'Rejected', nodes: [{ type: 'set.value', inputs: { value: 1 } }] })).toThrow();
+    expect(engine.list().length).toBe(before);
+  });
+
+  it('gates update() too, not just create()', () => {
+    const wf = engine.create({ name: 'Valid', nodes: [{ id: 'a', type: 'set.value', inputs: { value: 1 } }] });
+    expect(() => engine.update(wf._id, { nodes: [{ type: 'set.value', inputs: { value: 2 } }] }))
+      .toThrow(/needs a non-empty `id`/);
+  });
+
+  it('a properly-identified workflow still runs each node exactly once', async () => {
+    const wf = engine.create({
+      name: 'WithIds',
+      nodes: [
+        { id: 'a', type: 'set.value', inputs: { value: 'FIRST' } },
+        { id: 'b', type: 'set.value', inputs: { value: 'SECOND' } },
+      ],
+    });
+    const exec = await engine.run(wf._id);
+    expect(exec.status).toBe('success');
+    expect(Object.keys(exec.nodeResults).sort()).toEqual(['a', 'b']);
+    expect(exec.nodeResults.a.data).toBe('FIRST');
+    expect(exec.nodeResults.b.data).toBe('SECOND');
+  });
+});
+
 describe('Webhook path collision guard', () => {
   it('create() rejects a webhook path already owned by another ACTIVE workflow', () => {
     engine.create({

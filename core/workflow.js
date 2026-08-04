@@ -1280,7 +1280,25 @@ export class WorkflowEngine {
     for (const node of nodes) {
       if (!node || typeof node !== 'object') continue;
       const id = node.id;
-      if (id === undefined || id === null || id === '') continue;
+      // CORRECTNESS (2026-08-03, verified from a full-codebase audit lead):
+      // this used to `continue` past a missing id, validating nothing. The
+      // consequences were silent and severe: `_buildWorkflowDAG` put every
+      // id-less node in one level under the key `undefined`, `nodeMap`
+      // collapsed them to the LAST one, and results were indexed positionally
+      // against a level holding the same key twice. Reproduced with two
+      // id-less nodes: the first node's handler NEVER ran, the second's ran
+      // TWICE, `nodeResults` had a single `"undefined"` key, and the execution
+      // reported `success` with no errors. A node with a real side effect
+      // could therefore be skipped and another double-charged, invisibly.
+      //
+      // An id is not optional in this engine: it is the {{ref}} name, the DAG
+      // vertex, and the nodeResults key. Refusing at create()/update() time is
+      // the only place that can fail loudly -- `routes/workflows.js`'s
+      // CreateSchema declares `nodes` as a bare array and cannot express a
+      // per-node requirement, so the HTTP surface relies on this check too.
+      if (id === undefined || id === null || id === '') {
+        throw new Error('Every workflow node needs a non-empty `id` — it is the {{ref}} name, the DAG vertex and the nodeResults key');
+      }
       if (id === '_trigger') {
         throw new Error(`Workflow node id '_trigger' is reserved (collides with trigger data context key)`);
       }

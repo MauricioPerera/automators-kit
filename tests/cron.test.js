@@ -235,3 +235,53 @@ describe('CronScheduler', () => {
     expect(calls).toBe(2);
   });
 });
+
+// CORRECTNESS (2026-08-03, verified from a full-codebase audit lead):
+// matchesCron ANDed day-of-month with day-of-week unconditionally. POSIX/Vixie
+// cron ORs them when BOTH are restricted, so `0 0 1 * 1` means "midnight on
+// the 1st OR any Monday". Measured before the fix: it fired ONCE in 2026
+// instead of 63 times -- a standard crontab line pasted in became a schedule
+// that almost never runs, with no error anywhere.
+describe('day-of-month / day-of-week follow POSIX OR semantics', () => {
+  const firingsIn2026 = (expr) => {
+    const s = parseCron(expr);
+    let n = 0;
+    for (let m = 0; m < 12; m++) {
+      for (let day = 1; day <= 31; day++) {
+        const d = new Date(2026, m, day, 0, 0);
+        if (d.getMonth() !== m) continue;
+        if (matchesCron(d, s)) n++;
+      }
+    }
+    return n;
+  };
+
+  it('ORs them when BOTH are restricted', () => {
+    const s = parseCron('0 0 1 * 1'); // the 1st, or any Monday
+    expect(matchesCron(new Date(2026, 6, 1, 0, 0), s)).toBe(true);  // Wed the 1st
+    expect(matchesCron(new Date(2026, 6, 6, 0, 0), s)).toBe(true);  // a Monday
+    expect(matchesCron(new Date(2026, 5, 1, 0, 0), s)).toBe(true);  // both
+    expect(matchesCron(new Date(2026, 6, 7, 0, 0), s)).toBe(false); // neither
+    expect(firingsIn2026('0 0 1 * 1')).toBe(63);                    // was 1
+  });
+
+  it('ANDs them when only ONE is restricted (an OR there would match every day)', () => {
+    expect(firingsIn2026('0 0 * * 1')).toBe(52); // Mondays only
+    expect(firingsIn2026('0 0 1 * *')).toBe(12); // 1st of each month only
+  });
+
+  it('is unaffected when neither is restricted', () => {
+    expect(firingsIn2026('0 0 * * *')).toBe(365);
+  });
+
+  it('still ANDs the other fields (month keeps narrowing the result)', () => {
+    expect(firingsIn2026('0 0 1 1 *')).toBe(1); // Jan 1st only
+  });
+
+  it('treats an explicit full range as a RESTRICTION, unlike *', () => {
+    // `0-6` covers every weekday but is still a restriction, so pairing it
+    // with a restricted dom must OR (matching cron), not AND.
+    expect(matchesCron(new Date(2026, 6, 7, 0, 0), parseCron('0 0 1 * 0-6'))).toBe(true);
+    expect(matchesCron(new Date(2026, 6, 7, 0, 0), parseCron('0 0 1 * *'))).toBe(false);
+  });
+});
