@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1298 tests | 0 deps | 27 core modules
+By automators.work | 1307 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -2576,7 +2576,7 @@ Current posture:
 - Workflow credential-vault master key: random per-instance unless `opts.secret` is configured explicitly, via `createApp()` or `WorkflowEngine` directly (no hardcoded fallback either way)
 - Timing-safe password comparison (byte-level XOR)
 - Credential vault with encrypted storage, random per-installation PBKDF2 salt
-- SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions, covering IPv4 and IPv6 (including IPv4-mapped/compatible forms and unique-local `fc00::/7`), plus a real, enforced HTTP header for webhook secrets. Does NOT cover redirects or DNS resolution — see the open item at the end of Known Security Gaps
+- SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions, covering IPv4 and IPv6 (including IPv4-mapped/compatible forms and unique-local `fc00::/7`), plus a real, enforced HTTP header for webhook secrets. Redirects are covered for callers using `safeFetch` (every workflow-driven outbound call), with credential headers dropped on cross-origin hops; DNS resolution is still NOT covered — see the open item at the end of Known Security Gaps
 - RBAC: 4 roles (CMS, with `:own`-scope enforcement genuinely wired through the entry routes) + 4 agent profiles (Shell, fail-closed default, `profile` alone now actually restricts)
 - Collection names validated at the `DocStore.collection()` chokepoint (positive allowlist), so no caller can turn one into a path traversal; internal (`_`-prefixed) collections unreachable from both untrusted surfaces (`/api/db/:col` and the `data.table` node) via one shared check
 - Prototype-chain segments (`__proto__`/`constructor`/`prototype`) refused on every user-influenced path write/read: `db.js` dot-paths, `workflow.js` `{{ref}}`s, `shell.js` projections, `a2e.js` `outputPath`/`StoreData` keys
@@ -2589,7 +2589,7 @@ Current posture:
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-17 resolved; open items listed at the end)
+## Known Security Gaps (items 1-18 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -2601,7 +2601,7 @@ section) were spot-checked against current source rather than trusted at face va
 held. Item 7 found yet another way: comparing the platform directly against a specific n8n concept
 (the protected instance owner) rather than an audit or a claims check. Item 8 was found reasoning about a
 small, unrelated feature (listing data-table collection names) and stress-testing the design decision it
-exposed. Items 9-17 came from the full-codebase audit described below — including item 9, which found
+exposed. Items 9-18 came from the full-codebase audit described below — including item 9, which found
 that item 8's own fix was bypassable. Documented first, on request, before any code change each time; all
 fixed shortly after in separate, explicitly-requested passes.
 
@@ -2882,8 +2882,33 @@ to expose" are different questions, and a clean audit of the former says nothing
    was constrained and was not. Reproduced directly. Fixed by moving `enum` out of the type switch (set
    membership is type-agnostic, so it now applies to every rule shape) and applying `min`/`max` on a
    typeless rule by the VALUE's runtime type, matching what each typed branch does for that same type.
+18. **RESOLVED (2026-08-03), HIGH.** The SSRF guard applied to the first URL only, and `fetch` follows
+   redirects. `assertPublicUrl` validates the URL it is handed and nothing more, while `fetch` defaults
+   to `redirect: 'follow'` — which every outbound call site used. So a workflow pointing at an
+   attacker-controlled PUBLIC host (which the guard allows) reached any internal destination the moment
+   that host answered `302 Location: http://127.0.0.1/`. Verified live before the fix: the guard blocked
+   the direct attempt and the redirect delivered the same internal body anyway, into the node result.
+   Item 12 had closed the literal-PARSING hole; this is the separate hop-following one.
+   Fixed with `safeFetch` (`core/net-guard.js`), which follows redirects manually so every hop faces the
+   same check as the original URL, wired into `core/nodes.js` (the `http.request` node), `core/a2e.js`
+   (both sites), `core/triggers.js` (poll), and `core/connector.js`. The connector applies it ONLY when
+   `blockInternalHosts` is enabled — that flag's `false` default is a documented decision (the connector
+   is also used for trusted, operator-configured endpoints), and changing redirect handling for everyone
+   would alter behavior for callers who never asked for a guard.
+   Two things handled deliberately rather than left to chance: (a) **credential headers
+   (`Authorization`/`Cookie`) are dropped on a CROSS-ORIGIN hop** — `core/nodes.js` fills `Authorization`
+   from the credential vault, so following a redirect would otherwise hand a workflow's credentials to
+   whatever host the redirect names, turning an SSRF probe into credential exfiltration; same-origin hops
+   keep them, since that is the common real case. (b) **Method/body rewriting matches what `fetch` itself
+   does** (303 always becomes GET without a body, 301/302 turn POST into GET, 307/308 preserve both), so
+   switching to manual following is not a behavior change for ordinary traffic. Redirect loops are capped
+   (5 hops) instead of spinning. 10 new regression tests — the network layer is stubbed there, not the
+   guard, so they exercise the real hop-validation logic against synthetic responses.
+   Deliberately still exempt (pre-existing, documented decisions, not oversights): `core/credentials.js`'s
+   OAuth2 token exchange and `core/vector.js`'s Reranker take operator-supplied config rather than
+   workflow input, and were already outside the guard's scope.
 
-Items 1-4 and 6-17 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+Items 1-4 and 6-18 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
@@ -2894,12 +2919,11 @@ wrote, silently, while reading correctly. That is the more dangerous default tha
 is worth checking for deliberately in anything new: when a constraint can't be applied, refuse rather
 than ignore.
 
-**Still open, disclosed rather than quietly carried:** `fetch` follows redirects with its default
-`redirect: 'follow'` at every outbound call site (`core/nodes.js`, `core/connector.js`, `core/a2e.js`,
-`core/triggers.js`), so a public host that answers `302 Location: http://127.0.0.1/` still reaches an
-internal destination — `net-guard` validates only the URL it is handed, and its own scope note previously
-disclaimed DNS resolution but not redirects. Item 12 closed the literal-parsing hole; this is a separate
-fix across four call sites and is NOT done.
+**Still open, disclosed rather than quietly carried:** `net-guard` performs no DNS resolution, so a
+public-looking HOSTNAME that resolves to a private IP is still not caught — the module's original scope
+note called this out and it remains true. Items 12 and 18 closed the two holes that were NOT disclaimed
+(IPv6 literal parsing, and redirect following); DNS-based blocking is a genuinely different piece of work
+and has not been attempted.
 
 **Other audit findings confirmed but not yet fixed** — recorded here rather than dropped, since a finding
 that is real and unlisted is worse than one that is real and known:
