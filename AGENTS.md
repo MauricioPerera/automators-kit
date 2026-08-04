@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1384 tests | 0 deps | 27 core modules
+By automators.work | 1395 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -1204,8 +1204,9 @@ const created = await cms.users.createApiKey(userId, 'CI pipeline');
 - GET /api/db/ - collection names known to this process (internal `_`-prefixed ones filtered out)
 - GET/POST /api/db/:col, GET/PUT/DELETE /api/db/:col/:id, GET /api/db/:col/_count
 - GET /api/db/_schemas - every table with a registered typed-column schema
+- GET /api/db/_templates - built-in starting schemas (crm, tasks, inventory, content)
 - GET /api/db/:col/_schema - that table's columns, or `{ typed: false }` when schemaless
-- PUT /api/db/:col/_schema (admin) - define/replace typed columns; writes after this are validated on
+- PUT /api/db/:col/_schema (admin) - define/replace typed columns, either `{ columns: [...] }` or `{ template: 'crm' }`; writes after this are validated on
   BOTH this API and the `data.table` workflow node. Existing rows are left as they are
 - DELETE /api/db/:col/_schema (admin) - back to schemaless, rows kept
 - Internal (`_`-prefixed) collections are rejected with 403 on every one of these
@@ -1504,6 +1505,26 @@ setTableSchema(db, 'people', [
   { name: 'Email', type: 'email',  unique: true },
 ]);
 ```
+
+Four ready-made schemas ship built in — `crm`, `tasks`, `inventory`, `content` — with typed columns,
+`unique` constraints, select `options` and defaults:
+
+```javascript
+import { setTableSchemaFromTemplate, listTableTemplates } from './core/db.js';
+setTableSchemaFromTemplate(db, 'stock', 'inventory');
+listTableTemplates();   // [{ name, columns: [{ name, type, required, unique }] }, ...]
+```
+
+Over HTTP: `GET /api/db/_templates` to discover, `PUT /api/db/:col/_schema { template: 'inventory' }`
+to apply. They go through the same registry, so a template constrains BOTH surfaces.
+
+**Dynamic defaults use the `'$now'` sentinel, not a function.** The registry persists columns as JSON
+and `Collection.insert()` deep-clones with `structuredClone`, which throws `DataCloneError` on a
+function — so a schema carrying `default: () => …` cannot be registered at all. The templates
+originally used exactly that shape, which is why registering one used to crash. A `Table` built
+directly in code still honours a function default (unchanged); `setTableSchema` refuses one with the
+reason and points at `'$now'`. Narrow known limitation: a column wanting the literal string `"$now"`
+as its default cannot express it.
 
 Or over HTTP: `PUT /api/db/:col/_schema { columns: [...] }` (admin), `GET /api/db/:col/_schema`,
 `DELETE /api/db/:col/_schema`, `GET /api/db/_schemas`. Those are registered BEFORE the `/:col/:id`
@@ -2812,6 +2833,17 @@ receives the execution object — so a multi-worker deployment following its own
 shared history of manual runs only. New generic `opts.onExecutionFinished`, also on `createApp()`. See
 "Observing finished executions" above for the contract. Verified against a real Postgres with two
 engines and independent local stores feeding one shared table. 7 local tests + the end-to-end run.
+
+**Table templates reachable (2026-08-04):** `TEMPLATES`/`createFromTemplate` defined four ready schemas
+and nothing could reach them — the data-table surfaces resolve schemas through the registry, which
+`createFromTemplate` never touches. Wiring it showed they could not have worked anyway: their
+`CreatedAt` columns used a FUNCTION default, and the registry persists columns as JSON, so
+`structuredClone` threw `DataCloneError` and registering any template crashed. Fixed with a
+serializable `'$now'` sentinel (function defaults still work for an in-code `Table`) plus a clear
+refusal from `setTableSchema` instead of a `DataCloneError` from inside `insert()`. New
+`setTableSchemaFromTemplate`/`listTableTemplates`, `GET /api/db/_templates`, and `template:` accepted
+by `PUT /api/db/:col/_schema`. Second time running in this sweep that wiring something disconnected
+revealed the code could never have worked — after the metrics labels. 12 new tests.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
