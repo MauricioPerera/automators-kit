@@ -430,6 +430,76 @@ describe('Error message specificity', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Generic collection API (/api/db) -- internal collections blocked
+// (SECURITY, 2026-08-03: previously ANY authenticated user could read/write
+// ANY collection by name, including _users -- passwordHash exposure and
+// self-promotion to admin via PUT /api/db/_users/:id { role: 'admin' },
+// bypassing every other access-control fix in this codebase)
+// ---------------------------------------------------------------------------
+
+describe('Generic collection API (/api/db) blocks internal collections', () => {
+  let lowPrivToken, lowPrivId;
+
+  beforeAll(async () => {
+    await app.handle(req('POST', '/api/auth/register', {
+      email: 'lowpriv-db-test@test.com', password: 'password1234', name: 'LowPriv',
+    }));
+    const loginRes = await app.handle(req('POST', '/api/auth/login', {
+      email: 'lowpriv-db-test@test.com', password: 'password1234',
+    }));
+    lowPrivToken = (await json(loginRes)).token;
+    lowPrivId = (await json(await app.handle(req('GET', '/api/auth/me', null, lowPrivToken)))).user._id;
+  });
+
+  it('GET /api/db/_users is rejected with 403, not the raw user documents (was: full passwordHash exposure)', async () => {
+    const res = await app.handle(req('GET', '/api/db/_users', null, lowPrivToken));
+    expect(res.status).toBe(403);
+    const body = await json(res);
+    expect(body.error).toContain('_users');
+    expect(body.error).toContain('internal');
+    expect(JSON.stringify(body)).not.toContain('passwordHash');
+  });
+
+  it('PUT /api/db/_users/:id cannot be used to self-promote to admin (was: a full, unauthenticated-by-role privilege escalation)', async () => {
+    const res = await app.handle(req('PUT', `/api/db/_users/${lowPrivId}`, { role: 'admin' }, lowPrivToken));
+    expect(res.status).toBe(403);
+
+    const meRes = await app.handle(req('GET', '/api/auth/me', null, lowPrivToken));
+    expect((await json(meRes)).user.role).toBe('viewer'); // unchanged
+  });
+
+  it('every :col-based verb rejects an underscore-prefixed collection the same way', async () => {
+    for (const [method, path] of [
+      ['GET', '/api/db/_sessions'],
+      ['GET', '/api/db/_sessions/_count'],
+      ['GET', '/api/db/_sessions/some-id'],
+      ['POST', '/api/db/_api_keys'],
+      ['PUT', '/api/db/_workflows/some-id'],
+      ['DELETE', '/api/db/_projects/some-id'],
+    ]) {
+      const res = await app.handle(req(method, path, method === 'POST' || method === 'PUT' ? {} : null, adminToken));
+      expect(res.status).toBe(403);
+    }
+  });
+
+  it('a non-internal collection is completely unaffected -- normal CRUD still works for any authenticated user', async () => {
+    const insertRes = await app.handle(req('POST', '/api/db/db-guard-widgets', { name: 'ok' }, lowPrivToken));
+    expect(insertRes.status).toBe(201);
+    const listRes = await app.handle(req('GET', '/api/db/db-guard-widgets', null, lowPrivToken));
+    expect((await json(listRes)).data.length).toBeGreaterThan(0);
+  });
+
+  it('GET /api/db/ lists collection names but filters out every internal (underscore-prefixed) one', async () => {
+    await app.handle(req('POST', '/api/db/db-guard-discoverable', { x: 1 }, adminToken));
+    const res = await app.handle(req('GET', '/api/db/', null, adminToken));
+    expect(res.status).toBe(200);
+    const { collections } = await json(res);
+    expect(collections).toContain('db-guard-discoverable');
+    expect(collections.some((c) => c.startsWith('_'))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Content Types
 // ---------------------------------------------------------------------------
 

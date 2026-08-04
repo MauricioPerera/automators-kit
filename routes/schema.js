@@ -229,8 +229,9 @@ function buildApiCatalog() {
       {
         name: 'db',
         basePath: '/api/db',
-        description: 'Generic PostgREST-style collection API over any DB collection.',
+        description: 'Generic PostgREST-style collection API over any NON-internal DB collection (SECURITY, 2026-08-03: :col starting with "_" -- every internal/system collection, e.g. _users/_sessions/_api_keys/_workflows -- is rejected with 403, previously reachable by any authenticated user with zero role check).',
         endpoints: [
+          { method: 'GET', path: '/api/db/', auth: 'bearer', description: 'List collection names known to this process (internal ones filtered out) -- discovery for the routes below' },
           { method: 'GET', path: '/api/db/:col', auth: 'bearer', description: 'List documents; supports field__op=val filters, _sort/_order, _limit (max 500)/_offset, _fields projection' },
           { method: 'GET', path: '/api/db/:col/_count', auth: 'bearer', description: 'Count documents in a collection' },
           { method: 'GET', path: '/api/db/:col/:id', auth: 'bearer', description: 'Get a document by ID' },
