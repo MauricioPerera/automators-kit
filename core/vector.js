@@ -1646,10 +1646,22 @@ class IVFIndex {
     }
 
     const { centroids, assignments } = this._kmeans(flatTrunc, n, sdim, this.numClusters);
-    const index = { centroids, assignments, sampleDims: sdim };
+    // CORRECTNESS (2026-08-03, verified from a full-codebase audit lead):
+    // `assignments` is positional (slot i -> cluster), but VectorStore.remove()
+    // splices the vector out and renumbers every later position. Nothing
+    // invalidated the index, so after a single delete slot i described a
+    // DIFFERENT vector than the one it was clustered from. Measured with 4
+    // separated clusters and numProbes 1: deleting one cluster made a query
+    // sitting squarely inside another return the WRONG cluster entirely --
+    // recall 0/4, cosines 0.000-0.003 where the exact scan returned 1.000. Not
+    // degraded recall; confidently wrong answers. Snapshotting the ids lets
+    // _getCandidates resolve each assignment through the CURRENT idMap, so
+    // deletions and reordering can no longer misalign it.
+    const ids = entry.ids.slice();
+    const index = { centroids, assignments, ids, sampleDims: sdim };
     this._indexes.set(col, index);
     this.store._adapter.writeJson(this._indexFile(col), {
-      centroids, assignments, sampleDims: sdim,
+      centroids, assignments, ids, sampleDims: sdim,
       numClusters: centroids.length,
       numProbes:   this.numProbes,
     });
@@ -1670,7 +1682,24 @@ class IVFIndex {
   indexStats(col) {
     const idx = this._loadIndex(col);
     if (!idx) return null;
-    return { numClusters: idx.centroids.length, numProbes: this.numProbes };
+    const stats = { numClusters: idx.centroids.length, numProbes: this.numProbes };
+    // Drift since build(). Searches stay CORRECT when this is non-zero (see
+    // _getCandidates), but they get slower as `addedSinceBuild` grows, because
+    // those vectors are scanned outside the cluster probe. Exposed so the need
+    // for a rebuild is observable instead of guesswork.
+    if (idx.ids) {
+      const entry = this.store._load(col);
+      const built = new Set(idx.ids);
+      let removed = 0;
+      for (const id of built) if (!entry.idMap.has(id)) removed++;
+      let added = 0;
+      for (const id of entry.ids) if (!built.has(id)) added++;
+      stats.indexedAtBuild = idx.ids.length;
+      stats.removedSinceBuild = removed;
+      stats.addedSinceBuild = added;
+      stats.stale = removed > 0 || added > 0;
+    }
+    return stats;
   }
 
   _getCandidates(col, query) {
@@ -1683,8 +1712,37 @@ class IVFIndex {
     const probeClusters = new Set(centDists.slice(0, this.numProbes).map(x => x.i));
     const entry = this.store._load(col);
     const candidateIdxs = [];
-    for (let i = 0; i < assignments.length; i++) {
-      if (probeClusters.has(assignments[i])) candidateIdxs.push(i);
+
+    // Resolve each clustered id to its CURRENT position. An id that is gone
+    // (removed since build) is simply skipped; positions can shift freely
+    // without corrupting the mapping. See build()'s comment for what this
+    // replaces.
+    const indexedIds = idx.ids;
+    if (indexedIds) {
+      const seen = new Set();
+      for (let i = 0; i < assignments.length; i++) {
+        const id = indexedIds[i];
+        if (!probeClusters.has(assignments[i])) { seen.add(id); continue; }
+        seen.add(id);
+        const pos = entry.idMap.get(id);
+        if (pos !== undefined) candidateIdxs.push(pos);
+      }
+      // Vectors ADDED since build() have no cluster assignment at all and were
+      // therefore invisible to every search -- measured: a perfect match added
+      // after build simply never appeared in the results. They are included
+      // here rather than dropped: that keeps results CORRECT (the cost is
+      // speed, proportional to how much was added since the last build, not
+      // accuracy), and `indexStats()` reports the drift so an operator can see
+      // that a rebuild is due instead of having to guess.
+      for (let pos = 0; pos < entry.ids.length; pos++) {
+        if (!seen.has(entry.ids[pos])) candidateIdxs.push(pos);
+      }
+    } else {
+      // Index built before ids were snapshotted: fall back to the old
+      // positional behavior rather than returning nothing.
+      for (let i = 0; i < assignments.length; i++) {
+        if (probeClusters.has(assignments[i]) && i < entry.ids.length) candidateIdxs.push(i);
+      }
     }
     return { entry, candidateIdxs };
   }

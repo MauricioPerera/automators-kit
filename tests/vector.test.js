@@ -438,3 +438,88 @@ describe('searchAcross ranks on true similarity, not per-collection rank', () =>
     expect(store.searchAcross(['good'], [1, 0, 0], 2, 'cosine').map((r) => r.id)).toEqual(['g1', 'g2']);
   });
 });
+
+// CORRECTNESS (2026-08-03, verified from a full-codebase audit lead): IVF's
+// `assignments` array is positional (slot i -> cluster), but
+// VectorStore.remove() splices the vector out and renumbers every later
+// position, and nothing invalidated the index. After a single delete, slot i
+// described a DIFFERENT vector than the one it was clustered from. Measured
+// before the fix: deleting one cluster made a query sitting squarely inside
+// another return the wrong cluster entirely -- recall 0/4, cosines
+// 0.000-0.003 where the exact scan returned 1.000.
+describe('IVFIndex survives mutations of the underlying collection', () => {
+  const buildFixture = () => {
+    const store = new VectorStore(new MemoryStorageAdapter(), 2);
+    const centers = { C0: [10, 0], C1: [0, 10], C2: [-10, 0], C3: [0, -10] };
+    for (const [name, [x, y]] of Object.entries(centers)) {
+      for (let i = 0; i < 4; i++) store.set('v', `${name}_${i}`, [x + i * 0.01, y + i * 0.01]);
+    }
+    store.flush();
+    const ivf = new IVFIndex(store, 4, 1); // probe a single cluster
+    ivf.build('v');
+    return { store, ivf };
+  };
+
+  it('still returns the right cluster after deletions renumber positions', () => {
+    const { store, ivf } = buildFixture();
+    for (let i = 0; i < 4; i++) store.remove('v', `C0_${i}`);
+    store.flush();
+
+    const query = [0, 10]; // squarely inside C1
+    const exact = store.search('v', query, 4, 0, 'cosine').map((r) => r.id);
+    const got = ivf.search('v', query, 4, 'cosine').map((r) => r.id);
+    expect(got).toEqual(exact);
+    expect(got.every((id) => id.startsWith('C1_'))).toBe(true);
+  });
+
+  it('finds vectors ADDED after build (they used to be invisible)', () => {
+    const store = new VectorStore(new MemoryStorageAdapter(), 2);
+    store.set('v', 'old1', [1, 0]);
+    store.set('v', 'old2', [0, 1]);
+    store.flush();
+    const ivf = new IVFIndex(store, 2, 2);
+    ivf.build('v');
+
+    store.set('v', 'NEW_PERFECT', [1, 0]);
+    store.flush();
+    expect(ivf.search('v', [1, 0], 3, 'cosine').map((r) => r.id)).toContain('NEW_PERFECT');
+  });
+
+  it('keeps full recall against an exact scan after many deletes', () => {
+    const store = new VectorStore(new MemoryStorageAdapter(), 8);
+    const rnd = () => Array.from({ length: 8 }, () => Math.random() * 2 - 1);
+    for (let i = 0; i < 120; i++) store.set('v', `id${i}`, rnd());
+    store.flush();
+    const ivf = new IVFIndex(store, 6, 6); // probe every cluster -> must match exactly
+    ivf.build('v');
+    for (let i = 0; i < 40; i++) store.remove('v', `id${i}`);
+    store.flush();
+
+    for (let t = 0; t < 5; t++) {
+      const query = rnd();
+      const exact = store.search('v', query, 5, 0, 'cosine').map((r) => r.id);
+      const got = ivf.search('v', query, 5, 'cosine').map((r) => r.id);
+      expect(got).toEqual(exact);
+    }
+  });
+
+  it('reports drift so a due rebuild is observable rather than guesswork', () => {
+    const { store, ivf } = buildFixture();
+    expect(ivf.indexStats('v').stale).toBe(false);
+
+    store.remove('v', 'C0_0');
+    store.set('v', 'brand_new', [5, 5]);
+    store.flush();
+    const stats = ivf.indexStats('v');
+    expect(stats.removedSinceBuild).toBe(1);
+    expect(stats.addedSinceBuild).toBe(1);
+    expect(stats.stale).toBe(true);
+  });
+
+  it('a freshly built index over an untouched collection matches the exact scan', () => {
+    const { store, ivf } = buildFixture();
+    const query = [0, 10];
+    expect(ivf.search('v', query, 4, 'cosine').map((r) => r.id))
+      .toEqual(store.search('v', query, 4, 0, 'cosine').map((r) => r.id));
+  });
+});
