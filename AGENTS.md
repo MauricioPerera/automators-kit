@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1377 tests | 0 deps | 27 core modules
+By automators.work | 1384 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -18,7 +18,7 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry, persistent per-workflow scratch space (workflow.staticData), instance-wide concurrency cap with backpressure, execution-history retention, optional execution queue for horizontal scaling, synchronous webhook response (respond: 'whenFinished'), createdBy/updatedBy attribution
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history (with an onExecutionFinished seam), DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry, persistent per-workflow scratch space (workflow.staticData), instance-wide concurrency cap with backpressure, execution-history retention, optional execution queue for horizontal scaling, synchronous webhook response (respond: 'whenFinished'), createdBy/updatedBy attribution
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
@@ -1777,6 +1777,45 @@ logs, so shed load is visible instead of a silent OOM.
 Complements, rather than replaces, the execution queue below: this bounds one process, that one spreads
 work across several. Both can be used together.
 
+### Observing finished executions
+
+`opts.onExecutionFinished(execution)` fires for every execution that reaches a TERMINAL status,
+whatever started it — manual `run()`, webhook/cron/poll, error-workflow, queue worker:
+
+```javascript
+const log = new PostgresExecutionLog(pool); await log.init();
+const engine = new WorkflowEngine(db, {
+  onExecutionFinished: (exec) => log.record(exec),   // shared, cross-process history
+});
+```
+
+Also `createApp({ onExecutionFinished })`.
+
+**Why this exists.** `integrations/postgres-execution-log.js` documents its own integration as
+caller-driven, and deliberately NOT a change to `core/workflow.js` (its doc comment explains why:
+`db.js`'s storage-adapter interface is synchronous and `Collection` caches everything in memory, so it
+cannot be a DocStore adapter):
+
+```javascript
+const exec = await engine.execute(id, data);
+await log.record(exec);                              // fine for a MANUAL run
+```
+
+That pattern structurally cannot see the executions that dominate a real deployment. Trigger-fired and
+error-workflow runs go through `_dispatchExecution` fire-and-forget — nothing receives the execution
+object, only a `.catch()` is attached — so a multi-worker setup following those instructions ends up
+with a shared history holding only the manually-run executions. Verified against a real Postgres: two
+engines with independent local stores funnelling into one shared table, with both the manual and the
+webhook-triggered run arriving.
+
+Deliberately a GENERIC callback rather than a `postgresExecutionLog` option, so the engine keeps no
+Postgres knowledge — the same reason that module gives for not touching this file — and the same seam
+serves alerting, custom logging or metrics.
+
+Contract: fires only for terminal statuses (a `waiting` execution is not finished, so it does not
+fire); the execution passed in carries a resolvable `_id`; and it is fire-and-forget — a throwing or
+rejecting observer is logged and never fails the execution.
+
 ### Execution Queue (horizontal scaling)
 
 By default every triggered execution runs in-process. For real load — many webhooks/cron/poll
@@ -2763,6 +2802,16 @@ above a surface to be observed through. Wiring it surfaced two real bugs in the 
 as gap item 29: labels used the concrete path (unbounded cardinality + resource ids written into an
 unauthenticated endpoint), and sub-routers dropped the route pattern so nearly all real traffic
 reported as `<unmatched>`. 9 new tests. See "Metrics (Prometheus)" above for the contract.
+
+**Observation seam for finished executions (2026-08-04):** found sweeping for written-but-unwired code,
+and the first diagnosis was wrong in a way worth recording — `integrations/postgres-execution-log.js`
+is not missing engine wiring by oversight; its doc comment explicitly says it is a caller-driven
+sidecar and explains why. The real gap was underneath: the caller-driven pattern it documents cannot
+see trigger-fired or error-workflow runs, because those are dispatched fire-and-forget and nothing
+receives the execution object — so a multi-worker deployment following its own instructions gets a
+shared history of manual runs only. New generic `opts.onExecutionFinished`, also on `createApp()`. See
+"Observing finished executions" above for the contract. Verified against a real Postgres with two
+engines and independent local stores feeding one shared table. 7 local tests + the end-to-end run.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
