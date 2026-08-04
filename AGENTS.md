@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1407 tests | 0 deps | 27 core modules
+By automators.work | 1420 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -2124,6 +2124,43 @@ system:{ready|shutdown}
 Restrict plugin access: { "capabilities": ["entries:read", "entries:write"] }
 Empty = unrestricted.
 
+## Bundled plugins and their route auth
+
+Six plugins ship in `plugins/`. They are **opt-in** — nothing loads unless `opts.plugins` names them,
+so a default `createApp()` runs none of them:
+
+| Plugin | Routes | What it does |
+|---|---|---|
+| `webhooks` | `GET/POST /`, `DELETE /:id`, `POST /:id/toggle`, `GET /deliveries`, `GET /events`, `POST /in/:name` | Outbound HTTP POST to registered URLs on CMS hooks; inbound receiver |
+| `automations` | `GET/POST /`, `GET/PUT/DELETE /:id`, `POST /:id/toggle`, `GET /:id/runs`, templates | Trigger → conditions → actions (http / log) on CMS hooks |
+| `revisions` | `GET /entry/:id`, `GET /id/:id`, `POST /id/:id/restore` | Entry revision history and rollback |
+| `audit` | `GET /` | Action log |
+| `search` | `GET /` | Entry search index |
+| `scheduler` | none | Scheduled publishing |
+
+**Route auth (since 2026-08-04 — before that there was none at all; see Known Security Gaps item 31).**
+`createApp()` wraps every plugin router at the mount point with `createPluginRouteGate`, so the gate
+covers third-party plugins too and a plugin cannot ship unauthenticated by forgetting to add it.
+
+- **Default: `admin`.** Plugin routes name outbound destinations, define automations or restore
+  content — administrative actions. The default is deliberately not "any authenticated user".
+- A plugin definition may widen specific routes:
+  - `publicRoutes: ['POST /in/:name']` — no auth. For callers that genuinely cannot authenticate.
+  - `authRoutes: ['GET /']` — any authenticated user, no role check.
+- Patterns are `'<METHOD> <pattern>'`, relative to the plugin's mount prefix, matched with the Router's
+  own `compilePattern` (exported for this) so the gate can never disagree with the matcher that
+  dispatches the request. A malformed entry **throws at mount time** rather than being ignored.
+
+Only `webhooks` declares an exemption: `POST /in/:name`, its inbound receiver, called by an external
+service that has no account and no token — the same case as the OAuth2 callback route, where a shared
+secret or signature is the real protection rather than an `Authorization` header.
+
+**Writing a plugin that makes outbound calls: use `safeFetch` from `core/net-guard.js`, not `fetch`.**
+Both bundled plugins that call out originally used raw `fetch`, which is what let an attacker-supplied
+URL reach loopback and cloud-metadata addresses (item 32). Note the consequence for local development:
+a webhook or automation action aimed at `127.0.0.1` is now **refused**, matching how every other
+config-driven outbound call in this codebase behaves.
+
 ## Security
 
 3 full security audits to date, all findings remediated. Latest (2026-07): full-repo audit of
@@ -2902,17 +2939,43 @@ So the sweep really found two distinct shapes, and both are worth looking for:
 Shape 2 is the harder one to hunt, because the reassuring signal (the symbol IS referenced) is exactly
 what hides it.
 
+**2026-08-04 — hunting shape 2 deliberately, and what it found.** Rather than leave that as an
+observation, the next pass went looking for shape 2 on purpose: *which proven helper should this code be
+using and is not?* It concentrated in one place — `plugins/`, where all six bundled plugins imported only
+`core/http.js`, had no tests whatsoever, and were documented nowhere — all three since addressed (see
+"Bundled plugins and their route auth" above). Three findings, now items
+31-33: plugin routes were **completely unauthenticated** (an anonymous caller could install a permanent
+content-exfiltration webhook), both outbound-calling plugins used raw `fetch` instead of the tested
+`safeFetch`, and `checkCondition` failed open on an unknown operator. Item 31 is the most serious single
+finding of this whole audit.
+
+Two things worth keeping from how it was found:
+
+**The question that finds shape 2 is not greppable.** Shape 1 answers to "what has no consumer?", which
+a grep resolves in seconds. Here `safeFetch` had five consumers and looked entirely healthy; the useful
+question was "who *should* be calling this and isn't?", which no command answers. It has to be asked
+surface by surface, against a list of helpers whose whole point is that they are security-relevant.
+
+**Fixing it required exporting a private helper — the same root cause, again.** The gate needed to match
+route patterns, and `compilePattern` was module-private in `core/http.js`. Hand-rolling a second matcher
+would have created exactly the divergence being fixed, so it was exported instead. That is the
+`_getNestedValue` lesson applied rather than merely recorded: **a hardened helper that nothing outside
+its module can reach does not get reused, it gets reimplemented — badly, and without the hardening.**
+When a helper exists because it is careful about something, export it, or accept that every caller
+outside its module will write a careless version.
+
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
 - AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
 - Workflow credential-vault master key: random per-instance unless `opts.secret` is configured explicitly, via `createApp()` or `WorkflowEngine` directly (no hardcoded fallback either way)
 - Timing-safe password comparison (byte-level XOR)
 - Credential vault with encrypted storage, random per-installation PBKDF2 salt
-- SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions, covering IPv4 and IPv6 (including IPv4-mapped/compatible forms and unique-local `fc00::/7`), plus a real, enforced HTTP header for webhook secrets. Redirects are covered for callers using `safeFetch` (every workflow-driven outbound call), with credential headers dropped on cross-origin hops; DNS resolution is still NOT covered — see the open item at the end of Known Security Gaps
+- SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions **and by the bundled plugins** (`webhooks`, `automations` — raw `fetch` until 2026-08-04, see item 32), covering IPv4 and IPv6 (including IPv4-mapped/compatible forms and unique-local `fc00::/7`), plus a real, enforced HTTP header for webhook secrets. Redirects are covered for callers using `safeFetch` (every workflow-driven outbound call), with credential headers dropped on cross-origin hops; DNS resolution is still NOT covered — see the open item at the end of Known Security Gaps
 - RBAC: 4 roles (CMS, with `:own`-scope enforcement genuinely wired through the entry routes) + 4 agent profiles (Shell, fail-closed default, `profile` alone now actually restricts)
 - Collection names validated at the `DocStore.collection()` chokepoint (positive allowlist), so no caller can turn one into a path traversal; internal (`_`-prefixed) collections unreachable from both untrusted surfaces (`/api/db/:col` and the `data.table` node) via one shared check
 - Prototype-chain segments (`__proto__`/`constructor`/`prototype`) refused on every user-influenced path write/read: `db.js` dot-paths, `workflow.js` `{{ref}}`s, `shell.js` projections, `a2e.js` `outputPath`/`StoreData` keys
 - Plugin capability manifest, gated `database`/collection access, path-traversal guard on local plugin loading
+- Plugin ROUTES gated at the mount point, `admin` by default, with explicit `publicRoutes`/`authRoutes` opt-outs per plugin — every plugin route was reachable with no token at all until 2026-08-04 (Known Security Gaps item 31)
 - ReDoS guards on user-supplied `$regex`/pattern input (db.js, vector.js, a2e.js)
 - Query filters and schemas fail CLOSED, never open: an unknown/misspelled query operator throws rather than being treated as satisfied, non-array `$in`/`$nin` targets are rejected, and `validate.js`'s `enum`/`min`/`max` apply to every rule shape, not just explicitly-typed strings
 - Session auto-cleanup
@@ -2923,7 +2986,7 @@ Current posture:
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-30 resolved; open items listed at the end)
+## Known Security Gaps (items 1-33 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -3443,14 +3506,60 @@ to expose" are different questions, and a clean audit of the former says nothing
    (`< 1`) is rejected. One visible behavior change: `_order` is now an `asc|desc` enum, where it
    previously treated any non-`asc` value as descending.
 
-Items 1-4 and 6-30 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+31. **RESOLVED (2026-08-04), CRITICAL.** Every route of every bundled plugin was reachable with no
+   `Authorization` header at all. `index.js` mounted plugin routers raw
+   (`router.route('/api/plugins/' + name, pluginRouter)`, no middleware) and not one of the six plugins
+   in `plugins/` registered any of its own — a grep for `createAuth`/`requireRole`/`ctx.state.user`
+   across the whole directory returned nothing. Reproduced live, unauthenticated end to end:
+   `POST /api/plugins/webhooks/` registered an outbound webhook pointing at `http://127.0.0.1:<port>/admin`,
+   and an entry created afterwards made the server POST that entry's **full content** to it. The same
+   worked through `plugins/automations`, where the internal listener received `{"leaked":"secret draft"}`.
+   That is two things at once: SSRF (item 32), and a **persistent exfiltration channel** any anonymous
+   caller could install and leave running — point it at an attacker host instead of loopback and every
+   entry created, updated or published is delivered there indefinitely. The other four bundled plugins
+   mount through the identical path and expose audit-log reads, revision reads, revision **restore** (a
+   write) and search; that half was verified by reading, not by executing. Fixed with a gate at the
+   **mount point** rather than per plugin, so a plugin — bundled or third-party, written before or after
+   the gate — cannot ship unauthenticated by forgetting something. It defaults to `admin` rather than
+   "any authenticated user": these routes name outbound destinations, define automations or restore
+   content, so leaving them open to a viewer would keep the exfiltration channel installable from the
+   lowest-privileged account, which is most of the finding. Two declarations let a plugin widen a
+   specific route (`publicRoutes`, `authRoutes`), because `POST /in/:name` — the inbound webhook
+   receiver — genuinely must stay open: it is called by an external service with no account and no
+   token, the same situation as the OAuth2 callback route. A malformed declaration throws at mount time
+   instead of being skipped, since a typo leaving a route more open than its author believed is the
+   exact bug being fixed. **Scope, stated plainly:** plugins are opt-in via `opts.plugins`, so a default
+   `createApp()` never ran any of this. They ship in the repo as usable plugins with no warning, though,
+   and had **no tests of any kind** — which is why none of it surfaced in the six-agent audit.
+
+32. **RESOLVED (2026-08-04), HIGH.** `plugins/webhooks` and `plugins/automations` called raw `fetch` on
+   caller-supplied URLs instead of `safeFetch`, which is what let item 31 reach loopback. `net-guard.js`
+   was already exported, tested, and used by five core modules — these two dispatchers had simply never
+   been pointed at it. This also made a documented claim **false**: the README stated the SSRF guard
+   covered "all outbound fetches driven by workflow/trigger definitions", and `plugins/automations` is
+   precisely a stored workflow definition driving an outbound fetch. Verified after the fix: the
+   internal listener received **0** requests where it previously received one per plugin. Note that
+   `credentials.js` (OAuth2) and `vector.js` (Reranker) also call raw `fetch` and are **not** part of
+   this finding — both are recorded elsewhere as a deliberate exemption for operator-supplied config.
+
+33. **RESOLVED (2026-08-04), MEDIUM.** `plugins/automations`'s `checkCondition` ended in
+   `default: return true`, so an unsupported or typo'd operator made the condition **pass** — and
+   conditions are what decide whether an automation's outbound HTTP action fires, so an unreadable
+   condition silently ran the action against every record it was written to exclude. Same fail-open
+   class as items 15-17 and 30, and the same fix `core/db.js`'s `matchFilter` already received: an
+   operator that cannot be applied is refused, never ignored. It throws rather than returning `false`
+   so the mistake is reported instead of quietly matching nothing; verified that `executeWorkflow`'s
+   existing `try`/`catch` records it as a failed run before claiming as much.
+
+Items 1-4 and 6-33 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
 
-**A note on what items 15-17 and 30 have in common:** all four failed OPEN. A typo'd operator, a missing
-`type`, an `enum` on the wrong rule shape, a cap that bounded only one side — each made a filter, schema
-or limit accept MORE than the author wrote, silently, while reading correctly. That is the more
+**A note on what items 15-17, 30 and 33 have in common:** all five failed OPEN. A typo'd operator, a
+missing `type`, an `enum` on the wrong rule shape, a cap that bounded only one side, a condition whose
+`default` branch returned `true` — each made a filter, schema, limit or rule accept MORE than the author
+wrote, silently, while reading correctly. That is the more
 dangerous default than failing closed, and it is worth checking for deliberately in anything new: when a
 constraint can't be applied, refuse rather than ignore.
 
