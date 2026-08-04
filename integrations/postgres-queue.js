@@ -300,7 +300,17 @@ export class PostgresJobQueue {
         'UPDATE queue_jobs SET updated_at = now() WHERE id = $1 AND lease_token = $2',
         [job._id, job.leaseToken]
       ).catch(() => { /* a missed beat is recoverable; the next one renews */ });
-    }, Math.max(Math.floor(this.leaseMs / 3), 1000));
+      // The interval MUST stay meaningfully shorter than the lease, or the
+      // row expires before the first beat and the job is re-claimed anyway --
+      // which is the bug this heartbeat exists to prevent. A previous version
+      // used a flat 1000ms floor to avoid hammering the DB; that silently
+      // defeated the whole mechanism for any leaseMs under 3000ms. Caught by
+      // running it against a real Postgres: with leaseMs 400 the handler was
+      // still executed 7 times. Clamped on both ends instead: never slower
+      // than a third of the lease, never faster than 50ms (a pathological
+      // config should not hammer the DB), and capped at 30s so a long lease
+      // does not go minutes between beats.
+    }, Math.max(Math.min(Math.floor(this.leaseMs / 3), 30000), 50));
     if (typeof heartbeat.unref === 'function') heartbeat.unref();
 
     try {
