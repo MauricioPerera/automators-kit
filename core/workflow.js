@@ -167,6 +167,27 @@ export class WorkflowEngine {
     this._defaultErrorWorkflow = opts.defaultErrorWorkflow || null;
     this._waitPollInterval = opts.waitPollInterval || 1000;
     this._waitTimer = null;
+
+    // Instance-wide backpressure for FIRE-AND-FORGET dispatch (see
+    // _dispatchExecution). Without a cap, N simultaneous webhook/cron/poll
+    // firings started N simultaneous executions -- each resolving
+    // credentials, issuing outbound fetches and writing to the DB -- with no
+    // queue and no ceiling, so a burst degrades into a collapse rather than
+    // into a slowdown. The optional `executionQueue` had a concurrency cap
+    // but requires Postgres and is opt-in; the DEFAULT path had none at all.
+    //
+    // The default is a real number rather than "unlimited" on purpose: below
+    // it nothing changes, and above it the behavior only changes in the
+    // regime that was already broken. Set 0 to opt out entirely.
+    this._maxConcurrentExecutions = opts.maxConcurrentExecutions ?? 100;
+    // Overflow waits here instead of running. Bounded too: an unbounded
+    // in-memory backlog is its own way to fall over, so past this the
+    // dispatch REJECTS -- each caller already attaches a .catch that logs,
+    // so shed load is visible rather than a silent OOM.
+    this._maxQueuedExecutions = opts.maxQueuedExecutions ?? 1000;
+    this._activeDispatched = 0;
+    this._dispatchQueue = [];
+
     this._executionQueue = opts.executionQueue || null;
     if (this._executionQueue) {
       this._executionQueue.register(EXECUTION_JOB_TYPE, async (data) => {
@@ -494,7 +515,59 @@ export class WorkflowEngine {
     if (this._executionQueue) {
       return Promise.resolve(this._executionQueue.enqueue(EXECUTION_JOB_TYPE, { workflowId, triggerData }));
     }
-    return this.execute(workflowId, triggerData);
+
+    // The cap lives HERE and deliberately NOT in execute(). execute() is also
+    // how a `workflow.execute` / `loop.forEach` node runs a SUB-workflow from
+    // inside an already-running execution, and how run()/retryExecution()/
+    // resumeWebhook()/a `respond: 'whenFinished'` webhook run with a caller
+    // awaiting the result. Gating execute() would let a parent hold a slot
+    // while waiting for a child that can never get one -- a self-inflicted
+    // deadlock. This path is the one with no caller waiting and the one an
+    // external burst can actually flood, so it is the correct and safe place
+    // to apply backpressure.
+    if (this._maxConcurrentExecutions > 0 && this._activeDispatched >= this._maxConcurrentExecutions) {
+      if (this._dispatchQueue.length >= this._maxQueuedExecutions) {
+        return Promise.reject(new Error(
+          `Execution backlog full (${this._dispatchQueue.length} queued, ${this._activeDispatched} running): refusing to dispatch workflow '${workflowId}'`
+        ));
+      }
+      return new Promise((resolve, reject) => {
+        this._dispatchQueue.push({ workflowId, triggerData, resolve, reject });
+      });
+    }
+    return this._runDispatched(workflowId, triggerData);
+  }
+
+  /** @private Runs a dispatched execution while holding a concurrency slot. */
+  _runDispatched(workflowId, triggerData) {
+    this._activeDispatched++;
+    return this.execute(workflowId, triggerData).finally(() => {
+      this._activeDispatched--;
+      this._drainDispatchQueue();
+    });
+  }
+
+  /** @private Starts as many queued dispatches as there is now room for. */
+  _drainDispatchQueue() {
+    while (this._dispatchQueue.length > 0 &&
+           (this._maxConcurrentExecutions <= 0 || this._activeDispatched < this._maxConcurrentExecutions)) {
+      const next = this._dispatchQueue.shift();
+      this._runDispatched(next.workflowId, next.triggerData).then(next.resolve, next.reject);
+    }
+  }
+
+  /**
+   * Live dispatch pressure, so an operator can see backpressure happening
+   * instead of inferring it from latency. `queued > 0` means the cap is
+   * actively holding work back.
+   */
+  executionStats() {
+    return {
+      running: this._activeDispatched,
+      queued: this._dispatchQueue.length,
+      maxConcurrent: this._maxConcurrentExecutions,
+      maxQueued: this._maxQueuedExecutions,
+    };
   }
 
   /** Start triggers (cron, polling), the wait.until resume poller, and the execution queue if configured */

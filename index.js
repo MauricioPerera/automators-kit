@@ -98,6 +98,12 @@ via the standard tools/list method.`;
  * @param {object} opts.plugins - Plugin config: { plugins: [...] }
  * @param {boolean} opts.cors - Enable CORS (default: true)
  * @param {boolean} opts.logger - Enable request logging (default: false)
+ * @param {number} [opts.maxConcurrentExecutions] - Cap on trigger-fired
+ *   executions running at once (default 100; 0 disables). Overflow queues
+ *   rather than running, so a burst degrades into a slowdown instead of a
+ *   collapse. Read live pressure via `workflowEngine.executionStats()`.
+ * @param {number} [opts.maxQueuedExecutions] - Cap on that backlog (default
+ *   1000). Past it, dispatch rejects rather than growing without bound.
  * @param {object} [opts.workflowExecutionQueue] - A JobQueue/PostgresJobQueue
  *   instance to distribute triggered/error-workflow execution across
  *   worker processes. See WorkflowEngine's `opts.executionQueue` doc
@@ -176,6 +182,12 @@ export async function createApp(opts = {}) {
     // runs in-process exactly as before. See WorkflowEngine's own opts
     // doc comment for what this does and does not cover.
     executionQueue: opts.workflowExecutionQueue,
+    // Instance-wide backpressure on trigger-fired executions. Defaults to 100
+    // concurrent / 1000 queued inside WorkflowEngine; pass 0 to disable. See
+    // that constructor's comment for why the cap sits on the fire-and-forget
+    // dispatch path and not on execute() itself.
+    maxConcurrentExecutions: opts.maxConcurrentExecutions,
+    maxQueuedExecutions: opts.maxQueuedExecutions,
   });
   await workflowEngine.init();
 

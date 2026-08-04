@@ -530,6 +530,101 @@ describe('error-workflow cascades are bounded', () => {
   }, 15000);
 });
 
+// Instance-wide backpressure (2026-08-04, from the n8n load comparison):
+// without a cap, N simultaneous webhook/cron/poll firings started N
+// simultaneous executions with no queue and no ceiling, so a burst degraded
+// into a collapse rather than a slowdown. n8n caps this
+// (EXECUTIONS_CONCURRENCY_PRODUCTION_LIMIT); the optional executionQueue had a
+// cap but requires Postgres and is opt-in -- the DEFAULT path had none.
+describe('concurrent execution limit', () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  const slowEngine = async (opts) => {
+    const db2 = new DocStore(new MemoryStorageAdapter());
+    const e = new WorkflowEngine(db2, { masterKey: 'test-master-key!!!', ...opts });
+    await e.init();
+    return e;
+  };
+
+  it('caps concurrent dispatched executions without dropping any', async () => {
+    const e = await slowEngine({ maxConcurrentExecutions: 5 });
+    let inFlight = 0, peak = 0, completed = 0;
+    e.nodes.add({
+      type: 'conc.slow', name: 'Slow', category: 'core', inputs: [], outputs: [],
+      handler: async () => { inFlight++; peak = Math.max(peak, inFlight); await sleep(40); inFlight--; completed++; return 1; },
+    });
+    const wf = e.create({ name: 'Burst', nodes: [{ id: 'n', type: 'conc.slow', inputs: {} }] });
+
+    await Promise.all(Array.from({ length: 30 }, () => e._dispatchExecution(wf._id, { trigger: 'webhook' })));
+    expect(peak).toBeLessThanOrEqual(5);
+    expect(completed).toBe(30); // queued, not shed
+  }, 20000);
+
+  // The gate is on _dispatchExecution and deliberately NOT on execute(),
+  // because execute() is also how a sub-workflow runs from INSIDE a running
+  // execution. Gating it would let a parent hold a slot waiting for a child
+  // that can never get one. This test fails by timing out if that ever moves.
+  it('does not deadlock when a dispatched workflow calls a sub-workflow, even at cap 1', async () => {
+    const e = await slowEngine({ maxConcurrentExecutions: 1 });
+    e.nodes.add({
+      type: 'conc.child', name: 'Child', category: 'core', inputs: [], outputs: [],
+      handler: async () => { await sleep(30); return 'child-ran'; },
+    });
+    const child = e.create({ name: 'ConcChild', nodes: [{ id: 'c', type: 'conc.child', inputs: {} }] });
+    const parent = e.create({ name: 'ConcParent', nodes: [{ id: 'call', type: 'workflow.execute', inputs: { workflowId: child._id } }] });
+
+    const exec = await e._dispatchExecution(parent._id, { trigger: 'webhook' });
+    expect(exec.status).toBe('success');
+  }, 15000);
+
+  it('sheds load loudly once the backlog is full, rather than growing without bound', async () => {
+    const e = await slowEngine({ maxConcurrentExecutions: 1, maxQueuedExecutions: 3 });
+    e.nodes.add({
+      type: 'conc.slow2', name: 'Slow2', category: 'core', inputs: [], outputs: [],
+      handler: async () => { await sleep(120); return 1; },
+    });
+    const wf = e.create({ name: 'Shed', nodes: [{ id: 'n', type: 'conc.slow2', inputs: {} }] });
+
+    let rejected = 0;
+    const all = Array.from({ length: 10 }, () => e._dispatchExecution(wf._id, {}).catch((err) => {
+      expect(err.message).toContain('backlog full');
+      rejected++;
+    }));
+    expect(e.executionStats().queued).toBe(3);
+    await Promise.all(all);
+    expect(rejected).toBe(6); // 1 running + 3 queued accepted
+  }, 20000);
+
+  it('reports live pressure so backpressure is observable', async () => {
+    const e = await slowEngine({ maxConcurrentExecutions: 2 });
+    e.nodes.add({
+      type: 'conc.slow3', name: 'Slow3', category: 'core', inputs: [], outputs: [],
+      handler: async () => { await sleep(80); return 1; },
+    });
+    const wf = e.create({ name: 'Stats', nodes: [{ id: 'n', type: 'conc.slow3', inputs: {} }] });
+    const all = Array.from({ length: 5 }, () => e._dispatchExecution(wf._id, {}));
+
+    const mid = e.executionStats();
+    expect(mid.running).toBe(2);
+    expect(mid.queued).toBe(3);
+    expect(mid.maxConcurrent).toBe(2);
+    await Promise.all(all);
+    expect(e.executionStats()).toMatchObject({ running: 0, queued: 0 });
+  }, 20000);
+
+  it('can be disabled with 0 (unbounded, the pre-2026-08-04 behavior)', async () => {
+    const e = await slowEngine({ maxConcurrentExecutions: 0 });
+    let inFlight = 0, peak = 0;
+    e.nodes.add({
+      type: 'conc.slow4', name: 'Slow4', category: 'core', inputs: [], outputs: [],
+      handler: async () => { inFlight++; peak = Math.max(peak, inFlight); await sleep(30); inFlight--; return 1; },
+    });
+    const wf = e.create({ name: 'NoCap', nodes: [{ id: 'n', type: 'conc.slow4', inputs: {} }] });
+    await Promise.all(Array.from({ length: 12 }, () => e._dispatchExecution(wf._id, {})));
+    expect(peak).toBe(12);
+  }, 20000);
+});
+
 describe('Webhook path collision guard', () => {
   it('create() rejects a webhook path already owned by another ACTIVE workflow', () => {
     engine.create({
