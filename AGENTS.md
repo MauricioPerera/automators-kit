@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1207 tests | 0 deps | 27 core modules
+By automators.work | 1224 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -18,12 +18,12 @@ plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
 a2e.js             A2E executor: 19 operations, DAG parallel, middleware, onError
-workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry, persistent per-workflow scratch space (workflow.staticData), optional execution queue for horizontal scaling
+workflow.js        Workflow engine: n8n-style nodes, triggers, credentials, history, DAG-parallel execution, N-way branching (switch/runIf), error workflows, sub-workflows (workflow.execute), persisted wait (wait.until/wait.forWebhook), per-item processing (loop.forEach), per-node retry/backoff, native data table read/write (data.table), failed-execution retry, persistent per-workflow scratch space (workflow.staticData), optional execution queue for horizontal scaling, synchronous webhook response (respond: 'whenFinished'), createdBy/updatedBy attribution
 dag.js             Shared DAG level-scheduling (Kahn's algorithm), used by workflow.js + a2e.js
 nodes.js           Node registry: 21 built-in nodes (core, communication, data, AI)
 triggers.js        Trigger system: manual, webhook, cron, polling with change detection
-credentials.js     Credential vault: AES-256-GCM encrypted storage, OAuth2 (authorization-code + PKCE + refresh), testCredential (verify without running a workflow)
-projects.js        Projects -> Folders -> Workflows: project-scoped roles (owner/editor/viewer), separate from CMS's global roles
+credentials.js     Credential vault: AES-256-GCM encrypted storage, OAuth2 (authorization-code + PKCE + refresh), testCredential (verify without running a workflow), createdBy/updatedBy attribution
+projects.js        Projects -> Folders -> Workflows: project-scoped roles (owner/editor/viewer), separate from CMS's global roles, createdBy/updatedBy attribution
 shell.js           Agent shell: command gateway, parser, pipeline, JQ filter, RBAC
 shell-mcp.js       Exposes shell.js over MCP as 2 fixed tools (shell_help/shell_exec)
 queue.js           Job queue: async, retries, backoff, dead letter, concurrency
@@ -1226,6 +1226,12 @@ const created = await cms.users.createApiKey(userId, 'CI pipeline');
 - GET /api/workflows/credentials - list (no decryption)
 - POST /api/workflows/credentials/:name/test - verify a credential is usable (decrypts, refreshes OAuth2 if near expiry) without running a workflow
 
+Every stored workflow now carries `createdBy`/`updatedBy` (the authenticated caller's user id, stamped
+server-side by the route -- never trusted from the request body). `createdBy` is set once on creation
+and never changes; `updatedBy` is stamped by `PUT`/`toggle`. `POST /api/projects` and `PUT /api/projects/
+:id` (`core/projects.js`) and `POST /api/workflows/credentials` (`core/credentials.js`'s `store()`) work
+the same way -- same reasoning, same "separate trailing param, not part of the whitelisted body" pattern.
+
 ### Agent Shell (command gateway)
 - POST /api/shell/exec - execute command string
 - GET /api/shell/help - interaction protocol
@@ -1594,6 +1600,33 @@ already has in practice, matching n8n's own equivalent (`getWorkflowStaticData`)
 - webhook: `POST /api/workflows/webhook/:path`
 - cron: `{ type: 'cron', config: { expression: '0 9 * * *' } }`
 - poll: `{ type: 'poll', config: { url: '...', interval: 60000 } }`
+
+#### Synchronous webhook response
+
+By default a webhook trigger fires and responds immediately with `{ triggered: workflowId }` --
+execution continues fire-and-forget, the HTTP caller never sees the workflow's own result. Set
+`trigger.config.respond: 'whenFinished'` to make it act as a real synchronous request/response API
+endpoint instead:
+
+```javascript
+engine.create({
+  name: 'API-style workflow',
+  trigger: { type: 'webhook', config: { path: 'compute', respond: 'whenFinished' } },
+  nodes: [{ id: 'n', type: 'set.value', inputs: { value: '{{_trigger.x}}' } }],
+});
+// POST /api/workflows/webhook/compute now responds with { execution }
+// (status/nodeResults/errors -- the same shape POST /:id/run already returns)
+// instead of { triggered }, once the run stops progressing.
+```
+
+Always dispatched directly in-process (`execute()`), NEVER through `opts.executionQueue` -- an HTTP
+caller blocked waiting for a real-time answer can't be handed off to an out-of-process queue worker in
+this design. "Stops progressing" means success, failure, OR a `wait.*` node pausing -- this does NOT
+block until a paused wait later resumes, only until the run itself returns. HTTP status is always 200
+if the call itself completed (matching `POST /:id/run`'s own convention: the workflow's outcome lives
+in `execution.status`, not the HTTP status code) -- a genuine failure to even run (e.g. the workflow
+was deleted mid-flight) still falls through to 500. The secret check (`X-Webhook-Secret`) still applies
+before dispatch either way. Default unset: zero behavior change for every existing webhook.
 
 ### Execution Queue (horizontal scaling)
 
@@ -2504,6 +2537,32 @@ full-suite runs + 20 isolated runs of `db.test.js`/`workflow.test.js`/`integrati
 Also verified live over a real spawned server: an API key authenticates a real request exactly like a
 JWT, a revoked key is rejected, and `workflow.staticData`'s merge survives across two separate real
 executions of the same workflow.
+
+**Synchronous webhook response + createdBy/updatedBy attribution (2026-08-03):** two more gaps closed
+from re-reasoning about the execution/roles pillars. (1) A webhook trigger could only ever fire-and-
+forget — the HTTP caller got `{ triggered: workflowId }` immediately and never saw the workflow's own
+result, so a workflow could never act as a synchronous request/response API endpoint. New
+`trigger.config.respond: 'whenFinished'` (`core/triggers.js`): `TriggerManager` gains an optional
+`opts.onWebhookSync` callback, and `fireWebhook()` calls it instead of the usual fire-and-forget
+`onTrigger` for a webhook registered this way, returning its `Promise<execution>` directly instead of
+the bare `workflowId` string — callers distinguish the two cases with `result instanceof Promise`
+(`routes/workflows.js`'s webhook handler awaits it and responds with `{ execution }`). Always dispatched
+directly via `execute()`, NEVER through `opts.executionQueue` — an HTTP caller blocked waiting for a
+real-time answer can't be handed off to an out-of-process queue worker in this design. Default unset:
+zero behavior change for every existing webhook, verified with a dedicated regression test asserting the
+non-Promise return is preserved. (2) Nothing recorded WHO created or last touched a workflow, project,
+or credential — only `createdAt`/`updatedAt` existed. New `createdBy`/`updatedBy` on all three
+(`WorkflowEngine.create()`/`update()`/`toggle()`, `ProjectManager.createProject()`/`updateProject()`,
+`CredentialVault.store()`/`startOAuth2()`), always a SEPARATE trailing parameter populated server-side
+from `ctx.state.user._id` — deliberately never read from the request body/`definition`/`changes` object,
+since that travels straight from an HTTP request and a client-supplied `createdBy` would let a caller
+impersonate someone else. `createdBy` is set once and immutable after; `updatedBy` is stamped by every
+subsequent mutating call. 17 new regression tests (both features, including one over real HTTP
+confirming a `createdBy` sent in a request body is silently ignored). Verified: 2 full-suite runs + 20
+isolated runs of `workflow.test.js`/`triggers.test.js`/`integration.test.js`, all clean. Also verified
+live over a real spawned server: firing a `whenFinished` webhook returned the real node output in the
+same response, and a freshly created workflow correctly carried the creating user's id as both
+`createdBy` and `updatedBy`.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
