@@ -64,6 +64,32 @@
 
 import { generateId, matchFilter, applyUpdate } from '../core/db.js';
 
+/**
+ * SECURITY (2026-08-04, an audit lead CONFIRMED by running it against a real
+ * Postgres): the table name is interpolated into DDL/DML and, worse, into
+ * `LISTEN ${channel}` — which cannot take a bind parameter, so it went in
+ * completely raw. Verified: constructing a collection named
+ * `x; DROP TABLE canary; --` and calling init() DROPPED the canary table. The
+ * `"${this.table}"` quoting used elsewhere in this file is no defence either:
+ * a name containing a double quote breaks straight out of it.
+ *
+ * A Postgres identifier allowlist is the fix — narrower than
+ * `assertSafeCollectionName`'s `[A-Za-z0-9_-]` because an unquoted identifier
+ * (which `LISTEN` requires) may not contain a hyphen and may not start with a
+ * digit. Anything outside it is refused rather than escaped: escaping invites
+ * a second bug the first time someone edits the escaping.
+ */
+function assertSafeTableName(table) {
+  if (typeof table !== 'string' || !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(table)) {
+    throw new Error(
+      `Invalid table name '${table}': must match [a-zA-Z_][a-zA-Z0-9_]* (it is used as a raw SQL identifier, including in LISTEN, which cannot be parameterized)`
+    );
+  }
+  if (table.length > 63) {
+    throw new Error(`Invalid table name '${table}': exceeds Postgres's 63-character identifier limit`);
+  }
+}
+
 function channelFor(table) {
   return `doc_changes_${table}`;
 }
@@ -74,6 +100,7 @@ export class PostgresCollection {
    * @param {string} table - table name (also used to derive the NOTIFY channel)
    */
   constructor(pool, table) {
+    assertSafeTableName(table);
     this.pool = pool;
     this.table = table;
     this.channel = channelFor(table);
@@ -174,18 +201,50 @@ export class PostgresCollection {
 
   /** Updates the first doc matching filter using core/db.js's applyUpdate. Returns 0 or 1. */
   async update(filter, updateSpec) {
-    let target = null;
+    // CORRECTNESS (2026-08-04, an audit lead CONFIRMED by running it): this
+    // used to read the target from the LOCAL CACHE, compute the new document
+    // in JS, and blind-write the whole thing back. Two processes updating the
+    // same row therefore both read the same starting value and both wrote
+    // their own result -- a classic lost update. Verified against a real
+    // Postgres: two concurrent `$inc: { views: 1 }` from separate processes
+    // left `views = 1`, not 2. The NOTIFY that followed then made both caches
+    // agree on the WRONG value, so nothing surfaced the loss.
+    //
+    // The row is now re-read inside a transaction holding `FOR UPDATE`, so the
+    // read-modify-write is serialized per row by Postgres itself. The filter
+    // still selects the candidate from cache (that is this module's read
+    // model), but the VALUE the update is applied to always comes from the
+    // locked row, which is what makes concurrent operators like $inc correct.
+    let candidate = null;
     for (const doc of this._cache.values()) {
-      if (matchFilter(doc, filter)) { target = doc; break; }
+      if (matchFilter(doc, filter)) { candidate = doc; break; }
     }
-    if (!target) return 0;
+    if (!candidate) return 0;
 
-    const newDoc = applyUpdate(target, updateSpec);
-    newDoc._id = target._id;
-    await this.pool.query(
-      `UPDATE "${this.table}" SET data = $2, updated_at = now() WHERE id = $1`,
-      [newDoc._id, JSON.stringify(newDoc)]
-    );
+    const client = await this.pool.connect();
+    let newDoc;
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        `SELECT data FROM "${this.table}" WHERE id = $1 FOR UPDATE`,
+        [candidate._id]
+      );
+      if (rows.length === 0) { await client.query('ROLLBACK'); return 0; }
+
+      newDoc = applyUpdate(rows[0].data, updateSpec);
+      newDoc._id = candidate._id;
+      await client.query(
+        `UPDATE "${this.table}" SET data = $2, updated_at = now() WHERE id = $1`,
+        [newDoc._id, JSON.stringify(newDoc)]
+      );
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+
     this._cache.set(newDoc._id, newDoc);
     await this._notify('upsert', newDoc._id);
     return 1;
