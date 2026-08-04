@@ -16,6 +16,7 @@ import { userRoutes } from './routes/users.js';
 import { schemaRoutes } from './routes/schema.js';
 import { a2eRoutes } from './routes/a2e.js';
 import { workflowRoutes } from './routes/workflows.js';
+import { createPluginRouteGate } from './routes/middleware.js';
 import { WorkflowEngine } from './core/workflow.js';
 import { Shell } from './core/shell.js';
 import { shellRoutes } from './routes/shell.js';
@@ -263,10 +264,36 @@ export async function createApp(opts = {}) {
   if (opts.plugins) {
     await loadPlugins(cms, opts.plugins, hooks, pluginRegistry, routeRegistry, undefined, workflowEngine.nodes);
 
-    // Mount plugin routes
+    // Mount plugin routes, each behind the auth gate. Applied HERE rather than
+    // asking every plugin to add its own: this is the single point every plugin
+    // router — bundled or third-party, written before or after this gate — must
+    // pass through, so a plugin cannot ship unauthenticated by forgetting
+    // something. See createPluginRouteGate for what was reproduced before it
+    // existed and why the default is `admin`.
+    // Definition lookup, keyed BOTH ways on purpose: PluginRegistry keys by the
+    // name in plugins config, RouteRegistry keys by `definition.name || name`,
+    // and those differ whenever a plugin's exported `name` is not its config
+    // name. Getting this wrong fails closed (no definition -> everything
+    // admin-gated), which is safe but would silently ignore a plugin's declared
+    // public route -- the inbound webhook receiver would 401 against callers
+    // that cannot authenticate. Note `.definition`: `get()` returns a display
+    // wrapper, not the plugin object itself.
+    const definitionsByName = new Map();
+    for (const entry of pluginRegistry.getAll()) {
+      const def = entry.definition || {};
+      definitionsByName.set(entry.name, def);
+      if (def.name) definitionsByName.set(def.name, def);
+    }
+
     for (const [name, pluginRouter] of routeRegistry.getAll()) {
+      const definition = definitionsByName.get(name) || {};
+      pluginRouter.use(createPluginRouteGate(cms, definition));
       router.route(`/api/plugins/${name}`, pluginRouter);
-      console.log(`[API] Plugin routes: /api/plugins/${name}`);
+      const exempt = [
+        ...(definition.publicRoutes || []).map((r) => `${r} (public)`),
+        ...(definition.authRoutes || []).map((r) => `${r} (any user)`),
+      ];
+      console.log(`[API] Plugin routes: /api/plugins/${name} [admin${exempt.length ? '; ' + exempt.join(', ') : ''}]`);
     }
   }
 

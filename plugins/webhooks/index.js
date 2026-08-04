@@ -9,11 +9,21 @@
  */
 
 import { Router, json, error } from '../../core/http.js';
+import { safeFetch } from '../../core/net-guard.js';
 
 export default {
   name: 'webhooks',
   version: '1.0.0',
   description: 'Bidirectional webhooks: send and receive HTTP events',
+
+  // Every other route here is admin-gated by createPluginRouteGate. This one
+  // cannot be: it is the INBOUND receiver, called by an external service that
+  // has no account and no token -- the same situation as the OAuth2 callback
+  // route, where the shared secret/signature is the real protection rather
+  // than an Authorization header. Declared explicitly so that "this endpoint
+  // is unauthenticated" is a visible decision in the plugin's own definition
+  // instead of an accident of how the router happened to be mounted.
+  publicRoutes: ['POST /in/:name'],
 
   setup(api) {
     const webhooks = api.database.createCollection('webhooks');
@@ -60,7 +70,13 @@ export default {
         try {
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), timeout);
-          const res = await fetch(sub.url, { method: 'POST', headers, body, signal: controller.signal });
+          // safeFetch, not fetch: `sub.url` is caller-supplied and stored, so a
+          // raw fetch reached loopback/RFC1918/cloud-metadata destinations and
+          // re-validates nothing on redirect. Reproduced before this change: a
+          // registered webhook delivered a full entry payload to 127.0.0.1.
+          // net-guard already existed, was tested, and was used by five core
+          // modules -- this dispatcher simply had not been pointed at it.
+          const res = await safeFetch(sub.url, { method: 'POST', headers, body, signal: controller.signal });
           clearTimeout(timer);
 
           deliveries.insert({

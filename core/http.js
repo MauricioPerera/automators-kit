@@ -60,7 +60,15 @@ const BAD_REQUEST_MESSAGE = 'Bad Request: malformed percent-encoding in a URL pa
  * Compiles a route pattern like '/entries/:id/publish' into a regex + param names.
  * Supports :param and *wildcard.
  */
-function compilePattern(pattern) {
+// Exported so callers that need to decide something about a route BEFORE the
+// router matches it (notably the plugin auth gate in routes/middleware.js,
+// which runs as middleware and therefore has only a raw path to work with)
+// can ask the same question the Router will ask, instead of hand-rolling a
+// second pattern matcher that drifts from this one. Keeping it private is how
+// `_getNestedValue` in core/db.js ended up with an unguarded duplicate inside
+// plugins/automations -- a hardened helper nothing outside the module could
+// reach gets reimplemented, not reused.
+export function compilePattern(pattern) {
   const paramNames = [];
   const regexStr = pattern
     .replace(/:([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, name) => {

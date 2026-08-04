@@ -3,7 +3,7 @@
  * Auth and role-based access control.
  */
 
-import { error } from '../core/http.js';
+import { error, compilePattern } from '../core/http.js';
 import { hasPermission } from '../core/cms.js';
 
 /**
@@ -51,6 +51,71 @@ export function requireRole(...roles) {
       return error(`Insufficient permissions: requires role ${roles.join(' or ')}, you have '${user.role}'`, 403);
     }
     return next();
+  };
+}
+
+// SECURITY (2026-08-04): plugin routers were mounted RAW —
+// `router.route('/api/plugins/' + name, pluginRouter)` applied no middleware,
+// and not one of the six bundled plugins registered any of its own, so every
+// plugin route was reachable with no Authorization header at all. Reproduced
+// live before this gate, entirely unauthenticated: `POST /api/plugins/webhooks/`
+// registered an outbound webhook pointing at `http://127.0.0.1:<port>/admin`,
+// and creating an entry made the server POST that entry's full content to it.
+// The same worked through `plugins/automations` (`{"leaked":"secret draft"}`
+// arrived at the internal listener). That is two problems at once: SSRF, and a
+// PERSISTENT exfiltration channel any anonymous caller could install and leave
+// running. The other four bundled plugins mount through the identical path and
+// expose audit-log reads, revision reads, revision RESTORE (a write) and search.
+//
+// The gate defaults to `admin` rather than "any authenticated user" because
+// every plugin route in this repo is an administrative surface: it names an
+// outbound destination, defines an automation, or restores content. A viewer
+// who could still register a webhook destination would leave the exfiltration
+// channel open to the lowest-privileged account, which is most of the original
+// finding. Fail closed, and let a plugin widen a specific route deliberately.
+//
+// Two declarations let a plugin opt a route out, both matched with the Router's
+// OWN `compilePattern` so this can never disagree with the matcher that
+// actually dispatches the request:
+//   publicRoutes: ['POST /in/:name']  — no auth at all. Required for genuinely
+//     external callers; `plugins/webhooks`'s inbound receiver is exactly this
+//     case, the same shape as the OAuth2 callback route, where the caller is a
+//     third-party service that has no token and `state`/a signature is the real
+//     protection.
+//   authRoutes:   ['GET /']          — any authenticated user, no role check.
+//
+// Entries are `'<METHOD> <pattern>'`, where the pattern is relative to the
+// plugin's mount prefix (the path a sub-router sees). A malformed entry throws
+// at mount time rather than being skipped, so a typo cannot silently leave a
+// route gated tighter or looser than the author believed.
+export function createPluginRouteGate(cms, definition = {}) {
+  const auth = createAuth(cms);
+  const admin = requireRole('admin');
+
+  const compile = (list, field) => (list || []).map((entry) => {
+    if (typeof entry !== 'string') {
+      throw new Error(`Plugin ${field} entry must be a string like 'POST /in/:name', got ${typeof entry}`);
+    }
+    const sp = entry.indexOf(' ');
+    if (sp === -1) {
+      throw new Error(`Plugin ${field} entry '${entry}' must be '<METHOD> <pattern>', e.g. 'POST /in/:name'`);
+    }
+    const method = entry.slice(0, sp).toUpperCase();
+    const pattern = entry.slice(sp + 1).trim();
+    if (!pattern.startsWith('/')) {
+      throw new Error(`Plugin ${field} entry '${entry}' pattern must start with '/' (it is relative to the plugin mount prefix)`);
+    }
+    return { method, regex: compilePattern(pattern).regex };
+  });
+
+  const publics = compile(definition.publicRoutes, 'publicRoutes');
+  const authOnly = compile(definition.authRoutes, 'authRoutes');
+  const matches = (list, ctx) => list.some((r) => r.method === ctx.method && r.regex.test(ctx.path));
+
+  return async (ctx, next) => {
+    if (matches(publics, ctx)) return next();
+    if (matches(authOnly, ctx)) return auth(ctx, next);
+    return auth(ctx, () => admin(ctx, next));
   };
 }
 

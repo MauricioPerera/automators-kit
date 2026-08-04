@@ -11,6 +11,7 @@
  */
 
 import { Router, json, error } from '../../core/http.js';
+import { safeFetch } from '../../core/net-guard.js';
 
 export default {
   name: 'automations',
@@ -60,7 +61,13 @@ export default {
       switch (action.type) {
         case 'http': {
           const body = interpolate(JSON.stringify(action.body || {}), data);
-          const res = await fetch(action.url, {
+          // safeFetch, not fetch. `action.url` comes from a stored automation
+          // definition, which makes this exactly the "outbound fetch driven by
+          // a workflow definition" that net-guard exists for -- and which the
+          // README already claimed was covered. Reproduced before this change:
+          // an automation action delivered interpolated entry content to
+          // 127.0.0.1 ({"leaked":"secret draft"}).
+          const res = await safeFetch(action.url, {
             method: action.method || 'POST',
             headers: { 'Content-Type': 'application/json', ...(action.headers || {}) },
             body,
@@ -282,7 +289,19 @@ function checkCondition(val, op, expected) {
     case 'lte': return val <= expected;
     case 'contains': return Array.isArray(val) ? val.includes(expected) : String(val).includes(expected);
     case 'exists': return val !== undefined && val !== null;
-    default: return true;
+    // Fail CLOSED. This used to `return true`, so a typo'd or unsupported
+    // operator made the condition PASS -- and conditions are what decide
+    // whether an automation's outbound HTTP action fires, so an unreadable
+    // condition silently ran the action against every record it was written to
+    // exclude. Same failure class as Known Security Gaps items 15-17 and 30,
+    // and the same fix core/db.js's matchFilter already got: an operator that
+    // cannot be applied is refused, never ignored. Throwing rather than
+    // returning false so the mistake is reported instead of quietly matching
+    // nothing -- executeWorkflow already records a failed run with the error.
+    default:
+      throw new Error(
+        `Unknown condition operator '${op}' (supported: eq, ne, gt, gte, lt, lte, contains, exists)`
+      );
   }
 }
 
