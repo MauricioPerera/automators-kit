@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'bun:test';
-import { DocStore, MemoryStorageAdapter } from '../core/db.js';
+import { DocStore, MemoryStorageAdapter, setTableSchema } from '../core/db.js';
 import { WorkflowEngine, validateWorkflowDefinition } from '../core/workflow.js';
 import { NodeRegistry } from '../core/nodes.js';
 import { CredentialVault } from '../core/credentials.js';
@@ -1466,6 +1466,57 @@ describe('Data Table node (data.table)', () => {
     const def = engine.nodes.get('data.table');
     expect(def.category).toBe('core');
     expect(def.inputs.some(i => i.name === 'operation' && i.required)).toBe(true);
+  });
+
+  // Typed data tables (2026-08-04): the node and /api/db/:col go through the
+  // SAME schema registry, so a collection is typed for both surfaces or for
+  // neither. Two surfaces disagreeing about one collection is what made this
+  // node a second path to a privilege escalation earlier.
+  describe('honors a registered table schema', () => {
+    it('rejects an insert that violates the schema', async () => {
+      setTableSchema(db, 'typed_widgets', [
+        { name: 'Name', type: 'text', required: true },
+        { name: 'Qty', type: 'number' },
+      ]);
+      const wf = engine.create({
+        name: 'TypedBad',
+        nodes: [{ id: 'i', type: 'data.table', inputs: { collection: 'typed_widgets', operation: 'insert', data: { Qty: 'not-a-number' } } }],
+      });
+      const exec = await engine.run(wf._id);
+      expect(exec.status).toBe('failed');
+      expect(exec.errors.i).toContain('Validation failed');
+    });
+
+    it('accepts a valid insert', async () => {
+      setTableSchema(db, 'typed_ok', [{ name: 'Name', type: 'text', required: true }]);
+      const wf = engine.create({
+        name: 'TypedGood',
+        nodes: [{ id: 'i', type: 'data.table', inputs: { collection: 'typed_ok', operation: 'insert', data: { Name: 'Ana' } } }],
+      });
+      const exec = await engine.run(wf._id);
+      expect(exec.status).toBe('success');
+      expect(exec.nodeResults.i.data.Name).toBe('Ana');
+    });
+
+    it('validates updates too', async () => {
+      setTableSchema(db, 'typed_upd', [{ name: 'Qty', type: 'number' }]);
+      db.collection('typed_upd').insert({ Qty: 1 });
+      const wf = engine.create({
+        name: 'TypedUpd',
+        nodes: [{ id: 'u', type: 'data.table', inputs: { collection: 'typed_upd', operation: 'update', filter: {}, data: { Qty: 'bad' } } }],
+      });
+      const exec = await engine.run(wf._id);
+      expect(exec.status).toBe('failed');
+      expect(db.collection('typed_upd').findOne({}).Qty).toBe(1); // untouched
+    });
+
+    it('an untyped collection is completely unaffected', async () => {
+      const wf = engine.create({
+        name: 'UntypedStillFree',
+        nodes: [{ id: 'i', type: 'data.table', inputs: { collection: 'untyped_widgets', operation: 'insert', data: { whatever: { deep: 1 } } } }],
+      });
+      expect((await engine.run(wf._id)).status).toBe('success');
+    });
   });
 
   // SECURITY (2026-08-03, full-codebase audit): this node is documented as

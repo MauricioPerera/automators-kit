@@ -12,8 +12,8 @@
  */
 
 import { Router, json, error } from '../core/http.js';
-import { createAuth } from './middleware.js';
-import { isInternalCollectionName, assertSafeCollectionName } from '../core/db.js';
+import { createAuth, requireRole } from './middleware.js';
+import { isInternalCollectionName, assertSafeCollectionName, getTableSchema, setTableSchema, removeTableSchema, listTableSchemas } from '../core/db.js';
 
 // SECURITY (2026-08-03, found reasoning about a "list data tables" feature,
 // not by an audit): every collection this codebase itself manages
@@ -90,6 +90,39 @@ export function collectionRoutes(cms) {
   // internal schema, and they're unreachable through this API anyway now.
   r.get('/', auth, async () => json({ collections: cms.db.collections().filter((n) => !n.startsWith('_')) }));
 
+  // ─── TABLE SCHEMAS ────────────────────────────────────────
+  // Registered BEFORE `/:col/:id` below: `/:col/_schema` has the SAME segment
+  // count, and core/http.js's Router matches in REGISTRATION order, so
+  // declaring it after would make `_schema` be read as a document id. That
+  // exact shadowing bug has bitten this repo more than once.
+  r.get('/_schemas', auth, async () => json({ schemas: listTableSchemas(cms.db) }));
+
+  r.get('/:col/_schema', auth, _blockInternalCollections, async (ctx) => {
+    const table = getTableSchema(cms.db, ctx.params.col);
+    if (!table) return json({ table: ctx.params.col, columns: null, typed: false });
+    return json({ table: ctx.params.col, columns: table.columns, typed: true });
+  });
+
+  // Defining a schema is a structural change, so admin-only -- same bar as
+  // content types. Validation applies to writes made AFTER this; existing rows
+  // are left alone rather than retroactively rejected, so adding a schema is
+  // never destructive.
+  r.put('/:col/_schema', auth, requireRole('admin'), _blockInternalCollections, async (ctx) => {
+    const body = await ctx.json();
+    if (!body?.columns) return error('`columns` is required', 400);
+    try {
+      return json(setTableSchema(cms.db, ctx.params.col, body.columns));
+    } catch (err) {
+      return error(err.message, 400);
+    }
+  });
+
+  r.delete('/:col/_schema', auth, requireRole('admin'), _blockInternalCollections, async (ctx) => {
+    const removed = removeTableSchema(cms.db, ctx.params.col);
+    if (!removed) return error(`No schema registered for collection '${ctx.params.col}'`, 404);
+    return json({ removed: true, table: ctx.params.col });
+  });
+
   // List with query filters
   r.get('/:col', auth, _blockInternalCollections, async (ctx) => {
     const col = cms.db.collection(ctx.params.col);
@@ -159,18 +192,24 @@ export function collectionRoutes(cms) {
     const body = await ctx.json();
     if (!body) return error(`Request body is required (missing, empty, or not valid JSON) for POST /api/db/${ctx.params.col}`, 400);
 
-    const col = cms.db.collection(ctx.params.col);
+    // Typed collection -> validating Table; untyped -> raw collection, exactly
+    // as before. Same helper the `data.table` workflow node uses.
+    const target = getTableSchema(cms.db, ctx.params.col) || cms.db.collection(ctx.params.col);
 
-    // Batch insert
-    if (Array.isArray(body)) {
-      const docs = body.map(item => col.insert(item));
+    try {
+      // Batch insert
+      if (Array.isArray(body)) {
+        const docs = body.map(item => target.insert(item));
+        cms.db.flush();
+        return json({ data: docs, count: docs.length }, 201);
+      }
+
+      const doc = target.insert(body);
       cms.db.flush();
-      return json({ data: docs, count: docs.length }, 201);
+      return json({ data: doc }, 201);
+    } catch (err) {
+      return error(err.message, 400);
     }
-
-    const doc = col.insert(body);
-    cms.db.flush();
-    return json({ data: doc }, 201);
   });
 
   // Update by ID
@@ -182,7 +221,12 @@ export function collectionRoutes(cms) {
     const existing = col.findById(ctx.params.id);
     if (!existing) return error(`Document '${ctx.params.id}' not found in collection '${ctx.params.col}'`, 404);
 
-    col.update({ _id: ctx.params.id }, { $set: body });
+    const target = getTableSchema(cms.db, ctx.params.col) || col;
+    try {
+      target.update({ _id: ctx.params.id }, { $set: body });
+    } catch (err) {
+      return error(err.message, 400);
+    }
     cms.db.flush();
     return json({ data: col.findById(ctx.params.id) });
   });

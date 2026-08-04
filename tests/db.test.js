@@ -4,11 +4,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import {
-  DocStore, Collection, Auth, Table, EncryptedAdapter, FieldCrypto,
-  MemoryStorageAdapter, FileStorageAdapter, HashIndex, SortedIndex,
-  matchFilter, applyUpdate, generateId, createFromTemplate,
-} from '../core/db.js';
+import { DocStore, Collection, Auth, Table, EncryptedAdapter, FieldCrypto, MemoryStorageAdapter, FileStorageAdapter, HashIndex, SortedIndex, matchFilter, applyUpdate, generateId, createFromTemplate, getTableSchema, setTableSchema, removeTableSchema, listTableSchemas } from '../core/db.js';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -1023,5 +1019,101 @@ describe('FieldCrypto salt (FIX-41)', () => {
     expect(enc.startsWith('$enc$')).toBe(true);
     const dec = await crypto.decrypt(enc);
     expect(dec).toBe('secret-value');
+  });
+});
+
+// Typed data tables (2026-08-04, from the n8n comparison): `Table` existed
+// with typed columns, was exported from index.js, and was used by NOTHING --
+// so the data-table surfaces were schemaless while a tested typed
+// implementation sat unwired. These cover the registry that connects them.
+describe('table schema registry', () => {
+  it('an unregistered collection is untyped (null), so callers fall back to raw', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    expect(getTableSchema(db, 'anything')).toBeNull();
+  });
+
+  it('a registered schema yields a validating Table', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    setTableSchema(db, 'people', [{ name: 'Name', type: 'text', required: true }]);
+    const t = getTableSchema(db, 'people');
+    expect(t).not.toBeNull();
+    expect(() => t.insert({})).toThrow(/Name is required/);
+    expect(t.insert({ Name: 'Ana' }).Name).toBe('Ana');
+  });
+
+  it('rejects a malformed schema instead of registering something unusable', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    expect(() => setTableSchema(db, 'x', [])).toThrow(/non-empty/);
+    expect(() => setTableSchema(db, 'x', [{ type: 'text' }])).toThrow(/needs a non-empty `name`/);
+    expect(() => setTableSchema(db, 'x', [{ name: 'a' }])).toThrow(/needs a `type`/);
+    expect(() => setTableSchema(db, '../escape', [{ name: 'a', type: 'text' }])).toThrow(/Invalid collection name/);
+  });
+
+  it('registering a schema does NOT retroactively reject or rewrite existing rows', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    db.collection('legacy').insert({ whatever: 'shape' });
+    setTableSchema(db, 'legacy', [{ name: 'Name', type: 'text', required: true }]);
+    expect(db.collection('legacy').count({})).toBe(1);
+    expect(db.collection('legacy').findOne({}).whatever).toBe('shape');
+  });
+
+  it('removing the schema returns the collection to schemaless, keeping rows', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    setTableSchema(db, 'people', [{ name: 'Name', type: 'text', required: true }]);
+    getTableSchema(db, 'people').insert({ Name: 'Ana' });
+    expect(removeTableSchema(db, 'people')).toBe(true);
+    expect(getTableSchema(db, 'people')).toBeNull();
+    expect(db.collection('people').count({})).toBe(1);
+    expect(removeTableSchema(db, 'people')).toBe(false); // already gone
+  });
+
+  it('lists every registered schema', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    setTableSchema(db, 'a', [{ name: 'x', type: 'text' }]);
+    setTableSchema(db, 'b', [{ name: 'y', type: 'number' }]);
+    expect(listTableSchemas(db).map((s) => s.table).sort()).toEqual(['a', 'b']);
+  });
+});
+
+// CORRECTNESS (2026-08-04, an audit lead confirmed before wiring Table in):
+// Table.update validated `update.$set` only, so every other path wrote
+// unvalidated values into typed columns -- `$inc` with a string produced
+// Age: "30bad" (string concatenation), and a replacement wrote Name: 12345
+// into a text column. Wiring Table to the data-table surfaces would have made
+// the typed guarantee a lie on those paths, so it is fixed here first.
+describe('Table validates the RESULT of an update, not just $set', () => {
+  const typed = () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    const t = new Table(db, 'people', { columns: [
+      { name: 'Name', type: 'text', required: true },
+      { name: 'Age', type: 'number' },
+    ] });
+    return { t, row: t.insert({ Name: 'A', Age: 30 }) };
+  };
+
+  it('rejects $set, $inc AND a whole-document replacement alike', () => {
+    for (const update of [{ $set: { Age: 'bad' } }, { $inc: { Age: 'bad' } }, { Name: 12345, Age: 'bad' }]) {
+      const { t, row } = typed();
+      expect(() => t.update({ _id: row._id }, update)).toThrow(/Validation failed/);
+      expect(t.findById(row._id).Age).toBe(30); // untouched
+    }
+  });
+
+  it('still allows a valid update on every path', () => {
+    const { t, row } = typed();
+    t.update({ _id: row._id }, { $set: { Age: 31 } });
+    expect(t.findById(row._id).Age).toBe(31);
+    t.update({ _id: row._id }, { $inc: { Age: 1 } });
+    expect(t.findById(row._id).Age).toBe(32);
+    t.update({ _id: row._id }, { Name: 'Renamed', Age: 40 });
+    expect(t.findById(row._id)).toMatchObject({ Name: 'Renamed', Age: 40 });
+  });
+
+  it('updateMany validates against every matched document', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    const t = new Table(db, 'p', { columns: [{ name: 'Age', type: 'number' }] });
+    t.insert({ Age: 1 }); t.insert({ Age: 2 });
+    expect(() => t.updateMany({}, { $set: { Age: 'bad' } })).toThrow(/Validation failed/);
+    expect(t.updateMany({}, { $set: { Age: 9 } })).toBe(2);
   });
 });

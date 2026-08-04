@@ -1410,6 +1410,80 @@ function isInternalCollectionName(name) {
   return typeof name === 'string' && name.startsWith('_');
 }
 
+/**
+ * Where table schemas live. Underscore-prefixed, so `isInternalCollectionName`
+ * already keeps it out of the generic `/api/db/:col` surface and the
+ * `data.table` node -- a caller cannot rewrite the schema registry through the
+ * same API the schemas are meant to constrain.
+ */
+const TABLE_SCHEMA_COLLECTION = '_table_schemas';
+
+/**
+ * Returns a validating `Table` for `name` if a schema has been registered for
+ * it, or `null` if none has.
+ *
+ * The data-table surfaces (`core/workflow.js`'s `data.table` node and
+ * `routes/collections.js`) both go through this, so a collection is typed for
+ * BOTH or for neither -- the drift between two surfaces disagreeing about one
+ * collection is exactly what made the `data.table` node a second path to a
+ * privilege escalation earlier (see isInternalCollectionName's comment).
+ *
+ * Untyped collections return `null` and every caller falls back to the raw
+ * `Collection`, so this is additive: nothing changes for a collection that has
+ * no schema, which is all of them until someone defines one.
+ * @param {DocStore} db
+ * @param {string} name
+ * @returns {Table|null}
+ */
+function getTableSchema(db, name) {
+  const doc = db.collection(TABLE_SCHEMA_COLLECTION).findOne({ table: name });
+  if (!doc || !Array.isArray(doc.columns) || doc.columns.length === 0) return null;
+  return new Table(db, name, { columns: doc.columns });
+}
+
+/**
+ * Registers (or replaces) the schema for `name`. Validation applies to writes
+ * made AFTER this point -- existing rows are left exactly as they are rather
+ * than being retroactively rejected or rewritten, which would turn defining a
+ * schema into a destructive operation.
+ */
+function setTableSchema(db, name, columns) {
+  assertSafeCollectionName(name);
+  if (!Array.isArray(columns) || columns.length === 0) {
+    throw new Error(`Table schema for '${name}' needs a non-empty \`columns\` array`);
+  }
+  for (const col of columns) {
+    if (!col || typeof col.name !== 'string' || col.name === '') {
+      throw new Error(`Every column needs a non-empty \`name\` (table '${name}')`);
+    }
+    if (typeof col.type !== 'string' || !col.type) {
+      throw new Error(`Column '${col.name}' needs a \`type\` (table '${name}')`);
+    }
+  }
+  const store = db.collection(TABLE_SCHEMA_COLLECTION);
+  const existing = store.findOne({ table: name });
+  if (existing) store.update({ _id: existing._id }, { $set: { columns, updatedAt: Date.now() } });
+  else store.insert({ table: name, columns, createdAt: Date.now(), updatedAt: Date.now() });
+  db.flush();
+  return { table: name, columns };
+}
+
+/** Removes the schema, returning the collection to schemaless. Rows are kept. */
+function removeTableSchema(db, name) {
+  const store = db.collection(TABLE_SCHEMA_COLLECTION);
+  const existing = store.findOne({ table: name });
+  if (!existing) return false;
+  store.removeById(existing._id);
+  db.flush();
+  return true;
+}
+
+/** Every table that has a registered schema. */
+function listTableSchemas(db) {
+  return db.collection(TABLE_SCHEMA_COLLECTION).find({}).toArray()
+    .map(({ table, columns, createdAt, updatedAt }) => ({ table, columns, createdAt, updatedAt }));
+}
+
 class DocStore {
   constructor(dirOrAdapter) {
     this._adapter = typeof dirOrAdapter === 'string'
@@ -1626,18 +1700,38 @@ class Table {
     return docs.map(d => this.insert(d));
   }
 
-  update(filter, update) {
-    // Validate $set values if present
-    if (update.$set) {
-      this._validate(update.$set, true);
+  /**
+   * Validates the RESULTING document rather than the update operators.
+   *
+   * CORRECTNESS (2026-08-04, from a full-codebase audit lead, confirmed
+   * before wiring Table to the data-table surfaces): this used to check
+   * `update.$set` only, so every other path wrote unvalidated values into
+   * typed columns. Measured on a table with `Name: text(required)` and
+   * `Age: number`: `$inc` with a string produced `Age: "30bad"` (string
+   * concatenation, not even a number), and a whole-document replacement wrote
+   * `Name: 12345` and `Age: "bad"`. Enumerating operators is the wrong shape
+   * for this -- it has to be repeated for every operator that exists now and
+   * every one added later. Computing the would-be document with the same
+   * `applyUpdate` the collection itself uses, then validating THAT, covers
+   * all of them uniformly and cannot drift.
+   * @private
+   */
+  _validateResulting(filter, update, many) {
+    const targets = many ? this._col.find(filter).toArray() : [this._col.findOne(filter)];
+    for (const doc of targets) {
+      if (!doc) continue;
+      // applyUpdate clones internally; this never mutates the stored document.
+      this._validate(applyUpdate(doc, update), true);
     }
+  }
+
+  update(filter, update) {
+    this._validateResulting(filter, update, false);
     return this._col.update(filter, update);
   }
 
   updateMany(filter, update) {
-    if (update.$set) {
-      this._validate(update.$set, true);
-    }
+    this._validateResulting(filter, update, true);
     return this._col.updateMany(filter, update);
   }
 
@@ -2681,4 +2775,9 @@ export {
   generateId,
   isInternalCollectionName,
   assertSafeCollectionName,
+  getTableSchema,
+  setTableSchema,
+  removeTableSchema,
+  listTableSchemas,
+  TABLE_SCHEMA_COLLECTION,
 };

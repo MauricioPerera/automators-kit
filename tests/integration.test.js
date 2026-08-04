@@ -528,6 +528,89 @@ describe('Generic collection API (/api/db) blocks internal collections', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Typed data tables (2026-08-04, from the n8n comparison): `Table` existed
+// with typed columns and was wired to nothing, so data tables were schemaless
+// while a tested typed implementation sat unused.
+// ---------------------------------------------------------------------------
+
+describe('typed data tables over HTTP', () => {
+  let viewerTok;
+
+  beforeAll(async () => {
+    await app.handle(req('POST', '/api/auth/register', {
+      email: 'dt-viewer@test.com', password: 'password1234', name: 'DT Viewer',
+    }));
+    const loginRes = await app.handle(req('POST', '/api/auth/login', {
+      email: 'dt-viewer@test.com', password: 'password1234',
+    }));
+    viewerTok = (await json(loginRes)).token;
+  });
+
+  const cols = [
+    { name: 'Name', type: 'text', required: true },
+    { name: 'Age', type: 'number' },
+  ];
+
+  it('an untyped collection accepts any shape, exactly as before', async () => {
+    const res = await app.handle(req('POST', '/api/db/dt-untyped', { anything: { deep: 1 }, n: 'whatever' }, adminToken));
+    expect(res.status).toBe(201);
+  });
+
+  it('defining a schema is admin-only', async () => {
+    const viewerRes = await app.handle(req('PUT', '/api/db/dt-people/_schema', { columns: cols }, viewerTok));
+    expect(viewerRes.status).toBe(403);
+    const adminRes = await app.handle(req('PUT', '/api/db/dt-people/_schema', { columns: cols }, adminToken));
+    expect(adminRes.status).toBe(200);
+  });
+
+  // `/:col/_schema` has the same segment count as `/:col/:id`, and the Router
+  // matches in registration order -- this asserts it is not read as an id.
+  it('GET /:col/_schema is not shadowed by the /:col/:id catch-all', async () => {
+    await app.handle(req('PUT', '/api/db/dt-shadow/_schema', { columns: cols }, adminToken));
+    const res = await app.handle(req('GET', '/api/db/dt-shadow/_schema', null, adminToken));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.typed).toBe(true);
+    expect(body.columns.map((c) => c.name)).toEqual(['Name', 'Age']);
+  });
+
+  it('validates writes to a typed collection', async () => {
+    await app.handle(req('PUT', '/api/db/dt-valid/_schema', { columns: cols }, adminToken));
+    expect((await app.handle(req('POST', '/api/db/dt-valid', { Name: 'Ana', Age: 30 }, adminToken))).status).toBe(201);
+
+    const missing = await app.handle(req('POST', '/api/db/dt-valid', { Age: 1 }, adminToken));
+    expect(missing.status).toBe(400);
+    expect((await json(missing)).error).toContain('Name is required');
+
+    const wrongType = await app.handle(req('POST', '/api/db/dt-valid', { Name: 'B', Age: 'not-a-number' }, adminToken));
+    expect(wrongType.status).toBe(400);
+  });
+
+  it('validates PUT as well as POST', async () => {
+    await app.handle(req('PUT', '/api/db/dt-upd/_schema', { columns: cols }, adminToken));
+    const created = await json(await app.handle(req('POST', '/api/db/dt-upd', { Name: 'Ana', Age: 30 }, adminToken)));
+    const bad = await app.handle(req('PUT', `/api/db/dt-upd/${created.data._id}`, { Age: 'bad' }, adminToken));
+    expect(bad.status).toBe(400);
+  });
+
+  it('the schema registry itself is not reachable through /api/db', async () => {
+    const res = await app.handle(req('GET', '/api/db/_table_schemas', null, adminToken));
+    expect(res.status).toBe(403);
+  });
+
+  it('removing the schema returns the collection to schemaless, keeping rows', async () => {
+    await app.handle(req('PUT', '/api/db/dt-drop/_schema', { columns: cols }, adminToken));
+    await app.handle(req('POST', '/api/db/dt-drop', { Name: 'Ana' }, adminToken));
+    expect((await app.handle(req('DELETE', '/api/db/dt-drop/_schema', null, adminToken))).status).toBe(200);
+
+    const after = await app.handle(req('POST', '/api/db/dt-drop', { Age: 'anything' }, adminToken));
+    expect(after.status).toBe(201);
+    const rows = await json(await app.handle(req('GET', '/api/db/dt-drop', null, adminToken)));
+    expect(rows.data.length).toBe(2); // the pre-existing row survived
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Content Types
 // ---------------------------------------------------------------------------
 

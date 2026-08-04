@@ -87,7 +87,7 @@
 import { NodeRegistry } from './nodes.js';
 import { TriggerManager, TriggerType } from './triggers.js';
 import { CredentialVault } from './credentials.js';
-import { generateId, isInternalCollectionName } from './db.js';
+import { generateId, isInternalCollectionName, getTableSchema } from './db.js';
 import { buildLevels } from './dag.js';
 
 // Sentinel returned internally when a node's `runIf` guard evaluates false —
@@ -378,6 +378,13 @@ export class WorkflowEngine {
         if (isInternalCollectionName(collection)) {
           throw new Error(`data.table: collection '${collection}' is internal system state and cannot be accessed from a workflow`);
         }
+        // A collection with a registered schema is written through a
+        // validating `Table`; one without behaves exactly as before. Reads go
+        // to the raw collection either way -- validation is a write-time
+        // concern, and routing reads through Table would change nothing except
+        // adding a lookup. Same helper the /api/db routes use, so a collection
+        // is typed for BOTH surfaces or for neither.
+        const table = getTableSchema(this.db, collection);
         const col = this.db.collection(collection);
         const filter = inputs.filter || {};
 
@@ -391,17 +398,18 @@ export class WorkflowEngine {
             return { data };
           }
           case 'insert': {
+            const target = table || col;
             if (Array.isArray(inputs.data)) {
-              const docs = inputs.data.map((d) => col.insert(d));
+              const docs = inputs.data.map((d) => target.insert(d));
               this.db.flush();
               return { data: docs };
             }
-            const doc = col.insert(inputs.data || {});
+            const doc = target.insert(inputs.data || {});
             this.db.flush();
             return { data: doc };
           }
           case 'update': {
-            const count = col.updateMany(filter, { $set: inputs.data || {} });
+            const count = (table || col).updateMany(filter, { $set: inputs.data || {} });
             this.db.flush();
             return { count };
           }
