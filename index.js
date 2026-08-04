@@ -3,8 +3,9 @@
  * Main entry: createApp() returns a fetch-compatible handler.
  */
 
-import { Router, json, cors, logger } from './core/http.js';
+import { Router, json, cors, logger, metricsHandler } from './core/http.js';
 import { CMS } from './core/cms.js';
+import { MetricsRegistry } from './core/metrics.js';
 import { HookSystem, PluginRegistry, RouteRegistry, loadPlugins } from './core/plugins.js';
 import { authRoutes } from './routes/auth.js';
 import { contentTypeRoutes } from './routes/content-types.js';
@@ -98,6 +99,11 @@ via the standard tools/list method.`;
  * @param {object} opts.plugins - Plugin config: { plugins: [...] }
  * @param {boolean} opts.cors - Enable CORS (default: true)
  * @param {boolean} opts.logger - Enable request logging (default: false)
+ * @param {boolean|MetricsRegistry} [opts.metrics] - `true` mounts an
+ *   unauthenticated Prometheus endpoint at GET /metrics (like n8n's own) with
+ *   HTTP counters/durations plus execution and retention gauges. Pass an
+ *   existing MetricsRegistry instead to share one with application code. Unset
+ *   (default): no registry, no route. Restrict it at the network layer.
  * @param {number} [opts.maxConcurrentExecutions] - Cap on trigger-fired
  *   executions running at once (default 100; 0 disables). Overflow queues
  *   rather than running, so a burst degrades into a slowdown instead of a
@@ -139,9 +145,28 @@ export async function createApp(opts = {}) {
   // 4. Build router
   const router = new Router();
 
+  // Prometheus metrics. Every piece of this existed already -- MetricsRegistry
+  // with a Prometheus renderer, metricsHandler() in core/http.js (whose own doc
+  // comment shows exactly this mounting), and logger()'s instrumentation -- and
+  // NOTHING assembled them: createApp called `logger()` with no registry, so the
+  // instrumentation wrote to null and no /metrics route existed. An operator on
+  // createApp() had no way to get metrics without abandoning createApp entirely.
+  //
+  // Opt-in via `metrics: true` (or pass your own registry to share it with
+  // application code). Left unset, nothing is registered and no route is added.
+  const metrics = opts.metrics === true ? new MetricsRegistry()
+    : (opts.metrics instanceof MetricsRegistry ? opts.metrics : null);
+
   // Global middleware
   if (opts.cors !== false) router.use(cors());
-  if (opts.logger) router.use(logger());
+  // The logger is what feeds http_requests_total / http_request_duration_ms, so
+  // enabling metrics enables it even when opts.logger is off -- otherwise
+  // `metrics: true` would silently produce an endpoint with no HTTP metrics in
+  // it. `log: null` keeps that from also turning on request logging nobody asked
+  // for.
+  if (opts.logger || metrics) {
+    router.use(logger({ metrics, ...(opts.logger ? {} : { log: { info() {}, warn() {}, error() {} } }) }));
+  }
 
   // Health check
   router.get('/', async () => json({
@@ -256,12 +281,51 @@ export async function createApp(opts = {}) {
   });
 
   // Execute system:ready hook
+  // GET /metrics, mounted only when metrics are enabled. Registered here
+  // rather than beside the other routes because the engine gauges below need
+  // `workflowEngine` to exist.
+  //
+  // NO AUTH, deliberately and like n8n's own metrics endpoint: a Prometheus
+  // scraper cannot present a JWT. What it exposes is counters and durations
+  // labelled by route PATTERN, never by concrete path, so no ids or user data
+  // appear (see the logger's comment in core/http.js). It should still be
+  // restricted at the network layer -- request volume and error rates are
+  // operational information.
+  if (metrics) {
+    const render = metricsHandler(metrics);
+    const dispatchRunning = metrics.gauge('akit_executions_running', 'Trigger-fired executions currently running');
+    const dispatchQueued = metrics.gauge('akit_executions_queued', 'Trigger-fired executions waiting on the concurrency cap');
+    const storedTotal = metrics.gauge('akit_executions_stored', 'Execution records currently stored');
+    const storedInFlight = metrics.gauge('akit_executions_in_flight', 'Stored executions not yet finished (waiting/running/resuming)');
+
+    router.get('/metrics', async (ctx) => {
+      // Gauges are point-in-time, so they are sampled at SCRAPE time rather
+      // than pushed. These surface the numbers `executionStats()` and
+      // `retentionStats()` already computed -- which until now were only
+      // reachable from code, so the backpressure and retention added earlier
+      // were "observable" with nothing to observe them through.
+      try {
+        const ex = workflowEngine.executionStats();
+        dispatchRunning.set({}, ex.running);
+        dispatchQueued.set({}, ex.queued);
+        const ret = workflowEngine.retentionStats();
+        storedTotal.set({}, ret.total);
+        storedInFlight.set({}, ret.inFlight);
+      } catch (err) {
+        // A failure to sample must not take the whole endpoint down -- the
+        // HTTP counters are still worth serving.
+        console.error('[API] Metrics gauge sampling failed:', err.message);
+      }
+      return render(ctx);
+    });
+  }
+
   await hooks.execute('system:ready', {});
 
   // Start workflow triggers
   workflowEngine.start();
 
-  return { handle: router.handle, cms, router, workflowEngine, shell, projectManager };
+  return { handle: router.handle, cms, router, workflowEngine, shell, projectManager, metrics };
 }
 
 // Re-export core modules for library usage

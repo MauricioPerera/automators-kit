@@ -611,6 +611,90 @@ describe('typed data tables over HTTP', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Prometheus metrics (2026-08-04, from the n8n comparison): MetricsRegistry,
+// metricsHandler() and logger()'s instrumentation all existed and NOTHING
+// assembled them -- createApp called logger() with no registry, so it wrote to
+// null, and no /metrics route existed.
+// ---------------------------------------------------------------------------
+
+describe('metrics endpoint', () => {
+  const mkApp = (metrics) => createApp({ adapter: new MemoryStorageAdapter(), secret: 'metrics-test', metrics });
+
+  it('is absent unless enabled', async () => {
+    const a = await mkApp(undefined);
+    expect((await a.handle(new Request('http://x/metrics'))).status).toBe(404);
+    expect(a.metrics).toBeNull();
+  });
+
+  it('serves Prometheus text when enabled', async () => {
+    const a = await mkApp(true);
+    await a.handle(new Request('http://x/health'));
+    const res = await a.handle(new Request('http://x/metrics'));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('version=0.0.4');
+    const body = await res.text();
+    expect(body).toContain('http_requests_total');
+    expect(body).toContain('route="/health"');
+  });
+
+  // CARDINALITY + PRIVACY: the instrumentation labelled with the CONCRETE
+  // path, so every distinct id became its own time series (unbounded growth in
+  // this process and in any scraper) and ids landed in an endpoint that is
+  // normally scraped without auth.
+  it('labels by route pattern, so distinct ids do not each create a series', async () => {
+    const a = await mkApp(true);
+    for (const id of ['abc123', 'def456', 'ghi789']) {
+      await a.handle(new Request(`http://x/api/entries/id/${id}`));
+    }
+    const body = await (await a.handle(new Request('http://x/metrics'))).text();
+
+    const series = body.split(String.fromCharCode(10)).filter((l) => l.startsWith('http_requests_total') && l.includes('/api/entries'));
+    expect(series.length).toBe(1);                    // one series, not three
+    expect(series[0]).toContain('/api/entries/id/:id');
+    for (const id of ['abc123', 'def456', 'ghi789']) expect(body).not.toContain(id);
+  });
+
+  // Sub-routers hand the inner router a shallow COPY of ctx, so the pattern it
+  // records has to be carried back and re-prefixed. Without that, nearly every
+  // route (they are all mounted under a prefix) reported as <unmatched>,
+  // lumping real traffic in with genuine 404s.
+  it('resolves patterns through mounted sub-routers, not just top-level routes', async () => {
+    const a = await mkApp(true);
+    await a.handle(new Request('http://x/api/entries'));
+    const body = await (await a.handle(new Request('http://x/metrics'))).text();
+    expect(body).toContain('route="/api/entries/"');
+    expect(body.split(String.fromCharCode(10)).filter((l) => l.includes('<unmatched>')).length).toBe(0);
+  });
+
+  it('reserves <unmatched> for requests that really matched no route', async () => {
+    const a = await mkApp(true);
+    await a.handle(new Request('http://x/definitely-not-a-route'));
+    const body = await (await a.handle(new Request('http://x/metrics'))).text();
+    expect(body).toContain('<unmatched>');
+    expect(body).not.toContain('definitely-not-a-route'); // the raw path is not leaked either
+  });
+
+  it('samples engine gauges at scrape time', async () => {
+    const a = await mkApp(true);
+    const body = await (await a.handle(new Request('http://x/metrics'))).text();
+    for (const g of ['akit_executions_running', 'akit_executions_queued',
+                     'akit_executions_stored', 'akit_executions_in_flight']) {
+      expect(body).toContain(g);
+    }
+  });
+
+  it('accepts a caller-supplied registry so app code can share it', async () => {
+    const { MetricsRegistry } = await import('../core/metrics.js');
+    const registry = new MetricsRegistry();
+    registry.counter('my_app_thing', 'from application code').inc({});
+    const a = await createApp({ adapter: new MemoryStorageAdapter(), secret: 's', metrics: registry });
+    expect(a.metrics).toBe(registry);
+    const body = await (await a.handle(new Request('http://x/metrics'))).text();
+    expect(body).toContain('my_app_thing');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Content Types
 // ---------------------------------------------------------------------------
 

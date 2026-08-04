@@ -219,7 +219,16 @@ export class Router {
             subCtx.json = ctx.json;
             subCtx._body = ctx._body;
             const result = await router._handleInternal(subCtx, subPath);
-            if (result) { response = result; break; }
+            if (result) {
+              // Same reason as the copy in _handleInternal: subCtx is a fresh
+              // object, so the pattern the sub-router recorded has to be
+              // carried back and re-prefixed, or every route mounted under a
+              // prefix -- which is nearly all of them -- reports as
+              // `<unmatched>` in the metrics.
+              if (subCtx.routePattern) ctx.routePattern = prefix + subCtx.routePattern;
+              response = result;
+              break;
+            }
           }
         }
 
@@ -255,7 +264,21 @@ export class Router {
       const status = response ? response.status : 0;
       ctx.state._loggerLog.info('request', { method: ctx.method, path: ctx.path, status, ms: Math.round(ms * 10) / 10 });
       if (ctx.state._loggerMetrics) {
-        const labels = { method: ctx.method, path: ctx.path, status: String(status) };
+        // CARDINALITY + PRIVACY (2026-08-04, found while wiring /metrics):
+        // this used to label with `ctx.path`, the CONCRETE path. Every distinct
+        // id then created its own time series -- `/api/entries/id/abc123`,
+        // `/api/entries/id/def456`, ... -- which grows without bound in both
+        // this process and any scraper, the classic way to take Prometheus
+        // down. It also put entry/user/workflow ids INTO the metrics, which
+        // are normally scraped without authentication. Labelling by the route
+        // PATTERN keeps the series count bounded by the number of routes and
+        // carries no ids. Unmatched requests fall back to a single constant
+        // rather than leaking the raw path they asked for.
+        const labels = {
+          method: ctx.method,
+          route: ctx.routePattern || '<unmatched>',
+          status: String(status),
+        };
         ctx.state._loggerMetrics.counter('http_requests_total', 'Total HTTP requests').inc(labels);
         ctx.state._loggerMetrics.histogram('http_request_duration_ms', 'HTTP request duration in ms').observe(labels, ms);
       }
@@ -318,7 +341,16 @@ export class Router {
         const subPath = path.slice(prefix.length) || '/';
         const subCtx = { ...ctx, path: subPath };
         const result = await router._handleInternal(subCtx, subPath);
-        if (result) return result;
+        if (result) {
+          // subCtx is a shallow COPY, so the pattern the sub-router recorded
+          // does not come back on its own -- without this, every route mounted
+          // under a prefix (which is most of them) was reported as
+          // `<unmatched>` in the metrics, lumping real routes in with genuine
+          // 404s. Re-prefixing rebuilds the full pattern; nested sub-routers
+          // compose because each level prefixes what the level below recorded.
+          if (subCtx.routePattern) ctx.routePattern = prefix + subCtx.routePattern;
+          return result;
+        }
       }
     }
 
@@ -355,6 +387,10 @@ export class Router {
   /** @private */
   async _executeRoute(match, ctx) {
     ctx.params = { ...ctx.params, ...match.params };
+    // The route PATTERN (`/api/entries/id/:id`), not the concrete path. Used
+    // as the metrics label -- see the logger's own comment for why the
+    // concrete path is unusable there.
+    ctx.routePattern = match.route.pattern;
     const handlers = match.route.handlers;
 
     let i = 0;

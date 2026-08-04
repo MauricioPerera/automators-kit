@@ -458,8 +458,33 @@ describe('logger()', () => {
     await r.handle(req('GET', '/ping'));
 
     const output = metrics.render();
-    expect(output).toContain('http_requests_total{method="GET",path="/ping",status="200"} 1');
-    expect(output).toContain('http_request_duration_ms_count{method="GET",path="/ping",status="200"} 1');
+    // Label is the route PATTERN, not the concrete path. This assertion used
+    // to read `path="/ping"`; the two are identical for a top-level literal
+    // route, which is exactly why this test never caught that a parameterised
+    // route produced one time series per id (see the parameterised case below).
+    expect(output).toContain('http_requests_total{method="GET",route="/ping",status="200"} 1');
+    expect(output).toContain('http_request_duration_ms_count{method="GET",route="/ping",status="200"} 1');
+  });
+
+  // The case the /ping test above structurally cannot catch: with a
+  // parameterised route, labelling by concrete path produced one time series
+  // per id -- unbounded growth in this process and in any scraper, and ids
+  // written into an endpoint that is normally scraped without auth.
+  it('a parameterised route yields ONE series regardless of how many ids hit it', async () => {
+    const metrics = new MetricsRegistry();
+    const r = new Router();
+    r.use(logger({ metrics, log: { info() {}, warn() {}, error() {} } }));
+    r.get('/items/:id', async () => json({ ok: true }));
+
+    for (const id of ['a1', 'b2', 'c3']) await r.handle(req('GET', `/items/${id}`));
+
+    const output = metrics.render();
+    const series = output.split(String.fromCharCode(10))
+      .filter((l) => l.startsWith('http_requests_total') && l.includes('/items'));
+    expect(series.length).toBe(1);
+    expect(series[0]).toContain('route="/items/:id"');
+    expect(series[0]).toContain('} 3');
+    for (const id of ['a1', 'b2', 'c3']) expect(output).not.toContain(`/items/${id}`);
   });
 
   it('metricsHandler() exposes a registry in Prometheus text format', async () => {
