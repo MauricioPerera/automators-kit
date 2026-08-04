@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1322 tests | 0 deps | 27 core modules
+By automators.work | 1333 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -9,7 +9,7 @@ By automators.work | 1322 tests | 0 deps | 27 core modules
 Core (27 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
 
 db.js              Document DB: MongoDB queries, indices, JWT auth, AES-256-GCM encryption, long-lived API keys
-vector.js          Vector DB: Float32/Int8/Polar3bit/Binary, IVF, Matryoshka, BM25
+vector.js          Vector DB: Float32/Int8/Polar3bit/Binary, IVF (mutation-safe, reports drift via indexStats), Matryoshka, BM25
 hnsw.js            HNSW index: O(log n) approximate nearest neighbor search
 http.js            HTTP router: Request/Response, middleware, params, sub-routers, CORS
 validate.js        Schema validation: types, formats, defaults, middleware
@@ -2589,7 +2589,7 @@ Current posture:
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-21 resolved; open items listed at the end)
+## Known Security Gaps (items 1-24 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -2601,7 +2601,7 @@ section) were spot-checked against current source rather than trusted at face va
 held. Item 7 found yet another way: comparing the platform directly against a specific n8n concept
 (the protected instance owner) rather than an audit or a claims check. Item 8 was found reasoning about a
 small, unrelated feature (listing data-table collection names) and stress-testing the design decision it
-exposed. Items 9-21 came from the full-codebase audit described below — including item 9, which found
+exposed. Items 9-24 came from the full-codebase audit described below — including item 9, which found
 that item 8's own fix was bypassable. Documented first, on request, before any code change each time; all
 fixed shortly after in separate, explicitly-requested passes.
 
@@ -2954,7 +2954,55 @@ to expose" are different questions, and a clean audit of the former says nothing
    surface relies on this check too. Nothing in the suite or examples depended on id-less nodes. 5 new
    tests.
 
-Items 1-4 and 6-21 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+22. **RESOLVED (2026-08-03), MEDIUM.** `core/connector.js`'s timeout did not cover reading the response
+   body. `clearTimeout` ran right after `fetch` resolved — but `fetch` resolves when the response
+   HEADERS arrive, before a single byte of the body is read, so clearing the timer there left the
+   `AbortController` inert for the read. Measured: `timeout: 500` still hanging at **3011ms** against a
+   server that sent `{"a":` and never closed the stream. One slowloris-style upstream could hold a
+   worker (or a queue slot) indefinitely. The timer now spans both phases and is cleared in `finally`,
+   which additionally covers the case where `fetch` itself rejects — the old placement was on the
+   success path only, so a rejected request never cleared its timer. Now aborts at 511ms. 2 new tests.
+   (The auditor also claimed the un-cleared timers stayed armed and held the event loop; that specific
+   sub-claim did NOT reproduce here — 0 pending handles — so it is not counted as a finding, though the
+   `finally` fixes it regardless.)
+23. **RESOLVED (2026-08-03), MEDIUM.** `searchAcross` ranked on per-collection rank rather than true
+   similarity. It min-max normalized EACH collection's results independently before merging, which
+   destroyed the only thing that made them comparable: they all come from the SAME query under the SAME
+   metric and are already on one scale. Every collection's best hit was rescaled to exactly `1.0`
+   however irrelevant, and its worst to `0.0` however good. Measured, querying `[1,0,0]` over a `good`
+   collection (cosines 1.000 / 0.990 / 0.980) and a `junk` one (0.000 / 0.000 / -1.000): the top 3 came
+   back as `junk=1.0, good=1.0, junk=1.0` — two orthogonal vectors tied with the perfect match while
+   the 0.99 and 0.98 hits were dropped entirely. The `range > 0 ? … : 1.0` fallback was worse: a
+   collection returning a SINGLE result got `1.0` unconditionally, so a near-opposite vector (cosine
+   **-0.9987**) tied a perfect match and outranked a 0.91 one. Merging on the raw score is both simpler
+   and correct. Recorded in the code why "fix the normalization" is not the answer: for collections
+   using different embedding models — the only case it could plausibly have been aiming at — min-max
+   over the top-`limit` window is not a valid estimator either; that needs score calibration, which is a
+   different feature. 4 new tests. No existing test locked in the old scores (the one `searchAcross`
+   test asserted only the result count).
+24. **RESOLVED (2026-08-03), HIGH.** The IVF index returned confidently wrong results after any
+   deletion. `assignments` is positional (slot i -> cluster), but `VectorStore.remove()` splices the
+   vector out and renumbers every later position, and nothing invalidated the index — so after a single
+   delete, slot i described a DIFFERENT vector than the one it was clustered from. Measured with 4
+   separated clusters and `numProbes: 1`: deleting one cluster made a query sitting squarely inside
+   another return the WRONG cluster entirely — **recall 0/4**, cosines 0.000-0.003 where the exact scan
+   returned 1.000. That is not the degraded recall an approximate index is allowed to have; it is a
+   wrong answer delivered with full confidence. Fixed by snapshotting the ids at `build()` and resolving
+   each assignment through the CURRENT `idMap`, so positions may shift freely and a removed id is simply
+   skipped.
+   Fixing it surfaced a second case with the same root: vectors ADDED after `build()` have no cluster
+   assignment at all and were invisible to every search — a perfect match added post-build never
+   appeared in the results. They are now included in the sweep rather than dropped, so results stay
+   CORRECT and the cost is speed, proportional to how much was added since the last build. Returning
+   fast and wrong is the exact failure mode this round of fixes is about.
+   `indexStats()` now reports `removedSinceBuild` / `addedSinceBuild` / `stale`, so a due rebuild is
+   observable instead of guesswork — there was previously no comment, flag, or doc mention of IVF
+   staleness anywhere, so this was a hole rather than a documented tradeoff (checked before calling it a
+   bug). An index persisted before the id snapshot falls back to the old positional behavior rather than
+   returning nothing. 6 new tests, including a randomized 120-vector / 40-delete recall check against an
+   exact scan.
+
+Items 1-4 and 6-24 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
@@ -2973,13 +3021,15 @@ and has not been attempted.
 
 **Other audit findings confirmed but not yet fixed** — recorded here rather than dropped, since a finding
 that is real and unlisted is worse than one that is real and known:
-- Reported by auditors, NOT independently reproduced here (so treat as leads, not conclusions):
-  `core/connector.js`'s timeout not covering body reading, IVF index misalignment after deletes,
-  `searchAcross`'s per-collection normalization tying irrelevant results with perfect matches, an
+- Reported by auditors, NOT independently reproduced here (so treat as leads, not conclusions): an
   unbounded error-workflow loop, and the rest of the Postgres integrations (audited by reading only —
   `pg` is not installed here, the same limitation the auditors had on that file).
-  **Track record so far: 3 of the 3 leads that were checked turned out to be real bugs** (items 19-21),
-  so the remaining ones deserve the same treatment rather than being assumed noise.
+  **Track record: 8 of the 8 leads checked so far turned out to be real bugs** (items 19-24), several
+  of them severe. The remaining ones deserve the same treatment rather than being assumed noise.
+  Note on the error-workflow one: the auditor reported that instrumenting it killed their process
+  twice — two `setTimeout` watchdogs never fired at all, because the cascade starves the event loop.
+  Verifying it needs an out-of-process timeout (a spawned child killed from outside), not an in-process
+  watchdog, or it will just hang whoever tries.
 - `core/db.js`'s `$elemMatch` does not match an array of PRIMITIVES against an operator target
   (`{x: [1]}` vs `{x: {$elemMatch: {$gt: 0}}}` → false): the handler wraps each primitive as
   `{'': elem}`, so the target's `$gt` is looked up as a FIELD on that wrapper and resolves to
