@@ -505,6 +505,74 @@ describe('Webhook path collision guard', () => {
   });
 });
 
+describe('Webhook trigger.config.respond: "whenFinished" (synchronous webhook response)', () => {
+  it('default (unset) stays fire-and-forget -- webhookTrigger() returns the workflowId string, unchanged', async () => {
+    const wf = engine.create({
+      name: 'Immediate',
+      trigger: { type: 'webhook', config: { path: 'immediate' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 'ran' } }],
+      active: true,
+    });
+    const result = engine.webhookTrigger('immediate', {}, null);
+    expect(result).toBe(wf._id);
+    expect(result).not.toBeInstanceOf(Promise);
+  });
+
+  it('"whenFinished" makes webhookTrigger() return a Promise that resolves to the real execution', async () => {
+    const wf = engine.create({
+      name: 'Synchronous',
+      trigger: { type: 'webhook', config: { path: 'sync', respond: 'whenFinished' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 'computed-result' } }],
+      active: true,
+    });
+    const result = engine.webhookTrigger('sync', { in: 1 }, null);
+    expect(result).toBeInstanceOf(Promise);
+    const execution = await result;
+    expect(execution.workflowId).toBe(wf._id);
+    expect(execution.status).toBe('success');
+    expect(execution.nodeResults.n.data).toBe('computed-result');
+  });
+
+  it('"whenFinished" resolves with status "failed" (not a rejection) when a node throws', async () => {
+    engine.create({
+      name: 'SyncFails',
+      trigger: { type: 'webhook', config: { path: 'sync-fail', respond: 'whenFinished' } },
+      nodes: [{ id: 'x', type: 'data.table', inputs: { collection: 'w', operation: 'wipe' } }],
+      active: true,
+    });
+    const execution = await engine.webhookTrigger('sync-fail', {}, null);
+    expect(execution.status).toBe('failed');
+    expect(execution.errors.x).toContain("unknown operation 'wipe'");
+  });
+
+  it('"whenFinished" is always direct/in-process, bypassing opts.executionQueue entirely', async () => {
+    let enqueued = 0;
+    const queueingEngine = new WorkflowEngine(db, {
+      executionQueue: { register: () => {}, enqueue: async () => { enqueued++; }, start: () => {}, stop: () => {} },
+    });
+    await queueingEngine.init();
+    queueingEngine.create({
+      name: 'SyncViaQueueingEngine',
+      trigger: { type: 'webhook', config: { path: 'sync-queue-bypass', respond: 'whenFinished' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }],
+      active: true,
+    });
+    const execution = await queueingEngine.webhookTrigger('sync-queue-bypass', {}, null);
+    expect(execution.status).toBe('success');
+    expect(enqueued).toBe(0); // never went through the queue
+  });
+
+  it('the secret check still applies before "whenFinished" dispatches -- a wrong secret returns null, not a Promise', () => {
+    engine.create({
+      name: 'SyncSecret',
+      trigger: { type: 'webhook', config: { path: 'sync-secret', secret: 's3cr3t', respond: 'whenFinished' } },
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }],
+      active: true,
+    });
+    expect(engine.webhookTrigger('sync-secret', {}, 'wrong')).toBeNull();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Security fixes
 // ---------------------------------------------------------------------------

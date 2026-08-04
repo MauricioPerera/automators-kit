@@ -379,6 +379,64 @@ describe('TriggerManager: webhook method + webhookPathTaken', () => {
   });
 });
 
+describe('TriggerManager: webhook config.respond "whenFinished"', () => {
+  it('default (unset config.respond) still fires onTrigger and returns the workflowId string, unchanged', () => {
+    const fired = [];
+    const tm = new TriggerManager({
+      onTrigger: (id, data) => fired.push({ id, data }),
+      onWebhookSync: () => { throw new Error('should not be called'); },
+    });
+    tm.register('wf1', { type: TriggerType.WEBHOOK, config: { path: 'immediate-hook' } });
+    const result = tm.fireWebhook('immediate-hook', { x: 1 });
+    expect(result).toBe('wf1');
+    expect(fired.length).toBe(1);
+  });
+
+  it('respond: "whenFinished" calls onWebhookSync instead of onTrigger, and returns its Promise', async () => {
+    const onTriggerCalls = [];
+    let syncCallArgs = null;
+    const tm = new TriggerManager({
+      onTrigger: (id, data) => onTriggerCalls.push({ id, data }),
+      onWebhookSync: (id, data) => { syncCallArgs = { id, data }; return Promise.resolve({ status: 'success', nodeResults: { n: { data: 42 } } }); },
+    });
+    tm.register('wf1', { type: TriggerType.WEBHOOK, config: { path: 'sync-hook', respond: 'whenFinished' } });
+    const result = tm.fireWebhook('sync-hook', { x: 1 });
+    expect(result).toBeInstanceOf(Promise);
+    expect(onTriggerCalls.length).toBe(0);
+    const execution = await result;
+    expect(execution.status).toBe('success');
+    expect(syncCallArgs.id).toBe('wf1');
+    expect(syncCallArgs.data.trigger).toBe('webhook');
+    expect(syncCallArgs.data.data.x).toBe(1);
+  });
+
+  it('an unrecognized config.respond value behaves as "immediate" (defensive default, not a silent hang)', () => {
+    const fired = [];
+    const tm = new TriggerManager({ onTrigger: (id) => fired.push(id) });
+    tm.register('wf1', { type: TriggerType.WEBHOOK, config: { path: 'typo-hook', respond: 'weHnFinished' } });
+    expect(tm.fireWebhook('typo-hook', {})).toBe('wf1');
+    expect(fired.length).toBe(1);
+  });
+
+  it('respond: "whenFinished" still enforces the secret check before ever calling onWebhookSync', () => {
+    const tm = new TriggerManager({
+      onTrigger: () => {},
+      onWebhookSync: () => { throw new Error('should not be called'); },
+    });
+    tm.register('wf1', { type: TriggerType.WEBHOOK, config: { path: 'sync-secret', secret: 's3cr3t', respond: 'whenFinished' } });
+    expect(tm.fireWebhook('sync-secret', {}, 'wrong')).toBeNull();
+  });
+
+  it('without an onWebhookSync configured, a "whenFinished" webhook falls back to immediate (no crash)', () => {
+    const fired = [];
+    const tm = new TriggerManager({ onTrigger: (id) => fired.push(id) }); // no onWebhookSync
+    tm.register('wf1', { type: TriggerType.WEBHOOK, config: { path: 'no-sync-handler', respond: 'whenFinished' } });
+    const result = tm.fireWebhook('no-sync-handler', {});
+    expect(result).toBe('wf1');
+    expect(fired.length).toBe(1);
+  });
+});
+
 describe('TriggerType constants', () => {
   it('has all types', () => {
     expect(TriggerType.MANUAL).toBe('manual');

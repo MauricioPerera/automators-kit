@@ -26,9 +26,15 @@ export class TriggerManager {
   /**
    * @param {object} opts
    * @param {Function} opts.onTrigger - Called when trigger fires: (workflowId, triggerData) => void
+   * @param {Function} [opts.onWebhookSync] - Called instead of onTrigger for a
+   *   webhook whose trigger.config.respond is 'whenFinished':
+   *   (workflowId, triggerData) => Promise<execution>. Its return value is
+   *   what fireWebhook() resolves to for that case -- see fireWebhook's own
+   *   doc comment for the full contract.
    */
   constructor(opts = {}) {
     this._onTrigger = opts.onTrigger || (() => {});
+    this._onWebhookSync = opts.onWebhookSync || null;
     this._cron = new CronScheduler();
     this._webhooks = new Map();  // "METHOD:path" -> { workflowId, secret, method }
     this._pollers = new Map();   // workflowId -> { timer, config, _failures }
@@ -106,6 +112,12 @@ export class TriggerManager {
           workflowId,
           secret: trigger.config.secret,
           method,
+          // 'immediate' (default, unchanged pre-2026-08-03 behavior): fires
+          // and returns the workflowId right away, execution continues in
+          // the background. 'whenFinished': fireWebhook() instead returns a
+          // Promise for the actual execution (see fireWebhook below) -- lets
+          // a workflow act as a synchronous request/response API endpoint.
+          respond: trigger.config.respond === 'whenFinished' ? 'whenFinished' : 'immediate',
         });
         break;
       }
@@ -164,14 +176,34 @@ export class TriggerManager {
    *    don't-leak-which-case shape as the wrong-secret check below.
    *  @returns {string|null} workflowId on success, null when not found or
    *    rejected (wrong/missing secret). */
+  /**
+   * Fires a registered webhook. Return shape depends on how the webhook was
+   * registered (trigger.config.respond):
+   *  - not found / bad secret: `null`, same as always.
+   *  - 'immediate' (default): the `workflowId` string, same as always --
+   *    execution is dispatched fire-and-forget, the HTTP caller gets an
+   *    immediate ack. Every workflow that existed before this option was
+   *    added behaves exactly as before.
+   *  - 'whenFinished': a `Promise<execution>` -- resolves once execute()
+   *    itself would return (success, failure, OR a wait.* node pausing --
+   *    this does NOT block until a paused wait resumes, only until the run
+   *    stops actively progressing). Always dispatched directly in-process,
+   *    NEVER through opts.executionQueue -- an HTTP caller blocked waiting
+   *    for a real-time answer can't be handed off to an out-of-process
+   *    queue worker in this design.
+   * Callers distinguish the two non-null cases with `result instanceof Promise`.
+   */
   fireWebhook(path, data, providedSecret, method) {
     const entry = this._webhooks.get(this._webhookKey(path, null, method));
     if (!entry) return null;
-    const { workflowId, secret } = entry;
+    const { workflowId, secret, respond } = entry;
     // If the webhook registered a secret, the caller must present an exact match.
     // (Plain comparison — a constant-time compare would be a future hardening.)
     if (secret !== undefined && secret !== null && secret !== '') {
       if (providedSecret !== secret) return null;
+    }
+    if (respond === 'whenFinished' && this._onWebhookSync) {
+      return this._onWebhookSync(workflowId, { trigger: 'webhook', data });
     }
     this._onTrigger(workflowId, { trigger: 'webhook', data });
     return workflowId;

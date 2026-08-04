@@ -49,6 +49,12 @@ export class ProjectManager {
       name,
       description: opts.description || '',
       members: [{ userId: ownerUserId, role: 'owner' }],
+      // Distinct from `members` -- ownership can be transferred/revoked
+      // later (removeMember only refuses stripping the LAST owner, not
+      // reassigning it), so this is the only durable record of who
+      // actually created the project.
+      createdBy: ownerUserId,
+      updatedBy: ownerUserId,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -64,13 +70,14 @@ export class ProjectManager {
     return this._projects.find(filter).sort({ updatedAt: -1 }).toArray();
   }
 
-  updateProject(id, changes) {
+  updateProject(id, changes, updatedBy = null) {
     const project = this._projects.findById(id);
     if (!project) throw new Error(`Project '${id}' not found`);
     const updates = {};
     for (const k of ['name', 'description']) {
       if (changes[k] !== undefined) updates[k] = changes[k];
     }
+    if (updatedBy !== null) updates.updatedBy = updatedBy;
     updates.updatedAt = Date.now();
     this._projects.update({ _id: id }, { $set: updates });
     this.db.flush();

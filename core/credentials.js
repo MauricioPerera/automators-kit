@@ -112,7 +112,13 @@ export class CredentialVault {
    * Store credentials (encrypted).
    * @param {string} name - Credential name (e.g. 'slack', 'openai')
    * @param {object} values - Key-value pairs to encrypt
-   * @param {object} meta - Unencrypted metadata (description, service, projectId)
+   * @param {object} meta - Unencrypted metadata (description, service, projectId, createdBy)
+   * @param {string} [meta.createdBy] - Acting user's id, attribution only.
+   *   Set on the FIRST store() for a given name (immutable after); every
+   *   subsequent store() (create or update) also stamps `updatedBy`. Both
+   *   come from this trailing meta object, never trusted from `values` or
+   *   inferred elsewhere -- same "server-side attribution only" reasoning
+   *   as WorkflowEngine.create()'s `createdBy` param.
    * @param {string} [meta.projectId] - Organizational tag only (see `list()`) --
    *   NOT enforced against core/projects.js's ProjectManager membership, and
    *   NOT checked by `get()`. A workflow that knows a credential's NAME can
@@ -140,6 +146,7 @@ export class CredentialVault {
       if (meta.description !== undefined) set.description = meta.description;
       if (meta.service !== undefined) set.service = meta.service;
       if (meta.projectId !== undefined) set.projectId = meta.projectId;
+      if (meta.createdBy !== undefined) set.updatedBy = meta.createdBy;
       this._col.update({ _id: existing._id }, { $set: set });
     } else {
       this._col.insert({
@@ -148,6 +155,8 @@ export class CredentialVault {
         description: meta.description || '',
         service: meta.service || name,
         projectId: meta.projectId || null,
+        createdBy: meta.createdBy || null,
+        updatedBy: meta.createdBy || null,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       });
@@ -257,6 +266,8 @@ export class CredentialVault {
       projectId: doc.projectId || null,
       type: doc.type || 'basic',
       ...(doc.type === 'oauth2' ? { expiresAt: doc.expiresAt ?? null, pendingAuthorization: !!doc.pendingState } : {}),
+      createdBy: doc.createdBy || null,
+      updatedBy: doc.updatedBy || null,
       createdAt: doc.createdAt,
       updatedAt: doc.updatedAt,
       fields: Object.keys(doc.values || {}),
@@ -301,9 +312,11 @@ export class CredentialVault {
    * @param {string} config.clientSecret
    * @param {string} config.redirectUri
    * @param {string} [config.scope]
+   * @param {string} [createdBy] - Acting user's id, attribution only -- same
+   *   "separate trailing param" reasoning as store()'s meta.createdBy.
    * @returns {Promise<string>} authorizeUrl
    */
-  async startOAuth2(name, config) {
+  async startOAuth2(name, config, createdBy = null) {
     this._ensureInit();
     for (const field of ['authUrl', 'tokenUrl', 'clientId', 'clientSecret', 'redirectUri']) {
       if (!config?.[field]) throw new Error(`startOAuth2: config.${field} is required`);
@@ -324,9 +337,10 @@ export class CredentialVault {
       service: existing?.service || name,
       description: existing?.description || '',
       updatedAt: Date.now(),
+      ...(createdBy !== null ? { updatedBy: createdBy } : {}),
     };
     if (existing) this._col.update({ _id: existing._id }, { $set: doc });
-    else this._col.insert({ ...doc, createdAt: Date.now() });
+    else this._col.insert({ ...doc, createdBy, createdAt: Date.now() });
     this.db.flush();
 
     const url = new URL(config.authUrl);

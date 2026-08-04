@@ -419,6 +419,15 @@ export class WorkflowEngine {
           console.error(`[Workflow] Auto-execution failed for ${workflowId}:`, err.message);
         });
       },
+      // A 'whenFinished' webhook needs the real execution result to answer
+      // the still-open HTTP request with -- always direct/in-process
+      // (execute(), never opts.executionQueue), since the caller is blocked
+      // waiting for a real-time answer, not polling later. If execute()
+      // itself rejects (e.g. the workflow was deleted mid-flight), that
+      // rejection propagates to fireWebhook()'s caller to handle, same as
+      // any other awaited call -- no swallowing here, unlike onTrigger's
+      // fire-and-forget .catch() above.
+      onWebhookSync: (workflowId, triggerData) => this.execute(workflowId, triggerData),
     });
   }
 
@@ -480,7 +489,16 @@ export class WorkflowEngine {
 
   // ─── CRUD ────────────────────────────────────────────────
 
-  create(definition) {
+  /**
+   * @param {object} definition
+   * @param {string} [createdBy] - Acting user's id, for attribution only
+   *   (`createdBy`/`updatedBy` on the stored doc). A SEPARATE trailing
+   *   param, deliberately never read from `definition` -- that object can
+   *   come straight from an HTTP request body (routes/workflows.js), and a
+   *   client-supplied `createdBy` would let a caller impersonate someone
+   *   else. Callers pass the AUTHENTICATED caller's own id here instead.
+   */
+  create(definition, createdBy = null) {
     this._validateNodeIds(definition.nodes || []);
 
     const trigger = definition.trigger || { type: TriggerType.MANUAL };
@@ -513,6 +531,8 @@ export class WorkflowEngine {
       // `errorWorkflow` isn't validated against another workflow existing.
       projectId: definition.projectId || null,
       folderId: definition.folderId || null,
+      createdBy,
+      updatedBy: createdBy,
       createdAt: Date.now(),
       updatedAt: Date.now(),
     });
@@ -538,7 +558,14 @@ export class WorkflowEngine {
     return this._workflows.find(filter).sort({ updatedAt: -1 }).toArray();
   }
 
-  update(id, changes) {
+  /**
+   * @param {string} id
+   * @param {object} changes
+   * @param {string} [updatedBy] - Acting user's id -- same "separate
+   *   trailing param, never trusted from `changes`" reasoning as create()'s
+   *   `createdBy`.
+   */
+  update(id, changes, updatedBy = null) {
     const wf = this._workflows.findById(id);
     if (!wf) throw new Error(`Workflow '${id}' not found`);
 
@@ -563,6 +590,7 @@ export class WorkflowEngine {
     for (const k of ['name', 'description', 'trigger', 'nodes', 'active', 'settings', 'errorWorkflow', 'projectId', 'folderId']) {
       if (changes[k] !== undefined) updates[k] = changes[k];
     }
+    if (updatedBy !== null) updates.updatedBy = updatedBy;
     updates.updatedAt = Date.now();
 
     this._workflows.update({ _id: id }, { $set: updates });
@@ -583,10 +611,10 @@ export class WorkflowEngine {
     this.db.flush();
   }
 
-  toggle(id) {
+  toggle(id, updatedBy = null) {
     const wf = this._workflows.findById(id);
     if (!wf) throw new Error(`Workflow '${id}' not found`);
-    return this.update(id, { active: !wf.active });
+    return this.update(id, { active: !wf.active }, updatedBy);
   }
 
   // ─── EXECUTION ───────────────────────────────────────────

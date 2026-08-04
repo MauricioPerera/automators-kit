@@ -723,6 +723,37 @@ describe('Webhook trigger', () => {
     const successRes = await app.handle(req('GET', `/api/workflows/${wfId}/executions?status=success`, null, adminToken));
     expect((await json(successRes)).executions.length).toBe(0);
   });
+
+  it('trigger.config.respond: "whenFinished" responds with the real execution instead of a bare ack', async () => {
+    const createRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'Sync webhook',
+      trigger: { type: 'webhook', config: { path: 'sync-http-hook', respond: 'whenFinished' } },
+      nodes: [{ id: 'n1', type: 'set.value', inputs: { value: '{{_trigger.msg}}' } }],
+      active: true,
+    }, adminToken));
+    expect(createRes.status).toBe(201);
+
+    const res = await app.handle(req('POST', '/api/workflows/webhook/sync-http-hook', { msg: 'hello-sync' }));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.triggered).toBeUndefined(); // NOT the immediate-mode shape
+    expect(body.execution.status).toBe('success');
+    expect(body.execution.nodeResults.n1.data).toBe('hello-sync');
+  });
+
+  it('a "whenFinished" webhook still responds 200 with an embedded failed status when a node throws (not a 500)', async () => {
+    await app.handle(req('POST', '/api/workflows', {
+      name: 'Sync webhook fails',
+      trigger: { type: 'webhook', config: { path: 'sync-http-fail', respond: 'whenFinished' } },
+      nodes: [{ id: 'n1', type: 'http.request', credentials: 'does-not-exist', inputs: { url: 'http://example.com' } }],
+      active: true,
+    }, adminToken));
+
+    const res = await app.handle(req('POST', '/api/workflows/webhook/sync-http-fail', {}));
+    expect(res.status).toBe(200);
+    const body = await json(res);
+    expect(body.execution.status).toBe('failed');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -969,6 +1000,98 @@ describe('OAuth2', () => {
     const body = await json(res);
     expect(body.ok).toBe(false);
     expect(body.reason).toContain('refresh');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Attribution (createdBy/updatedBy) -- workflows, projects, credentials
+// ---------------------------------------------------------------------------
+
+describe('Attribution (createdBy/updatedBy)', () => {
+  let secondAdminToken, secondAdminId;
+
+  beforeAll(async () => {
+    await app.handle(req('POST', '/api/auth/register', {
+      email: 'attribution-second@test.com', password: 'password1234', name: 'Second',
+    }));
+    const col = app.cms.auth._users;
+    const u = col.findOne({ email: 'attribution-second@test.com' });
+    col.update({ _id: u._id }, { $set: { role: 'admin', roles: ['admin'] } });
+    secondAdminId = u._id;
+    const loginRes = await app.handle(req('POST', '/api/auth/login', {
+      email: 'attribution-second@test.com', password: 'password1234',
+    }));
+    secondAdminToken = (await json(loginRes)).token;
+  });
+
+  it('workflows: createdBy is the creating user, never trusted from the request body', async () => {
+    const res = await app.handle(req('POST', '/api/workflows', {
+      name: 'Attributed workflow',
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }],
+      createdBy: 'someone-else-entirely', // must be ignored -- server-side only
+    }, adminToken));
+    const wf = (await json(res)).workflow;
+    const adminId = (await json(await app.handle(req('GET', '/api/auth/me', null, adminToken)))).user._id;
+    expect(wf.createdBy).toBe(adminId);
+    expect(wf.updatedBy).toBe(adminId);
+  });
+
+  it('workflows: PUT by a different user updates updatedBy, but createdBy stays the original creator', async () => {
+    const createRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'To be edited by someone else',
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }],
+    }, adminToken));
+    const wf = (await json(createRes)).workflow;
+    const adminId = (await json(await app.handle(req('GET', '/api/auth/me', null, adminToken)))).user._id;
+
+    const putRes = await app.handle(req('PUT', `/api/workflows/${wf._id}`, { description: 'edited' }, secondAdminToken));
+    const updated = (await json(putRes)).workflow;
+    expect(updated.createdBy).toBe(adminId); // unchanged
+    expect(updated.updatedBy).toBe(secondAdminId); // the actual editor
+  });
+
+  it('workflows: toggle also stamps updatedBy', async () => {
+    const createRes = await app.handle(req('POST', '/api/workflows', {
+      name: 'Toggled by someone else',
+      nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }],
+      active: false,
+    }, adminToken));
+    const wf = (await json(createRes)).workflow;
+
+    const toggleRes = await app.handle(req('POST', `/api/workflows/${wf._id}/toggle`, {}, secondAdminToken));
+    expect((await json(toggleRes)).workflow.updatedBy).toBe(secondAdminId);
+  });
+
+  it('projects: createdBy is the creating user, and updateProject by a different member stamps updatedBy', async () => {
+    const createRes = await app.handle(req('POST', '/api/projects', { name: 'Attributed Project' }, adminToken));
+    const project = (await json(createRes)).project;
+    const adminId = (await json(await app.handle(req('GET', '/api/auth/me', null, adminToken)))).user._id;
+    expect(project.createdBy).toBe(adminId);
+    expect(project.updatedBy).toBe(adminId);
+
+    // Add secondAdmin as an editor member, then have THEM update the project.
+    await app.handle(req('POST', `/api/projects/${project._id}/members`, { userId: secondAdminId, role: 'editor' }, adminToken));
+    const putRes = await app.handle(req('PUT', `/api/projects/${project._id}`, { description: 'edited by editor' }, secondAdminToken));
+    const updated = (await json(putRes)).project;
+    expect(updated.createdBy).toBe(adminId); // unchanged
+    expect(updated.updatedBy).toBe(secondAdminId);
+  });
+
+  it('credentials: createdBy is set on first store(), updatedBy changes on a later store() by a different admin', async () => {
+    await app.handle(req('POST', '/api/workflows/credentials', { name: 'attributed-cred', values: { token: 'x' } }, adminToken));
+    const adminId = (await json(await app.handle(req('GET', '/api/auth/me', null, adminToken)))).user._id;
+
+    let listRes = await app.handle(req('GET', '/api/workflows/credentials', null, adminToken));
+    let cred = (await json(listRes)).credentials.find(c => c.name === 'attributed-cred');
+    expect(cred.createdBy).toBe(adminId);
+    expect(cred.updatedBy).toBe(adminId);
+
+    // Re-store the same name as the OTHER admin -- an update, not a new credential.
+    await app.handle(req('POST', '/api/workflows/credentials', { name: 'attributed-cred', values: { token: 'y' } }, secondAdminToken));
+    listRes = await app.handle(req('GET', '/api/workflows/credentials', null, adminToken));
+    cred = (await json(listRes)).credentials.find(c => c.name === 'attributed-cred');
+    expect(cred.createdBy).toBe(adminId); // unchanged -- still the original creator
+    expect(cred.updatedBy).toBe(secondAdminId); // the actual last editor
   });
 });
 

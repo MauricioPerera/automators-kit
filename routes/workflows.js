@@ -71,7 +71,7 @@ export function workflowRoutes(cms, engine, projectManager) {
 
   r.post('/', auth, requireRole('admin', 'editor'), validateBody(CreateSchema), async (ctx) => {
     try {
-      const wf = engine.create(ctx.state.body);
+      const wf = engine.create(ctx.state.body, ctx.state.user._id);
       return json({ workflow: wf }, 201);
     } catch (err) {
       return error(err.message, 400);
@@ -81,7 +81,7 @@ export function workflowRoutes(cms, engine, projectManager) {
   r.put('/:id', auth, requireRole('admin', 'editor'), async (ctx) => {
     try {
       const body = await ctx.json();
-      const wf = engine.update(ctx.params.id, body);
+      const wf = engine.update(ctx.params.id, body, ctx.state.user._id);
       return json({ workflow: wf });
     } catch (err) {
       return error(err.message, 400);
@@ -101,7 +101,7 @@ export function workflowRoutes(cms, engine, projectManager) {
   // matching run's bar (a real state-changing action, not a read).
   r.post('/:id/toggle', auth, requireWorkflowProjectRole(engine, projectManager, 'editor'), async (ctx) => {
     try {
-      const wf = engine.toggle(ctx.params.id);
+      const wf = engine.toggle(ctx.params.id, ctx.state.user._id);
       return json({ workflow: wf });
     } catch (err) {
       return error(err.message, 400);
@@ -168,9 +168,25 @@ export function workflowRoutes(cms, engine, projectManager) {
     // isn't registered, the method doesn't match, or the secret is wrong —
     // don't leak which case it is.
     const secret = ctx.req.headers.get('X-Webhook-Secret');
-    const workflowId = engine.webhookTrigger(ctx.params.path, data, secret, ctx.method);
-    if (!workflowId) return error('No workflow registered for this webhook', 404);
-    return json({ triggered: workflowId });
+    const result = engine.webhookTrigger(ctx.params.path, data, secret, ctx.method);
+    if (!result) return error('No workflow registered for this webhook', 404);
+    // trigger.config.respond: 'whenFinished' -- fireWebhook() returns a
+    // Promise<execution> instead of the bare workflowId string in that case
+    // (see TriggerManager.fireWebhook's doc comment). Always 200 here if the
+    // call itself completed -- same convention POST /:id/run already uses:
+    // the HTTP call succeeded in running the workflow; the workflow's OWN
+    // outcome (including 'failed') lives in the response body's
+    // execution.status, not the HTTP status code. A genuine failure to even
+    // run (e.g. the workflow was deleted mid-flight) throws and falls to 500.
+    if (result instanceof Promise) {
+      try {
+        const execution = await result;
+        return json({ execution });
+      } catch (err) {
+        return error(err.message, 500);
+      }
+    }
+    return json({ triggered: result });
   };
   r.get('/webhook/:path', webhookHandler);
   r.post('/webhook/:path', webhookHandler);
@@ -214,7 +230,7 @@ export function workflowRoutes(cms, engine, projectManager) {
   r.post('/credentials', auth, requireRole('admin'), async (ctx) => {
     const body = await ctx.json();
     if (!body?.name || !body?.values) return error('name and values required', 400);
-    await engine.vault.store(body.name, body.values, { description: body.description, service: body.service, projectId: body.projectId });
+    await engine.vault.store(body.name, body.values, { description: body.description, service: body.service, projectId: body.projectId, createdBy: ctx.state.user._id });
     return json({ stored: body.name }, 201);
   });
 
@@ -239,7 +255,7 @@ export function workflowRoutes(cms, engine, projectManager) {
   r.post('/oauth2/:name/start', auth, requireRole('admin'), async (ctx) => {
     const config = await ctx.json();
     try {
-      const authorizeUrl = await engine.vault.startOAuth2(ctx.params.name, config);
+      const authorizeUrl = await engine.vault.startOAuth2(ctx.params.name, config, ctx.state.user._id);
       return json({ authorizeUrl });
     } catch (err) {
       return error(err.message, 400);

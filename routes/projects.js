@@ -54,7 +54,7 @@ export function projectRoutes(cms, projectManager, workflowEngine) {
   r.put('/:id', auth, requireProjectRole(projectManager, 'editor'), async (ctx) => {
     const body = await ctx.json();
     try {
-      return json({ project: projectManager.updateProject(ctx.params.id, body) });
+      return json({ project: projectManager.updateProject(ctx.params.id, body, ctx.state.user._id) });
     } catch (err) {
       return error(err.message, 400);
     }
