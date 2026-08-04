@@ -120,6 +120,13 @@ via the standard tools/list method.`;
  *   FINISHED executions, newest first. Age alone does not bound a burst.
  * @param {number} [opts.retentionIntervalMs] - How often the retention pass
  *   runs when either bound is set (default hourly).
+ * @param {(execution: object) => void|Promise<void>} [opts.onExecutionFinished]
+ *   Called with every execution that reaches a terminal status, whatever
+ *   triggered it. This is how a shared history sidecar such as
+ *   `integrations/postgres-execution-log.js` sees webhook/cron/poll runs,
+ *   which nothing awaits and which its own caller-driven usage therefore
+ *   cannot reach. Fire-and-forget: throwing or rejecting is logged and never
+ *   fails the execution.
  * @param {object} [opts.workflowExecutionQueue] - A JobQueue/PostgresJobQueue
  *   instance to distribute triggered/error-workflow execution across
  *   worker processes. See WorkflowEngine's `opts.executionQueue` doc
@@ -217,6 +224,11 @@ export async function createApp(opts = {}) {
     // runs in-process exactly as before. See WorkflowEngine's own opts
     // doc comment for what this does and does not cover.
     executionQueue: opts.workflowExecutionQueue,
+    // Fires for every finished execution regardless of what started it --
+    // the seam integrations/postgres-execution-log.js needs, since its own
+    // documented `await log.record(await engine.execute(...))` pattern cannot
+    // see trigger-fired runs (nothing awaits those).
+    onExecutionFinished: opts.onExecutionFinished,
     // Instance-wide backpressure on trigger-fired executions. Defaults to 100
     // concurrent / 1000 queued inside WorkflowEngine; pass 0 to disable. See
     // that constructor's comment for why the cap sits on the fire-and-forget

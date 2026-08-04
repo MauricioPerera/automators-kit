@@ -725,6 +725,97 @@ describe('execution retention', () => {
   });
 });
 
+// Observation seam for finished executions (2026-08-04, from the n8n
+// comparison sweep). integrations/postgres-execution-log.js documents its
+// integration as caller-driven -- `await log.record(await engine.execute())`
+// -- which is sound for a manual run and structurally CANNOT see the
+// executions that dominate a real deployment: trigger-fired and
+// error-workflow runs go through _dispatchExecution fire-and-forget, so
+// nothing receives the execution object. A multi-worker setup following that
+// module's own instructions would get a shared history holding only manual runs.
+describe('onExecutionFinished hook', () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const withHook = async (onExecutionFinished) => {
+    const d = new DocStore(new MemoryStorageAdapter());
+    const e = new WorkflowEngine(d, { masterKey: 'test-master-key!!!', onExecutionFinished });
+    await e.init();
+    e.nodes.add({ type: 'hook.ok', name: 'OK', category: 'core', inputs: [], outputs: [], handler: async () => 'done' });
+    e.nodes.add({ type: 'hook.bad', name: 'Bad', category: 'core', inputs: [], outputs: [], handler: async () => { throw new Error('boom'); } });
+    return { d, e };
+  };
+
+  it('fires for a manual run', async () => {
+    const seen = [];
+    const { e } = await withHook((x) => seen.push(x));
+    const wf = e.create({ name: 'HookManual', nodes: [{ id: 'n', type: 'hook.ok', inputs: {} }] });
+    await e.run(wf._id);
+    expect(seen.length).toBe(1);
+    expect(seen[0].status).toBe('success');
+  });
+
+  // The case the documented caller-driven pattern cannot reach.
+  it('fires for a TRIGGER-fired run, which nothing awaits', async () => {
+    const seen = [];
+    const { e } = await withHook((x) => seen.push(x));
+    const wf = e.create({
+      name: 'HookWebhook',
+      nodes: [{ id: 'n', type: 'hook.ok', inputs: {} }],
+      trigger: { type: 'webhook', config: { path: 'hook-test' } },
+      active: true,
+    });
+    e.start();
+    e.webhookTrigger('hook-test', {}, null);
+    await sleep(300);
+    e.stop();
+    expect(seen.length).toBe(1);
+    expect(seen[0].workflowId).toBe(wf._id);
+  }, 10000);
+
+  it('fires for a FAILED execution too', async () => {
+    const seen = [];
+    const { e } = await withHook((x) => seen.push(x));
+    const wf = e.create({ name: 'HookFails', nodes: [{ id: 'n', type: 'hook.bad', inputs: {} }] });
+    await e.run(wf._id);
+    expect(seen.map((x) => x.status)).toEqual(['failed']);
+  });
+
+  it('does NOT fire for an execution that merely paused', async () => {
+    const seen = [];
+    const { e } = await withHook((x) => seen.push(x));
+    const wf = e.create({ name: 'HookPaused', nodes: [{ id: 'w', type: 'wait.forWebhook', inputs: {} }] });
+    const exec = await e.run(wf._id);
+    expect(exec.status).toBe('waiting');
+    expect(seen.length).toBe(0);
+  });
+
+  it('reports an execution carrying a resolvable _id', async () => {
+    const seen = [];
+    const { e } = await withHook((x) => seen.push(x));
+    const wf = e.create({ name: 'HookId', nodes: [{ id: 'n', type: 'hook.ok', inputs: {} }] });
+    await e.run(wf._id);
+    expect(seen[0]._id).toBeTruthy();
+    expect(e.getExecution(seen[0]._id)).not.toBeNull();
+  });
+
+  // An execution must never fail because something downstream wanted to watch it.
+  it('a throwing or rejecting hook does not affect the execution', async () => {
+    const { e } = await withHook(() => { throw new Error('observer exploded'); });
+    const wf = e.create({ name: 'HookThrows', nodes: [{ id: 'n', type: 'hook.ok', inputs: {} }] });
+    expect((await e.run(wf._id)).status).toBe('success');
+
+    const { e: e2 } = await withHook(async () => { throw new Error('async observer exploded'); });
+    const wf2 = e2.create({ name: 'HookRejects', nodes: [{ id: 'n', type: 'hook.ok', inputs: {} }] });
+    expect((await e2.run(wf2._id)).status).toBe('success');
+    await sleep(50); // let the rejection settle so it is caught, not unhandled
+  });
+
+  it('is inert when not configured', async () => {
+    const { e } = await withHook(undefined);
+    const wf = e.create({ name: 'HookNone', nodes: [{ id: 'n', type: 'hook.ok', inputs: {} }] });
+    expect((await e.run(wf._id)).status).toBe('success');
+  });
+});
+
 describe('Webhook path collision guard', () => {
   it('create() rejects a webhook path already owned by another ACTIVE workflow', () => {
     engine.create({

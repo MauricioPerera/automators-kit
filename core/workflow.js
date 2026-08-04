@@ -216,6 +216,11 @@ export class WorkflowEngine {
     this._retentionIntervalMs = opts.retentionIntervalMs ?? 3600000; // hourly
     this._retentionTimer = null;
 
+    // Observation seam for finished executions -- see
+    // _notifyExecutionFinished for why this is a generic callback rather than
+    // an execution-log option.
+    this._onExecutionFinished = opts.onExecutionFinished || null;
+
     this._executionQueue = opts.executionQueue || null;
     if (this._executionQueue) {
       this._executionQueue.register(EXECUTION_JOB_TYPE, async (data) => {
@@ -1096,9 +1101,49 @@ export class WorkflowEngine {
 
     if (!isWaiting) {
       this._maybeTriggerErrorWorkflow(wf, execution, triggerData);
+      this._notifyExecutionFinished(execution);
     }
 
     return execution;
+  }
+
+  /**
+   * Fires `opts.onExecutionFinished` for an execution that reached a terminal
+   * status, whatever started it.
+   *
+   * Why this exists (2026-08-04): `integrations/postgres-execution-log.js`
+   * documents its own integration as caller-driven and deliberately NOT a
+   * change to this file --
+   *
+   *   const exec = await engine.execute(id, data);
+   *   await log.record(exec);
+   *
+   * -- which is sound for a manual `run()`, and structurally CANNOT work for
+   * the executions that dominate a real deployment. Trigger-fired runs
+   * (webhook/cron/poll) and error-workflow runs go through
+   * `_dispatchExecution`, which is fire-and-forget: nothing receives the
+   * execution object, only a `.catch()` is attached. A multi-worker setup
+   * following that module's own instructions would end up with a shared
+   * history containing only the manually-run executions.
+   *
+   * The hook is deliberately GENERIC rather than a `postgresExecutionLog`
+   * option: the engine stays free of any Postgres knowledge (the same reason
+   * that module gives for not touching this file), and the same seam serves
+   * alerting, custom logging or metrics. It is fire-and-forget and its
+   * failures are swallowed after logging -- an execution must never fail
+   * because something downstream wanted to observe it.
+   * @private
+   */
+  _notifyExecutionFinished(execution) {
+    if (!this._onExecutionFinished) return;
+    try {
+      const result = this._onExecutionFinished(execution);
+      if (result && typeof result.then === 'function') {
+        result.catch((err) => console.error('[Workflow] onExecutionFinished failed:', err.message));
+      }
+    } catch (err) {
+      console.error('[Workflow] onExecutionFinished failed:', err.message);
+    }
   }
 
   /**
