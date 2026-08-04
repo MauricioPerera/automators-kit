@@ -3027,8 +3027,18 @@ to expose" are different questions, and a clean audit of the former says nothing
    owning the job. Fencing surfaced a second bug: the dead-letter INSERT was unconditional, so a worker
    that lost its lease would dead-letter the job while the fenced DELETE no-opped, leaving it alive AND
    recorded as dead — reordered to `DELETE ... RETURNING` first, dead-lettering only if that removed our
-   row. **Scope honesty: the Postgres half parses and is reasoned line by line but could NOT be executed
-   (`pg` is not installed here). Only the `core/queue.js` half is verified by running.** 5 new tests.
+   row. 5 new tests.
+   **FOLLOW-UP (2026-08-04) — the Postgres half of this fix was BROKEN, and only running it found that.**
+   It shipped marked "parses and is reasoned line by line but was never executed" (`pg` is not installed
+   in the dev environment). Verified later against a real Postgres 16: the handler ran **SEVEN times**
+   for one job — precisely the bug the heartbeat was added to prevent. Cause: `core/queue.js` floors the
+   heartbeat interval at 50ms, but this file used **1000ms** to avoid hammering the DB. The interval is
+   `leaseMs/3` subject to that floor, so for any `leaseMs` under 3000 the heartbeat beat LESS often than
+   the lease expired — the row went stale before the first beat and the job was re-claimed anyway,
+   defeating the mechanism exactly in the configurations where it mattered most. Now clamped on both
+   ends (never slower than a third of the lease, never faster than 50ms, capped at 30s). One wrong
+   constant silently disabled a three-part mechanism that read as correct; "reasoned line by line" is
+   not verification, and the honest label is what made it worth revisiting.
 20. **RESOLVED (2026-08-03), MEDIUM.** `core/cron.js` ANDed day-of-month with day-of-week; POSIX/Vixie
    cron ORs them when BOTH are restricted. `0 0 1 * 1` means "midnight on the 1st OR any Monday", and it
    fired **once in 2026 instead of 63 times** — anyone pasting a standard crontab line got a schedule
@@ -3139,13 +3149,16 @@ and has not been attempted.
 
 **Other audit findings confirmed but not yet fixed** — recorded here rather than dropped, since a finding
 that is real and unlisted is worse than one that is real and known:
-- The Postgres integrations, audited by READING ONLY — `pg` is not installed here, the same limitation
-  the auditors had on that file. This also covers the Postgres half of item 19's fix: it parses and is
-  reasoned line by line, but was never executed. Treat it as unverified, not as resolved.
+- `integrations/postgres-collection.js` and `integrations/postgres-execution-log.js`, still audited by
+  READING ONLY. `integrations/postgres-queue.js` is NO LONGER in this list — it was verified on
+  2026-08-04 against a real Postgres 16 (a throwaway container, torn down afterwards), which is how the
+  broken heartbeat in item 19 was found. The remaining two have not been through that.
   **Track record: 9 of the 9 leads checked turned out to be real bugs** (items 19-25), several of them
-  severe, and none was noise. That is the reason the Postgres items are left listed rather than assumed
-  fine: the sample so far says an unchecked auditor lead in this codebase is more likely real than not.
-  Verifying them needs a live Postgres, which this environment does not have.
+  severe, and none was noise — and separately, the FIRST piece of read-only-reasoned code that finally
+  got executed turned out to be broken too. Both samples point the same way: in this codebase,
+  unexecuted code and unchecked leads are more likely wrong than fine. `pg` is not installed in the dev
+  environment, so verifying the remaining two means standing up a Postgres, exactly as was done for the
+  queue.
 - `core/db.js`'s `$elemMatch` does not match an array of PRIMITIVES against an operator target
   (`{x: [1]}` vs `{x: {$elemMatch: {$gt: 0}}}` → false): the handler wraps each primitive as
   `{'': elem}`, so the target's `$gt` is looked up as a FIELD on that wrapper and resolves to
