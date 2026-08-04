@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1231 tests | 0 deps | 27 core modules
+By automators.work | 1236 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -2596,7 +2596,9 @@ confirmed by reading the exact code paths, not taken on the auditor's word alone
 way: this session's own audit-summary claims (the "3 full security audits" list in README.md's Security
 section) were spot-checked against current source rather than trusted at face value, and one no longer
 held. Item 7 found yet another way: comparing the platform directly against a specific n8n concept
-(the protected instance owner) rather than an audit or a claims check. Documented first, on request,
+(the protected instance owner) rather than an audit or a claims check. Item 8 — the most severe finding
+in this entire list — was found reasoning about a small, unrelated feature (listing data-table
+collection names) and stress-testing the design decision it exposed. Documented first, on request,
 before any code change each time; all fixed shortly after in separate, explicitly-requested passes.
 
 1. **RESOLVED (2026-08-03).** Unauthenticated privilege escalation via registration. `POST
@@ -2704,8 +2706,43 @@ before any code change each time; all fixed shortly after in separate, explicitl
    2 full-suite runs + 20 isolated runs of `cms.test.js`, all clean. Also verified live over a real
    spawned server: self-demotion and self-deletion of the sole admin both correctly rejected with a clear
    400, and confirmed the guard releases correctly once a second active admin exists.
+8. **RESOLVED (2026-08-03), CRITICAL.** The generic `/api/db/:col` collection API (`routes/collections.js`)
+   required only `auth` — ANY authenticated user, zero role check — and let `:col` be literally any
+   collection name, including every collection this codebase itself manages internally: `_users`,
+   `_sessions`, `_api_keys`, `_workflows`, `_executions`, `_projects`, `_folders`, `_credentials`,
+   `_credentials_meta`, `_queue_jobs`, `_queue_dead`. Reproduced live before the fix, from a freshly
+   self-registered `'viewer'` account (the lowest privilege level, created via ordinary public
+   registration): `GET /api/db/_users` returned every user's `passwordHash`; `PUT /api/db/_users/:id`
+   with `{ role: 'admin' }` self-promoted the very same account to admin, immediately, confirmed via
+   `GET /api/auth/me`. This is the most severe finding in this entire list — worse than items 1-4
+   combined — because it's not a narrower gap in ONE feature, it's a raw path to the underlying
+   collections that sits UNDERNEATH every access-control fix built this session: H1's registration gate,
+   H2/BUG1/BUG2's project gating, item 7's last-admin-lockout guard — all of them, since none of that
+   application-level logic runs when a caller reaches the collection directly through this route. The
+   second independent audit (item 3/4's source) had explicitly verified generic `/api/db` "holds up" —
+   it tested that the CRUD mechanics work correctly, never that its authorization boundary was
+   nonexistent, an important reminder that a feature working correctly and a feature being safe to expose
+   are two different questions. Found reasoning about a small, unrelated feature (a "list data-table
+   collection names" discovery endpoint) and stress-testing what that discovery would actually reveal.
+   Fixed: every `:col`-based route (list/count/get/insert/update/delete, 6 total) now rejects any
+   collection name starting with `_` — the naming convention used consistently for every internal
+   collection across every `core/*.js` module (verified by grepping every `db.collection('...')` call
+   site in the codebase) — with a 403 naming the collection and explaining why. The new discovery
+   endpoint (`GET /api/db/`, wired to `DocStore.collections()`) filters internal names out of its list
+   too. Deliberately does NOT also block the CMS content collections (`contentTypes`/`entries`/
+   `taxonomies`/`terms`, the one naming exception to the underscore convention) — those don't carry
+   security-critical fields like a password hash or a role, and this generic API's own doc comment
+   ("expose any DocStore collection", PostgREST-style) suggests they're its actual intended use;
+   blocking them too would be a separate, narrower scope decision (bypassing granular CMS permissions
+   like `entries:write`, not full instance compromise), noted but not bundled into this fix. 7 new
+   regression tests, including one reproducing both exploits exactly and confirming they're blocked, one
+   confirming every verb rejects every internal collection, and one confirming normal (non-internal)
+   collection access is completely unaffected. Verified: 2 full-suite runs + 20 isolated runs of
+   `integration.test.js`, all clean. Also verified live over a real spawned server reproducing the exact
+   passwordHash-leak and self-promotion exploits, confirming both now return 403 and the account is still
+   just a `'viewer'` afterward.
 
-Items 1-4, 6, and 7 verified: 2 full-suite runs + 20 isolated runs of `integration.test.js`/`cms.test.js`
+Items 1-4 and 6-8 verified: 2 full-suite runs + 20 isolated runs of `integration.test.js`/`cms.test.js`
 each, all clean. Also verified live over real spawned servers/instances, each reproducing the exact
 exploit (or lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately
 as described above (its own test file).
