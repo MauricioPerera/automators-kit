@@ -216,6 +216,17 @@ export class WorkflowEngine {
           trigger: 'workflow',
           data: inputs.data || {},
           _subWorkflowChain: ctx?.callChain || [],
+          // CORRECTNESS (2026-08-03, verified from a full-codebase audit
+          // lead): this used to carry only the call chain, dropping
+          // `_errorDepth`. _maybeTriggerErrorWorkflow reads the depth off the
+          // triggerData it is handed, so every hop through a sub-workflow
+          // reset it to 0 and the `depth >= 5` cap NEVER engaged. With `A`
+          // failing into error workflow `B`, and `B` calling `A` back through
+          // this node, that is an unbounded cascade: measured 6720 executions
+          // of A in 20 seconds, stopped only by killing the process from
+          // outside. (An in-process watchdog cannot even observe it -- the
+          // cascade starves the event loop, so a setTimeout never fires.)
+          _errorDepth: ctx?.errorDepth || 0,
         };
         const subExec = await this.execute(inputs.workflowId, subTriggerData);
         if (subExec.status === 'failed') {
@@ -828,7 +839,10 @@ export class WorkflowEngine {
             creds = await this._vault.get(node.credentials);
             if (!creds) throw new Error(`Credential '${node.credentials}' not found`);
           }
-          return this._executeNodeWithRetry(nodeId, node, resolvedInputs, creds, { callChain: subWorkflowChain }, retryAttempts);
+          // `errorDepth` rides along with `callChain` so a sub-workflow call
+          // can carry it forward -- see the workflow.execute handler and
+          // _maybeTriggerErrorWorkflow for why losing it uncapped the cascade.
+          return this._executeNodeWithRetry(nodeId, node, resolvedInputs, creds, { callChain: subWorkflowChain, errorDepth: execution.trigger?._errorDepth || 0 }, retryAttempts);
         }));
 
         // A `wait.until`/`wait.forWebhook` node in this level pauses the
@@ -1171,6 +1185,14 @@ export class WorkflowEngine {
 
     const errorContext = {
       _errorDepth: depth + 1,
+      // The depth cap above bounds a long chain of DISTINCT error workflows.
+      // This bounds the far more likely shape -- an actual cycle -- using the
+      // machinery execute() already has: appending the failing workflow to the
+      // chain means an error workflow that calls back into it is refused with
+      // `Circular sub-workflow reference` on the first lap rather than the
+      // fifth. Previously the error hop was invisible to cycle detection
+      // because no chain was passed at all.
+      _subWorkflowChain: [...((triggerData && triggerData._subWorkflowChain) || []), wf._id],
       workflow: { id: wf._id, name: wf.name },
       execution: { id: execution._id, status: execution.status },
       error: {

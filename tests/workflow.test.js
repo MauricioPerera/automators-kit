@@ -459,6 +459,77 @@ describe('every node must have an id', () => {
   });
 });
 
+// CORRECTNESS (2026-08-03, verified from a full-codebase audit lead): the
+// `depth >= 5` cap in _maybeTriggerErrorWorkflow reads `_errorDepth` off the
+// triggerData it is handed, but the `workflow.execute` node built its
+// subTriggerData without it -- so every hop through a sub-workflow reset the
+// depth to 0 and the cap NEVER engaged. With A failing into error workflow B,
+// and B calling A back, that is an unbounded cascade: measured 6720 executions
+// of A in 20 seconds, stopped only by killing the process from outside. (An
+// in-process watchdog cannot even observe it -- the cascade starves the event
+// loop, so a setTimeout never fires. That is why this is asserted on execution
+// COUNTS after a bounded sleep rather than with a timer.)
+describe('error-workflow cascades are bounded', () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  it('an A -> B -> A cycle runs A exactly once', async () => {
+    let aRuns = 0;
+    engine.nodes.add({
+      type: 'errloop.boom', name: 'Boom', category: 'core', inputs: [], outputs: [],
+      handler: async () => { aRuns++; throw new Error('boom'); },
+    });
+    const b = engine.create({ name: 'CycleHandler', nodes: [{ id: 'c', type: 'workflow.execute', inputs: { workflowId: 'placeholder' } }] });
+    const a = engine.create({ name: 'CycleFails', nodes: [{ id: 'x', type: 'errloop.boom', inputs: {} }], errorWorkflow: b._id });
+    engine.update(b._id, { nodes: [{ id: 'c', type: 'workflow.execute', inputs: { workflowId: a._id } }] });
+
+    await engine.run(a._id);
+    await sleep(600);
+    expect(aRuns).toBe(1);
+  }, 15000);
+
+  it('still runs a normal error workflow exactly once', async () => {
+    const hits = [];
+    engine.nodes.add({
+      type: 'errloop.boom2', name: 'Boom2', category: 'core', inputs: [], outputs: [],
+      handler: async () => { throw new Error('boom'); },
+    });
+    engine.nodes.add({
+      type: 'errloop.note', name: 'Note', category: 'core', inputs: [], outputs: [],
+      handler: async () => { hits.push(1); return 'ok'; },
+    });
+    const handler = engine.create({ name: 'NormalHandler', nodes: [{ id: 'n', type: 'errloop.note', inputs: {} }] });
+    const failing = engine.create({ name: 'NormalFails', nodes: [{ id: 'x', type: 'errloop.boom2', inputs: {} }], errorWorkflow: handler._id });
+
+    await engine.run(failing._id);
+    await sleep(400);
+    expect(hits.length).toBe(1);
+  }, 15000);
+
+  it('bounds a chain of DISTINCT error workflows by depth', async () => {
+    const runs = {};
+    engine.nodes.add({
+      type: 'errloop.chain', name: 'Chain', category: 'core', inputs: [], outputs: [],
+      handler: async (inputs) => { runs[inputs.tag] = (runs[inputs.tag] || 0) + 1; throw new Error('boom'); },
+    });
+    // W0 -> W1 -> ... -> W9, each failing into the next.
+    const ids = [];
+    for (let i = 9; i >= 0; i--) {
+      const wf = engine.create({
+        name: `Chain_W${i}`,
+        nodes: [{ id: 'x', type: 'errloop.chain', inputs: { tag: `W${i}` } }],
+        errorWorkflow: ids[0] || null,
+      });
+      ids.unshift(wf._id);
+    }
+    await engine.run(ids[0]);
+    await sleep(600);
+
+    const total = Object.values(runs).reduce((a, b) => a + b, 0);
+    expect(total).toBeGreaterThan(1);   // the chain does hand off
+    expect(total).toBeLessThanOrEqual(7); // but the depth cap stops it
+  }, 15000);
+});
+
 describe('Webhook path collision guard', () => {
   it('create() rejects a webhook path already owned by another ACTIVE workflow', () => {
     engine.create({
