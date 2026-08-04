@@ -2,7 +2,7 @@
 
 **Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.**
 
-1224 tests | 0 deps | 27 modules | Bun + Deno + Node.js
+1231 tests | 0 deps | 27 modules | Bun + Deno + Node.js
 
 By [automators.work](https://automators.work)
 
@@ -32,7 +32,7 @@ No `npm install`. Zero dependencies.
 | **hnsw.js** | HNSW index: O(log n) approximate nearest neighbor search (see [`examples/large-catalog-search`](examples/large-catalog-search/), [`examples/agent-memory-hnsw`](examples/agent-memory-hnsw/)) |
 | **http.js** | HTTP router: Web Standard Request/Response, middleware chain, params, sub-routers, CORS |
 | **validate.js** | Schema validation: types, formats, defaults (replaces Zod) |
-| **cms.js** | CMS: content types, entries, taxonomies, terms, users, roles, autosave |
+| **cms.js** | CMS: content types, entries, taxonomies, terms, users, roles, autosave, last-admin lockout protection |
 | **plugins.js** | Plugin system: hooks, capability-based access control, registry (see [`examples/plugin-workflow-nodes`](examples/plugin-workflow-nodes/)) |
 | **portable-text.js** | Rich content: JSON blocks to HTML/Markdown/PlainText, fromMarkdown parser (see [`examples/content-render-workflow`](examples/content-render-workflow/)) |
 | **mcp.js** | MCP server: JSON-RPC 2.0 over stdio, 20 tools for AI agents |
@@ -1091,7 +1091,7 @@ POSTGRES_TEST_URL=postgres://user:pass@host:port/db bun test tests/integrations-
 ## Testing
 
 ```bash
-bun test tests/    # 1224 tests across 83 files, ~35 seconds
+bun test tests/    # 1231 tests across 83 files, ~35 seconds
 ```
 
 83 test files covering all core modules (including `log.js`/`metrics.js`/
@@ -1220,6 +1220,7 @@ deno run --allow-net --allow-read --allow-write --allow-env server-deno.js
 - **2026-08-03 (workflow static data + API keys)**: two more gaps closed on the execution/roles pillars. Workflows had no persistent scratch space across executions (n8n's `getWorkflowStaticData` equivalent) — new `WorkflowEngine.getStaticData`/`setStaticData`/`mergeStaticData` plus a `workflow.staticData` node (`get`/`set`/`merge`), stored on the workflow document, always operating on the currently-executing workflow with no id input needed. Auth had no way to issue a token for a script/CI caller without holding a real user's password — new `Auth.createApiKey`/`listApiKeys`/`revokeApiKey` (`core/db.js`), long-lived `akit_...` tokens (only a SHA-256 hash persisted, raw key shown once), accepted by `verify()` transparently alongside JWTs so every existing auth-middleware caller works unchanged. New routes `POST`/`GET`/`DELETE /api/auth/api-keys`. 22 new regression tests. Verified: 2 full-suite runs + 20 isolated runs of `db.test.js`/`workflow.test.js`/`integration.test.js`, all clean. Also verified live over a real spawned server: an API key authenticates like a JWT, a revoked key is rejected, and static data survives across two separate executions.
 - **2026-08-03 (predictable default workflow credential-vault master key, found verifying this very Security section's own claims)**: this section previously claimed "replaced predictable default secrets (CMS JWT, workflow vault key, credential-vault PBKDF2 salt) with per-instance random values" — true for the CMS JWT secret and the PBKDF2 salt, but NOT true for the workflow vault key reached through `createApp()` (`index.js`, the documented main entry point). `WorkflowEngine` itself already falls back to a correct random master key when none is given — but `createApp()` pre-empted that safe fallback with `masterKey: opts.secret || 'akit-dev-secret'`, the exact same hardcoded string already banned for the CMS JWT secret specifically for being public in source, reintroduced here for a different purpose. Verified live before the fix: two separate no-secret `createApp()` instances had an IDENTICAL vault master key — any credential encrypted under it was trivially decryptable by anyone with the source. Fixed by passing `opts.secret` through as-is, letting `WorkflowEngine`'s own already-correct fallback apply; an explicit `opts.secret` still works as the vault key unchanged. 4 new regression tests. Verified: 2 full-suite runs + 20 isolated runs of `integration.test.js`, all clean. Also verified live: two no-secret instances now get distinct random keys.
 - **2026-08-03 (synchronous webhook response + createdBy/updatedBy attribution)**: two more gaps closed on the execution/roles pillars. A webhook trigger could only ever fire-and-forget — new `trigger.config.respond: 'whenFinished'` makes `POST/GET/.../DELETE /api/workflows/webhook/:path` instead wait for the workflow to stop progressing (success, failure, or a `wait.*` pause) and respond with `{ execution }`, always dispatched directly (never through the execution queue, since an HTTP caller can't be handed off to an out-of-process worker). Default unset: zero behavior change. Also, nothing recorded who created or last touched a workflow, project, or credential — new `createdBy`/`updatedBy` on all three, always stamped server-side from the authenticated caller, never trusted from the request body (a client-supplied `createdBy` is silently ignored). 17 new regression tests. Verified: 2 full-suite runs + 20 isolated runs of `workflow.test.js`/`triggers.test.js`/`integration.test.js`, all clean. Also verified live over a real spawned server: a synchronous webhook returned the real node output in the same response, and a freshly created workflow correctly carried the creator's id.
+- **2026-08-03 (last-admin lockout protection)**: found comparing directly against n8n's protected instance-owner concept rather than an audit — `UserService.update()`/`delete()` (`core/cms.js`) let a caller demote, deactivate, or delete ANY user with zero guard, including the instance's own admin. An accidental self-demotion/deactivation/deletion of the sole admin permanently locked the instance out of every admin action (public registration always creates `viewer`; only an admin can promote anyone), with no recovery path through the API. Fixed: both methods now refuse any change that would leave zero active admins, mirroring `ProjectManager.removeMember`'s existing "refuse to strip the last owner" guard at the instance level; an already-inactive admin doesn't count as a safety net. 7 new regression tests. Verified: 2 full-suite runs + 20 isolated runs of `cms.test.js`, all clean. Also verified live over a real spawned server: self-demotion/self-deletion of the sole admin both correctly rejected, and the guard releases once a second active admin exists.
 - 2 earlier audits, 26 fixes applied
 
 Current security posture:

@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1224 tests | 0 deps | 27 core modules
+By automators.work | 1231 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -13,7 +13,7 @@ vector.js          Vector DB: Float32/Int8/Polar3bit/Binary, IVF, Matryoshka, BM
 hnsw.js            HNSW index: O(log n) approximate nearest neighbor search
 http.js            HTTP router: Request/Response, middleware, params, sub-routers, CORS
 validate.js        Schema validation: types, formats, defaults, middleware
-cms.js             CMS: content types, entries, taxonomies, terms, users, roles
+cms.js             CMS: content types, entries, taxonomies, terms, users, roles, last-admin lockout protection
 plugins.js         Plugins: hooks, capabilities, registry, loader
 portable-text.js   Rich content: JSON blocks to HTML/Markdown/PlainText
 mcp.js             MCP server: JSON-RPC 2.0 stdio, 20 tools
@@ -1201,6 +1201,12 @@ const created = await cms.users.createApiKey(userId, 'CI pipeline');
 
 ### Users (admin)
 - GET/PUT/DELETE /api/users[/:id]
+
+`PUT`/`DELETE` refuse any change that would leave the instance with zero active admins (demoting the
+last admin's role, deactivating them via `isActive: false`, or deleting them) — 400 with a clear
+message, mirroring `ProjectManager.removeMember`'s existing "refuse to strip the last owner" guard at
+the instance level. An inactive admin doesn't count toward the count — they can't log in to help
+recover the instance either.
 
 ### A2E Workflows
 - POST /api/a2e/execute - execute A2E workflow
@@ -2589,8 +2595,9 @@ independently re-verified against the source by the session that requested each 
 confirmed by reading the exact code paths, not taken on the auditor's word alone. Item 6 found a different
 way: this session's own audit-summary claims (the "3 full security audits" list in README.md's Security
 section) were spot-checked against current source rather than trusted at face value, and one no longer
-held. Documented first, on request, before any code change each time; all fixed shortly after in separate,
-explicitly-requested passes.
+held. Item 7 found yet another way: comparing the platform directly against a specific n8n concept
+(the protected instance owner) rather than an audit or a claims check. Documented first, on request,
+before any code change each time; all fixed shortly after in separate, explicitly-requested passes.
 
 1. **RESOLVED (2026-08-03).** Unauthenticated privilege escalation via registration. `POST
    /api/auth/register`'s `RegisterSchema` (`routes/auth.js`) allowed the caller to set `role` to any of
@@ -2682,10 +2689,26 @@ explicitly-requested passes.
    regression tests. Verified: 2 full-suite runs + 20 isolated runs of `integration.test.js`, all clean.
    Also verified live: two no-secret instances now get distinct random keys, and an explicit `opts.secret`
    still works as before.
+7. **RESOLVED (2026-08-03).** No protection against locking an instance out of admin access. Found a
+   different way again: not an audit finding, but a comparison against n8n's protected instance-owner
+   concept (an account that can't be deleted) — `UserService.update()`/`delete()` (`core/cms.js`) let the
+   caller change ANY user's `role` or `isActive`, or delete them outright, with zero guard, even for the
+   instance's OWN admin. An accidental self-demotion, self-deactivation, or self-deletion of the sole
+   admin permanently locks the instance out of every admin action — public registration always creates
+   `'viewer'` (item 1 above), and only an existing admin can promote anyone via this same route, so there
+   is no recovery path through the API at all once that happens. Fixed: both methods now refuse any
+   change that would leave zero ACTIVE admins — `_countOtherActiveAdmins()` counts admins excluding the
+   one being changed, `isActive: { $ne: false }` so an already-inactive admin (can't log in anyway)
+   doesn't count as a safety net. Mirrors `ProjectManager.removeMember`'s existing "refuse to strip the
+   last owner" guard, just at the instance level instead of a project's. 7 new regression tests. Verified:
+   2 full-suite runs + 20 isolated runs of `cms.test.js`, all clean. Also verified live over a real
+   spawned server: self-demotion and self-deletion of the sole admin both correctly rejected with a clear
+   400, and confirmed the guard releases correctly once a second active admin exists.
 
-Items 1-4 and 6 verified: 2 full-suite runs + 20 isolated runs of `integration.test.js` each, all clean.
-Also verified live over real spawned servers/instances, each reproducing the exact exploit before the fix
-and confirming it's blocked after. Item 5 verified separately as described above (its own test file).
+Items 1-4, 6, and 7 verified: 2 full-suite runs + 20 isolated runs of `integration.test.js`/`cms.test.js`
+each, all clean. Also verified live over real spawned servers/instances, each reproducing the exact
+exploit (or lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately
+as described above (its own test file).
 
 ## Known Agent-UX Friction Points
 
