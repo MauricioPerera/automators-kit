@@ -1,14 +1,14 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1341 tests | 0 deps | 27 core modules
+By automators.work | 1361 tests | 0 deps | 27 core modules
 
 ## Architecture
 
 ```
 Core (27 modules, zero deps, vanilla JS, Bun/Deno/Node.js)
 
-db.js              Document DB: MongoDB queries, indices, JWT auth, AES-256-GCM encryption, long-lived API keys
+db.js              Document DB: MongoDB queries, indices, JWT auth, AES-256-GCM encryption, long-lived API keys, optional typed tables (Table + schema registry)
 vector.js          Vector DB: Float32/Int8/Polar3bit/Binary, IVF (mutation-safe, reports drift via indexStats), Matryoshka, BM25
 hnsw.js            HNSW index: O(log n) approximate nearest neighbor search
 http.js            HTTP router: Request/Response, middleware, params, sub-routers, CORS
@@ -1199,6 +1199,16 @@ const created = await cms.users.createApiKey(userId, 'CI pipeline');
 - GET /api/terms/taxonomy/:slug[/tree]
 - GET/POST/PUT/DELETE /api/terms[/id/:id]
 
+### Generic collection API (/api/db)
+- GET /api/db/ - collection names known to this process (internal `_`-prefixed ones filtered out)
+- GET/POST /api/db/:col, GET/PUT/DELETE /api/db/:col/:id, GET /api/db/:col/_count
+- GET /api/db/_schemas - every table with a registered typed-column schema
+- GET /api/db/:col/_schema - that table's columns, or `{ typed: false }` when schemaless
+- PUT /api/db/:col/_schema (admin) - define/replace typed columns; writes after this are validated on
+  BOTH this API and the `data.table` workflow node. Existing rows are left as they are
+- DELETE /api/db/:col/_schema (admin) - back to schemaless, rows kept
+- Internal (`_`-prefixed) collections are rejected with 403 on every one of these
+
 ### Users (admin)
 - GET/PUT/DELETE /api/users[/:id]
 
@@ -1480,13 +1490,33 @@ to the useful payload):
 - `update`/`delete`/`count` return `{ count }` with **no** `data` key — the unwrap only triggers when
   `result.data !== undefined`, so this object survives intact and `{{nodeId.count}}` works as expected.
 
-**Known gap — data tables are SCHEMALESS (2026-08-04, from the n8n comparison, NOT fixed):** both this
-node and `/api/db/:col` operate on a raw `Collection`, so any workflow can write any shape into any
-field. n8n's data tables have typed columns. `core/db.js` already contains a `Table` class with typed
-columns, `required`, `unique` and validation — it is even exported from `index.js` — and NOTHING uses
-it: grepping `new Table(` finds only its own definition and its tests. So the piece needed to close
-this gap exists and is tested; it was simply never wired to the surface that needs it. Recorded here
-rather than left as a verbal observation, since an unlisted gap is one nobody can pick up.
+#### Typed columns (optional)
+
+A collection is SCHEMALESS by default — any workflow may write any shape into any field, unchanged.
+Register a schema and writes get validated, on this node AND on `/api/db/:col`:
+
+```javascript
+import { setTableSchema } from './core/db.js';
+setTableSchema(db, 'people', [
+  { name: 'Name',  type: 'text',   required: true },
+  { name: 'Age',   type: 'number' },
+  { name: 'Email', type: 'email',  unique: true },
+]);
+```
+
+Or over HTTP: `PUT /api/db/:col/_schema { columns: [...] }` (admin), `GET /api/db/:col/_schema`,
+`DELETE /api/db/:col/_schema`, `GET /api/db/_schemas`. Those are registered BEFORE the `/:col/:id`
+catch-all — `/:col/_schema` has the same segment count, and the Router matches in registration order.
+
+Both surfaces go through one `getTableSchema()`, so a collection is typed for BOTH or for neither. Two
+surfaces disagreeing about one collection is exactly what made this node a second path to a privilege
+escalation earlier (see `isInternalCollectionName`), and this keeps them from drifting again.
+
+Additive by design: no schema means the previous behavior exactly; defining one leaves existing rows
+untouched rather than retroactively rejecting them (so it is never destructive); removing one returns
+the table to schemaless with its rows intact. Reads always go to the raw collection — validation is a
+write-time concern. Schemas live in `_table_schemas`, which the underscore convention already keeps out
+of `/api/db` and this node, so the registry cannot be rewritten through the API it constrains.
 
 ### Per-node Retry
 
@@ -2623,6 +2653,19 @@ execution limit (backpressure)" section above for the full contract — in parti
 sub-workflow), which is guarded by a regression test at cap 1. 5 new tests. Verified: 30 simultaneous
 dispatches at cap 5 peak at 5 with all 30 completing; a parent with a sub-workflow completes at cap 1;
 a full backlog sheds the excess with a clear error; `0` restores the previous unbounded behavior.
+
+**Typed data tables (2026-08-04):** the second gap from the n8n comparison. Both data-table surfaces
+(`data.table` and `/api/db/:col`) used a raw `Collection`, so any workflow could write any shape into
+any field, while `core/db.js`'s `Table` — typed columns, `required`, `unique`, validation, exported
+from `index.js` — was wired to NOTHING (`new Table(` appeared only in its own definition and tests).
+`Table` was fixed first: an audit lead said `update()` validated only `$set`, and verifying it showed
+worse — `$inc` with a string produced `Age: "30bad"` and a replacement wrote `Name: 12345` into a text
+column, so wiring it in as-is would have made the typed guarantee a lie. It now validates the RESULTING
+document via the same `applyUpdate` the collection uses, covering every operator uniformly rather than
+enumerating them. A shared schema registry (`getTableSchema`/`setTableSchema`/`removeTableSchema`/
+`listTableSchemas`, stored in `_table_schemas`) is the single decision point for both surfaces — see
+"Typed columns (optional)" above for the full contract and why sharing it matters. Additive
+throughout. 20 new tests; `/api/schema` synced.
 
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
