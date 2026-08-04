@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'bun:test';
-import { CMS } from '../core/cms.js';
+import { CMS, ROLE_PERMISSIONS, hasPermission } from '../core/cms.js';
 import { MemoryStorageAdapter } from '../core/db.js';
 
 let cms;
@@ -426,6 +426,35 @@ describe('JWT secret hardening (FIX-13)', () => {
 // ---------------------------------------------------------------------------
 // EntryService :own scope authorization (FIX-30)
 // ---------------------------------------------------------------------------
+
+// CORRECTNESS (2026-08-03, full-codebase audit): hasPermission collapsed
+// `X:Y:own` -> `X:Y` but not the reverse, so a role holding ONLY the `:own`
+// variant failed every route's base-permission check. The `author` role's
+// entire entry permission set is `:own`, so it was locked out of its own
+// entries -- the role could do nothing at all.
+describe('hasPermission: :own holders satisfy the base permission', () => {
+  it('author holds entries:write:own and now satisfies entries:write', () => {
+    expect(ROLE_PERMISSIONS.author).toContain('entries:write:own');
+    expect(ROLE_PERMISSIONS.author).not.toContain('entries:write');
+    expect(hasPermission({ role: 'author' }, 'entries:write')).toBe(true);
+    expect(hasPermission({ role: 'author' }, 'entries:delete')).toBe(true);
+  });
+
+  it('the exact :own permission still resolves too', () => {
+    expect(hasPermission({ role: 'author' }, 'entries:write:own')).toBe(true);
+  });
+
+  it('does NOT grant a permission the role lacks in either form', () => {
+    expect(hasPermission({ role: 'author' }, 'users:write')).toBe(false);
+    expect(hasPermission({ role: 'author' }, 'content-types:write')).toBe(false);
+    expect(hasPermission({ role: 'viewer' }, 'entries:write')).toBe(false);
+  });
+
+  it('a full holder is unaffected', () => {
+    expect(hasPermission({ role: 'editor' }, 'entries:write')).toBe(true);
+    expect(hasPermission({ role: 'admin' }, 'entries:delete')).toBe(true);
+  });
+});
 
 describe('EntryService :own scope authorization (FIX-30)', () => {
   let authorA, authorB, editor;

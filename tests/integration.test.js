@@ -1194,6 +1194,74 @@ describe('Attribution (createdBy/updatedBy)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The `author` role over real HTTP (2026-08-03, full-codebase audit): the
+// role was dead -- every route asks for the base permission, the role holds
+// only the `:own` variant. Granting the base is only safe because the routes
+// now pass a caller so ownership is actually enforced; both halves are
+// asserted here.
+// ---------------------------------------------------------------------------
+
+describe('author role (:own scope) over HTTP', () => {
+  let authorAToken, authorBToken, entryOfA;
+
+  beforeAll(async () => {
+    await app.handle(req('POST', '/api/content-types', {
+      name: 'AuthorPost', slug: 'author-post',
+      fields: [{ name: 'body', type: 'text' }],
+    }, adminToken));
+
+    const mk = async (email) => {
+      await app.handle(req('POST', '/api/auth/register', { email, password: 'password1234', name: email }));
+      const col = app.cms.auth._users;
+      col.update({ _id: col.findOne({ email })._id }, { $set: { role: 'author' } });
+      const r = await app.handle(req('POST', '/api/auth/login', { email, password: 'password1234' }));
+      return (await json(r)).token;
+    };
+    authorAToken = await mk('author-a@test.com');
+    authorBToken = await mk('author-b@test.com');
+  });
+
+  it('an author can CREATE an entry (was: 403, the role could do nothing)', async () => {
+    const res = await app.handle(req('POST', '/api/entries', {
+      title: 'By author A', contentTypeSlug: 'author-post', content: { body: 'x' },
+    }, authorAToken));
+    expect(res.status).toBe(201);
+    entryOfA = (await json(res)).entry;
+  });
+
+  it('an author can UPDATE their OWN entry', async () => {
+    const res = await app.handle(req('PUT', `/api/entries/id/${entryOfA._id}`, { title: 'Edited by A' }, authorAToken));
+    expect(res.status).toBe(200);
+    expect((await json(res)).entry.title).toBe('Edited by A');
+  });
+
+  it("an author CANNOT update another author's entry (the gate alone would have allowed it)", async () => {
+    const res = await app.handle(req('PUT', `/api/entries/id/${entryOfA._id}`, { title: 'Hijacked by B' }, authorBToken));
+    expect(res.status).toBe(400);
+    expect((await json(res)).error).toContain('not the author');
+
+    const check = await app.handle(req('GET', `/api/entries/id/${entryOfA._id}`));
+    expect((await json(check)).entry.title).toBe('Edited by A'); // unchanged
+  });
+
+  it("an author CANNOT delete another author's entry", async () => {
+    const res = await app.handle(req('DELETE', `/api/entries/id/${entryOfA._id}`, null, authorBToken));
+    expect(res.status).toBe(400);
+    expect((await json(res)).error).toContain('not the author');
+  });
+
+  it('an editor (full scope) can still edit anyone\'s entry, unchanged', async () => {
+    const res = await app.handle(req('PUT', `/api/entries/id/${entryOfA._id}`, { title: 'Edited by admin' }, adminToken));
+    expect(res.status).toBe(200);
+  });
+
+  it('an author still cannot reach an admin-only surface', async () => {
+    const res = await app.handle(req('POST', '/api/content-types', { name: 'Nope', slug: 'nope-author' }, authorAToken));
+    expect(res.status).toBe(403);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Projects -> Folders -> Workflows (project-scoped roles, separate from
 // the CMS-global roles every other describe block above uses)
 // ---------------------------------------------------------------------------
@@ -1440,6 +1508,77 @@ describe('Projects', () => {
     it('GET /executions/:execId for a genuinely nonexistent execution still 404s', async () => {
       const res = await app.handle(req('GET', '/api/workflows/executions/does-not-exist', null, adminToken));
       expect(res.status).toBe(404);
+    });
+  });
+
+  // SECURITY (2026-08-03, full-codebase audit): these routes take BOTH a
+  // project id and a folder/workflow id, gated on the project alone. Since
+  // any authenticated user can create their own project and become its
+  // owner, an attacker passed THEIR project in :id and a VICTIM's id in the
+  // trailing param. All three were reproduced live.
+  describe('cross-tenant IDOR on folder/workflow routes', () => {
+    let thiefToken, thiefProject, thiefFolder, victimProject, victimFolder, victimWorkflow;
+
+    beforeAll(async () => {
+      await app.handle(req('POST', '/api/auth/register', { email: 'thief@test.com', password: 'password1234', name: 'Thief' }));
+      thiefToken = (await json(await app.handle(req('POST', '/api/auth/login', { email: 'thief@test.com', password: 'password1234' })))).token;
+
+      // Victim's project + folder + a workflow filed into it (admin is the owner).
+      victimProject = (await json(await app.handle(req('POST', '/api/projects', { name: 'VictimProj' }, adminToken)))).project;
+      victimFolder = (await json(await app.handle(req('POST', `/api/projects/${victimProject._id}/folders`, { name: 'VictimFolder' }, adminToken)))).folder;
+      victimWorkflow = (await json(await app.handle(req('POST', '/api/workflows', {
+        name: 'VictimWorkflow', nodes: [{ id: 'n', type: 'set.value', inputs: { value: 'secret' } }],
+      }, adminToken)))).workflow;
+      await app.handle(req('POST', `/api/projects/${victimProject._id}/folders/${victimFolder._id}/workflows`,
+        { workflowId: victimWorkflow._id }, adminToken));
+
+      // Attacker's own project + folder (any user may create one and owns it).
+      thiefProject = (await json(await app.handle(req('POST', '/api/projects', { name: 'ThiefProj' }, thiefToken)))).project;
+      thiefFolder = (await json(await app.handle(req('POST', `/api/projects/${thiefProject._id}/folders`, { name: 'ThiefFolder' }, thiefToken)))).folder;
+    });
+
+    it("cannot delete a folder that lives in someone else's project", async () => {
+      const res = await app.handle(req('DELETE', `/api/projects/${thiefProject._id}/folders/${victimFolder._id}`, null, thiefToken));
+      expect(res.status).toBe(404);
+
+      const check = await app.handle(req('GET', `/api/projects/${victimProject._id}/folders`, null, adminToken));
+      expect((await json(check)).folders.some((f) => f._id === victimFolder._id)).toBe(true); // still there
+    });
+
+    it("cannot steal another project's workflow into the attacker's own folder", async () => {
+      const res = await app.handle(req('POST', `/api/projects/${thiefProject._id}/folders/${thiefFolder._id}/workflows`,
+        { workflowId: victimWorkflow._id }, thiefToken));
+      expect(res.status).toBe(403);
+
+      // Ownership unchanged: the victim still reads it, the thief still can't.
+      expect((await app.handle(req('GET', `/api/workflows/${victimWorkflow._id}`, null, adminToken))).status).toBe(200);
+      expect((await app.handle(req('GET', `/api/workflows/${victimWorkflow._id}`, null, thiefToken))).status).toBe(403);
+    });
+
+    it("cannot unassign another project's workflow (which would strip its protection entirely)", async () => {
+      const res = await app.handle(req('DELETE', `/api/projects/${thiefProject._id}/folders/${thiefFolder._id}/workflows/${victimWorkflow._id}`, null, thiefToken));
+      expect(res.status).toBe(404);
+      expect((await app.handle(req('GET', `/api/workflows/${victimWorkflow._id}`, null, thiefToken))).status).toBe(403);
+    });
+
+    it('a legitimate owner can still file and unassign a workflow in their own project', async () => {
+      const assign = await app.handle(req('POST', `/api/projects/${victimProject._id}/folders/${victimFolder._id}/workflows`,
+        { workflowId: victimWorkflow._id }, adminToken));
+      expect(assign.status).toBe(200);
+      expect((await json(assign)).workflow.projectId).toBe(victimProject._id);
+
+      const unassign = await app.handle(req('DELETE', `/api/projects/${victimProject._id}/folders/${victimFolder._id}/workflows/${victimWorkflow._id}`, null, adminToken));
+      expect(unassign.status).toBe(200);
+      expect((await json(unassign)).workflow.projectId).toBeNull();
+    });
+
+    it('an UNASSIGNED workflow stays claimable by any authenticated user (documented convention, unchanged)', async () => {
+      const free = (await json(await app.handle(req('POST', '/api/workflows', {
+        name: 'FreeWorkflow', nodes: [{ id: 'n', type: 'set.value', inputs: { value: 1 } }],
+      }, adminToken)))).workflow;
+      const res = await app.handle(req('POST', `/api/projects/${thiefProject._id}/folders/${thiefFolder._id}/workflows`,
+        { workflowId: free._id }, thiefToken));
+      expect(res.status).toBe(200);
     });
   });
 });

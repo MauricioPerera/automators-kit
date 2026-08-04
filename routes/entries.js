@@ -70,9 +70,16 @@ export function entryRoutes(cms) {
   });
 
   // Update
+  // SECURITY (2026-08-03, full-codebase audit): `ctx.state.user` is passed as
+  // the `caller` on every mutating route below. Without it,
+  // EntryService._enforceOwnScope short-circuits ("legacy: no check"), so
+  // FIX-30's `:own` ownership comparison never ran anywhere in the codebase.
+  // That is the other half of the `author`-role fix in core/cms.js's
+  // hasPermission -- the gate now lets a `:own` holder through, and this is
+  // what stops them at documents that aren't theirs.
   r.put('/id/:id', auth, requirePermission('entries:write'), validateBody(UpdateSchema, { partial: true }), async (ctx) => {
     try {
-      const entry = await cms.entries.update(ctx.params.id, ctx.state.body);
+      const entry = await cms.entries.update(ctx.params.id, ctx.state.body, ctx.state.user);
       return json({ entry });
     } catch (err) {
       return error(err.message, 400);
@@ -82,7 +89,7 @@ export function entryRoutes(cms) {
   // Delete
   r.delete('/id/:id', auth, requirePermission('entries:delete'), async (ctx) => {
     try {
-      await cms.entries.delete(ctx.params.id);
+      await cms.entries.delete(ctx.params.id, ctx.state.user);
       return json({ deleted: true });
     } catch (err) {
       return error(err.message, 400);
@@ -92,7 +99,7 @@ export function entryRoutes(cms) {
   // Publish
   r.post('/id/:id/publish', auth, requirePermission('entries:publish'), async (ctx) => {
     try {
-      const entry = await cms.entries.publish(ctx.params.id);
+      const entry = await cms.entries.publish(ctx.params.id, ctx.state.user);
       return json({ entry });
     } catch (err) {
       return error(err.message, 400);
@@ -102,7 +109,7 @@ export function entryRoutes(cms) {
   // Unpublish
   r.post('/id/:id/unpublish', auth, requirePermission('entries:publish'), async (ctx) => {
     try {
-      const entry = await cms.entries.unpublish(ctx.params.id);
+      const entry = await cms.entries.unpublish(ctx.params.id, ctx.state.user);
       return json({ entry });
     } catch (err) {
       return error(err.message, 400);

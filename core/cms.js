@@ -50,7 +50,23 @@ export function hasPermission(user, permission) {
   const perms = ROLE_PERMISSIONS[user.role] || [];
   if (perms.includes(permission)) return true;
   const base = permission.split(':').slice(0, 2).join(':');
-  return perms.includes(base);
+  if (perms.includes(base)) return true;
+  // SECURITY/CORRECTNESS (2026-08-03, full-codebase audit): the collapse
+  // above is one-directional -- `entries:write:own` collapsed to
+  // `entries:write`, but a holder of ONLY `entries:write:own` failed a check
+  // for `entries:write`. Every route asks for the base permission
+  // (routes/entries.js), so the `author` role -- whose entire entry
+  // permission set is `entries:write:own` / `entries:delete:own` -- got 403
+  // on its OWN entries. The role was effectively dead: it could do nothing.
+  //
+  // Granting the base here is only half the fix and is UNSAFE alone: it says
+  // "this caller may attempt the action", not "on any document". The
+  // ownership comparison lives in EntryService._enforceOwnScope, which runs
+  // only when the route passes a `caller` -- no route did, which is why
+  // FIX-30's `:own` enforcement was dead code too. routes/entries.js now
+  // passes ctx.state.user on every mutating entry route, so a `:own` holder
+  // reaching a document they don't own is rejected there.
+  return perms.includes(`${permission}:own`);
 }
 
 /**
@@ -626,9 +642,14 @@ class EntryService {
     return updated;
   }
 
-  async unpublish(id) {
+  async unpublish(id, caller) {
     const doc = this.col.findById(id);
     if (!doc) throw new Error(`Entry '${id}' not found`);
+    // `publish` above already enforced this; `unpublish` was the one mutating
+    // entry method that never accepted a caller at all -- an inconsistency,
+    // not a scoping decision (found 2026-08-03 by a full-codebase audit).
+    // Same optional-`caller` contract as its siblings: omitted -> no check.
+    this._enforceOwnScope(doc, caller, 'entries:publish');
 
     await this.cms.hook('entry:beforeUnpublish', { id, entry: doc });
     this.col.update({ _id: id }, { $set: { status: 'draft', updatedAt: Date.now() } });
