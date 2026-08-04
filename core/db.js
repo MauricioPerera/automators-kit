@@ -1459,6 +1459,18 @@ function setTableSchema(db, name, columns) {
     if (typeof col.type !== 'string' || !col.type) {
       throw new Error(`Column '${col.name}' needs a \`type\` (table '${name}')`);
     }
+    // A function default cannot be persisted -- the registry stores columns as
+    // JSON and Collection.insert() deep-clones with structuredClone, which
+    // throws DataCloneError on a function. Caught here so the caller gets the
+    // reason and the alternative, instead of a DataCloneError raised from deep
+    // inside insert(). Found while wiring TEMPLATES, whose CreatedAt columns
+    // used exactly this shape.
+    if (typeof col.default === 'function') {
+      throw new Error(
+        `Column '${col.name}' (table '${name}') has a function default, which cannot be persisted. ` +
+        `Use the '$now' sentinel for a current-timestamp default, or a plain literal value.`
+      );
+    }
   }
   const store = db.collection(TABLE_SCHEMA_COLLECTION);
   const existing = store.findOne({ table: name });
@@ -1476,6 +1488,30 @@ function removeTableSchema(db, name) {
   store.removeById(existing._id);
   db.flush();
   return true;
+}
+
+/**
+ * Registers a schema from one of the built-in TEMPLATES (`crm`, `tasks`,
+ * `inventory`, `content`). The templates were written with typed columns,
+ * `unique` constraints, select `options` and defaults, and nothing could
+ * reach them: `createFromTemplate` builds a Table in code, which the
+ * data-table surfaces (the `data.table` node and `/api/db/:col`) never see
+ * because they resolve schemas through this registry. This is the door.
+ */
+function setTableSchemaFromTemplate(db, name, template) {
+  const spec = TEMPLATES[template];
+  if (!spec) {
+    throw new Error(`Unknown table template '${template}'. Available: ${Object.keys(TEMPLATES).join(', ')}`);
+  }
+  return setTableSchema(db, name, spec.columns);
+}
+
+/** Names of the built-in table templates, for discovery. */
+function listTableTemplates() {
+  return Object.entries(TEMPLATES).map(([name, spec]) => ({
+    name,
+    columns: spec.columns.map((c) => ({ name: c.name, type: c.type, required: !!c.required, unique: !!c.unique })),
+  }));
 }
 
 /** Every table that has a registered schema. */
@@ -1681,7 +1717,20 @@ class Table {
       }
 
       if (col.default !== undefined) {
-        result[col.name] = typeof col.default === 'function' ? col.default() : col.default;
+        // Three forms, in order of how they arrive:
+        //  - a FUNCTION: only possible for a Table built in code. Cannot be
+        //    persisted (structuredClone refuses it), so it never reaches here
+        //    from the schema registry -- setTableSchema rejects it outright
+        //    with an explanation rather than letting the clone blow up.
+        //  - the '$now' SENTINEL: the serializable equivalent, so a schema
+        //    with a timestamp default survives JSON persistence. This is what
+        //    TEMPLATES use. (A column that genuinely wants the literal string
+        //    "$now" as its default cannot express it -- an accepted, narrow
+        //    collision, called out here rather than left to be discovered.)
+        //  - anything else: a plain literal.
+        if (typeof col.default === 'function') result[col.name] = col.default();
+        else if (col.default === '$now') result[col.name] = new Date().toISOString();
+        else result[col.name] = col.default;
       }
     }
 
@@ -1894,7 +1943,7 @@ const TEMPLATES = {
       { name: 'Revenue',  type: 'number',   default: 0 },
       { name: 'Notes',    type: 'text' },
       { name: 'Tags',     type: 'multiselect', options: ['VIP', 'Enterprise', 'SMB', 'Partner'] },
-      { name: 'CreatedAt',type: 'date',     default: () => new Date().toISOString() },
+      { name: 'CreatedAt',type: 'date',     default: '$now' },
     ],
   },
   tasks: {
@@ -1907,7 +1956,7 @@ const TEMPLATES = {
       { name: 'DueDate',  type: 'date' },
       { name: 'Tags',     type: 'multiselect', options: ['Bug', 'Feature', 'Docs', 'Infra'] },
       { name: 'Number',   type: 'autonumber' },
-      { name: 'CreatedAt',type: 'date',     default: () => new Date().toISOString() },
+      { name: 'CreatedAt',type: 'date',     default: '$now' },
     ],
   },
   inventory: {
@@ -1933,7 +1982,7 @@ const TEMPLATES = {
       { name: 'PublishedAt', type: 'date' },
       { name: 'URL',      type: 'url' },
       { name: 'Number',   type: 'autonumber' },
-      { name: 'CreatedAt',type: 'date',     default: () => new Date().toISOString() },
+      { name: 'CreatedAt',type: 'date',     default: '$now' },
     ],
   },
 };
@@ -2777,6 +2826,8 @@ export {
   assertSafeCollectionName,
   getTableSchema,
   setTableSchema,
+  setTableSchemaFromTemplate,
+  listTableTemplates,
   removeTableSchema,
   listTableSchemas,
   TABLE_SCHEMA_COLLECTION,

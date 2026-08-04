@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { DocStore, Collection, Auth, Table, EncryptedAdapter, FieldCrypto, MemoryStorageAdapter, FileStorageAdapter, HashIndex, SortedIndex, matchFilter, applyUpdate, generateId, createFromTemplate, getTableSchema, setTableSchema, removeTableSchema, listTableSchemas } from '../core/db.js';
+import { DocStore, Collection, Auth, Table, EncryptedAdapter, FieldCrypto, MemoryStorageAdapter, FileStorageAdapter, HashIndex, SortedIndex, matchFilter, applyUpdate, generateId, createFromTemplate, getTableSchema, setTableSchema, removeTableSchema, listTableSchemas, TEMPLATES, setTableSchemaFromTemplate, listTableTemplates } from '../core/db.js';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -1115,5 +1115,71 @@ describe('Table validates the RESULT of an update, not just $set', () => {
     t.insert({ Age: 1 }); t.insert({ Age: 2 });
     expect(() => t.updateMany({}, { $set: { Age: 'bad' } })).toThrow(/Validation failed/);
     expect(t.updateMany({}, { $set: { Age: 9 } })).toBe(2);
+  });
+});
+
+// Table templates (2026-08-04, from the written-but-unwired sweep): TEMPLATES
+// and createFromTemplate defined four ready schemas -- typed columns, unique
+// constraints, select options, defaults -- and nothing could reach them. The
+// data-table surfaces resolve schemas through the registry, which
+// createFromTemplate does not touch.
+describe('table templates', () => {
+  it('every built-in template registers and validates', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    for (const name of Object.keys(TEMPLATES)) {
+      expect(() => setTableSchemaFromTemplate(db, `reg_${name}`, name)).not.toThrow();
+      expect(getTableSchema(db, `reg_${name}`)).not.toBeNull();
+    }
+  });
+
+  it('rejects an unknown template by name, listing the real ones', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    expect(() => setTableSchemaFromTemplate(db, 't', 'nope')).toThrow(/Unknown table template.*crm/);
+  });
+
+  it('enforces the template contract on writes', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    setTableSchemaFromTemplate(db, 'stock', 'inventory');
+    const t = getTableSchema(db, 'stock');
+
+    expect(() => t.insert({ Name: 'No SKU' })).toThrow(/SKU is required/);
+    const ok = t.insert({ SKU: 'A1', Name: 'Widget', Price: 9.5 });
+    expect(ok.SKU).toBe('A1');
+    expect(() => t.insert({ SKU: 'A1', Name: 'Dup', Price: 1 })).toThrow(); // unique
+  });
+
+  // Templates used `default: () => new Date().toISOString()`. The registry
+  // persists columns as JSON and Collection.insert deep-clones with
+  // structuredClone, which throws DataCloneError on a function -- so
+  // registering a template crashed. Dynamic defaults are a serializable
+  // sentinel now, which works in code AND through persistence.
+  it('applies the $now default through the registry, where a function could not survive', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    setTableSchemaFromTemplate(db, 'people', 'crm');
+    const row = getTableSchema(db, 'people').insert({ Name: 'Ana', Email: 'a@x.com' });
+    expect(typeof row.CreatedAt).toBe('string');
+    expect(Number.isNaN(Date.parse(row.CreatedAt))).toBe(false);
+  });
+
+  it('a function default is refused with the reason, not a DataCloneError', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    expect(() => setTableSchema(db, 'x', [{ name: 'A', type: 'text', default: () => 'v' }]))
+      .toThrow(/function default, which cannot be persisted.*\$now/s);
+  });
+
+  it('an in-code Table still honours a function default (unchanged)', () => {
+    const db = new DocStore(new MemoryStorageAdapter());
+    const t = new Table(db, 'direct', { columns: [
+      { name: 'Name', type: 'text', required: true },
+      { name: 'At', type: 'text', default: () => 'computed' },
+    ] });
+    expect(t.insert({ Name: 'x' }).At).toBe('computed');
+  });
+
+  it('lists templates with their column shape for discovery', () => {
+    const names = listTableTemplates().map((t) => t.name);
+    expect(names).toEqual(['crm', 'tasks', 'inventory', 'content']);
+    const inv = listTableTemplates().find((t) => t.name === 'inventory');
+    expect(inv.columns.find((c) => c.name === 'SKU')).toMatchObject({ required: true, unique: true });
   });
 });

@@ -593,6 +593,39 @@ describe('typed data tables over HTTP', () => {
     expect(bad.status).toBe(400);
   });
 
+  it('lists the built-in templates for discovery', async () => {
+    const res = await app.handle(req('GET', '/api/db/_templates', null, adminToken));
+    expect(res.status).toBe(200);
+    const { templates } = await json(res);
+    expect(templates.map((t) => t.name)).toEqual(['crm', 'tasks', 'inventory', 'content']);
+  });
+
+  it('defines a schema from a template, and enforces it on both surfaces', async () => {
+    expect((await app.handle(req('PUT', '/api/db/dt-stock/_schema', { template: 'inventory' }, adminToken))).status).toBe(200);
+
+    const schema = await json(await app.handle(req('GET', '/api/db/dt-stock/_schema', null, adminToken)));
+    expect(schema.typed).toBe(true);
+    expect(schema.columns.map((c) => c.name)).toContain('SKU');
+
+    expect((await app.handle(req('POST', '/api/db/dt-stock', { SKU: 'A1', Name: 'Widget', Price: 9.5 }, adminToken))).status).toBe(201);
+    const missing = await app.handle(req('POST', '/api/db/dt-stock', { Name: 'No SKU' }, adminToken));
+    expect(missing.status).toBe(400);
+    expect((await json(missing)).error).toContain('SKU is required');
+    // unique constraint from the template
+    expect((await app.handle(req('POST', '/api/db/dt-stock', { SKU: 'A1', Name: 'Dup', Price: 1 }, adminToken))).status).toBe(400);
+  });
+
+  it('rejects an unknown template name', async () => {
+    const res = await app.handle(req('PUT', '/api/db/dt-nope/_schema', { template: 'not-a-template' }, adminToken));
+    expect(res.status).toBe(400);
+    expect((await json(res)).error).toContain('Unknown table template');
+  });
+
+  it('still requires columns or template', async () => {
+    const res = await app.handle(req('PUT', '/api/db/dt-empty/_schema', {}, adminToken));
+    expect(res.status).toBe(400);
+  });
+
   it('the schema registry itself is not reachable through /api/db', async () => {
     const res = await app.handle(req('GET', '/api/db/_table_schemas', null, adminToken));
     expect(res.status).toBe(403);

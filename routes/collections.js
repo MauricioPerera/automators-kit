@@ -13,7 +13,7 @@
 
 import { Router, json, error } from '../core/http.js';
 import { createAuth, requireRole } from './middleware.js';
-import { isInternalCollectionName, assertSafeCollectionName, getTableSchema, setTableSchema, removeTableSchema, listTableSchemas } from '../core/db.js';
+import { isInternalCollectionName, assertSafeCollectionName, getTableSchema, setTableSchema, setTableSchemaFromTemplate, removeTableSchema, listTableSchemas, listTableTemplates } from '../core/db.js';
 
 // SECURITY (2026-08-03, found reasoning about a "list data tables" feature,
 // not by an audit): every collection this codebase itself manages
@@ -97,6 +97,10 @@ export function collectionRoutes(cms) {
   // exact shadowing bug has bitten this repo more than once.
   r.get('/_schemas', auth, async () => json({ schemas: listTableSchemas(cms.db) }));
 
+  // Built-in starting schemas. Registered before `/:col/...` for the same
+  // ordering reason as `/_schemas` above.
+  r.get('/_templates', auth, async () => json({ templates: listTableTemplates() }));
+
   r.get('/:col/_schema', auth, _blockInternalCollections, async (ctx) => {
     const table = getTableSchema(cms.db, ctx.params.col);
     if (!table) return json({ table: ctx.params.col, columns: null, typed: false });
@@ -109,9 +113,15 @@ export function collectionRoutes(cms) {
   // never destructive.
   r.put('/:col/_schema', auth, requireRole('admin'), _blockInternalCollections, async (ctx) => {
     const body = await ctx.json();
-    if (!body?.columns) return error('`columns` is required', 400);
+    // Either an explicit column list, or the name of a built-in template.
+    if (!body?.columns && !body?.template) {
+      return error('`columns` or `template` is required (see GET /api/db/_templates)', 400);
+    }
     try {
-      return json(setTableSchema(cms.db, ctx.params.col, body.columns));
+      const result = body.template
+        ? setTableSchemaFromTemplate(cms.db, ctx.params.col, body.template)
+        : setTableSchema(cms.db, ctx.params.col, body.columns);
+      return json(result);
     } catch (err) {
       return error(err.message, 400);
     }

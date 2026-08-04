@@ -233,8 +233,9 @@ function buildApiCatalog() {
         endpoints: [
           { method: 'GET', path: '/api/db/', auth: 'bearer', description: 'List collection names known to this process (internal ones filtered out) -- discovery for the routes below' },
           { method: 'GET', path: '/api/db/_schemas', auth: 'bearer', description: 'Every table that has a registered typed-column schema' },
+          { method: 'GET', path: '/api/db/_templates', auth: 'bearer', description: 'Built-in starting schemas (crm, tasks, inventory, content) with their column shapes' },
           { method: 'GET', path: '/api/db/:col/_schema', auth: 'bearer', description: 'The typed-column schema for this table, or { typed: false } when it is schemaless' },
-          { method: 'PUT', path: '/api/db/:col/_schema', auth: 'admin', bodyDescription: '{ columns: [{ name, type, required?, unique?, default?, options? }] }', description: 'Define/replace a typed-column schema. Writes AFTER this are validated on both /api/db and the data.table workflow node; existing rows are left as they are' },
+          { method: 'PUT', path: '/api/db/:col/_schema', auth: 'admin', bodyDescription: '{ columns: [{ name, type, required?, unique?, default?, options? }] } OR { template: "crm"|"tasks"|"inventory"|"content" }', description: 'Define/replace a typed-column schema, either explicitly or from a built-in template. Writes AFTER this are validated on both /api/db and the data.table workflow node; existing rows are left as they are' },
           { method: 'DELETE', path: '/api/db/:col/_schema', auth: 'admin', description: 'Remove the schema, returning the table to schemaless. Rows are kept' },
           { method: 'GET', path: '/api/db/:col', auth: 'bearer', description: 'List documents; supports field__op=val filters, _sort/_order, _limit (max 500)/_offset, _fields projection' },
           { method: 'GET', path: '/api/db/:col/_count', auth: 'bearer', description: 'Count documents in a collection' },
