@@ -6,10 +6,25 @@
  * trusted, so any URL it controls must be validated to stop the server from
  * reaching cloud metadata endpoints (169.254.169.254) or internal services.
  *
- * Scope note: this validates the hostname / IP *literal* found in the URL. It
- * does NOT perform DNS resolution, so a public-looking hostname that resolves
- * to a private IP is not caught here. Real DNS-based blocking (resolve then
- * check) is a future improvement, intentionally out of scope for this fix.
+ * Scope note (updated 2026-08-04, when DNS checking was added -- the previous
+ * version of this note said no resolution was performed at all):
+ *
+ *  - `assertPublicUrl` validates the hostname / IP *literal* in the URL and is
+ *    synchronous. On its own it still catches nothing about where a NAME
+ *    points.
+ *  - `assertPublicDns` resolves a hostname and rejects it if ANY address it
+ *    resolves to is internal. `safeFetch` calls it for the initial URL and for
+ *    every redirect hop, so all real outbound traffic is covered.
+ *  - **DNS rebinding is still NOT covered**, and this is a genuine remaining
+ *    hole rather than an oversight: the check resolves the name, then hands
+ *    the NAME to `fetch`, which resolves again on its own. A 0-TTL record
+ *    answering public-then-private defeats it. Closing that requires
+ *    connecting to the verified IP with a `Host` header and a TLS SNI
+ *    override, which is not reachable portably with zero dependencies across
+ *    Bun, Deno and Node.
+ *  - On a runtime with no `node:dns` (Cloudflare Workers), the DNS check is
+ *    skipped and behaviour matches the pre-2026-08-04 guard. Literal checks
+ *    still apply everywhere. See `assertPublicDns` for why that fails open.
  *
  * Redirects ARE covered, but only for callers that use `safeFetch` below --
  * `assertPublicUrl` alone validates a single URL and cannot see where the
@@ -112,6 +127,25 @@ export function assertPublicUrl(rawUrl) {
     throw new Error(`net-guard: blocked internal destination: ${host}`);
   }
 
+  assertPublicLiteral(host);
+
+  return parsed;
+}
+
+/**
+ * Throws if `host` is an IP literal pointing at an internal destination.
+ * A no-op for anything that is not an IP literal.
+ *
+ * Extracted from assertPublicUrl (2026-08-04) so the DNS check below can run
+ * RESOLVED addresses through the exact same rule. Writing a second copy of
+ * "is this address internal" for the DNS path is the mistake this codebase
+ * has now made four times over (see Known Security Gaps items 31-36): the
+ * copy always ends up weaker than the original, and nobody notices because
+ * both read correctly in isolation.
+ *
+ * @param {string} host  IP literal or hostname, IPv6 already unbracketed
+ */
+function assertPublicLiteral(host) {
   // IPv4 literal
   const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
   if (v4) {
@@ -122,7 +156,7 @@ export function assertPublicUrl(rawUrl) {
     if (isInternalIPv4(a, b, c, d)) {
       throw new Error(`net-guard: blocked internal destination: ${host}`);
     }
-    return parsed;
+    return;
   }
 
   // IPv6 literal
@@ -161,8 +195,90 @@ export function assertPublicUrl(rawUrl) {
       throw new Error(`net-guard: blocked internal destination: ${host}`);
     }
   }
+}
 
-  return parsed;
+// DNS module handle: `undefined` = not attempted, `null` = unavailable here.
+// Resolved lazily and cached, never imported at module load, because
+// `node:dns` does not exist on every runtime this codebase targets --
+// Cloudflare Workers has no DNS module at all, and a static import would
+// break `net-guard` (and therefore every outbound call) on a supported
+// platform rather than protecting it.
+let _dnsPromises;
+
+async function _getDns() {
+  if (_dnsPromises !== undefined) return _dnsPromises;
+  try {
+    _dnsPromises = await import('node:dns/promises');
+  } catch {
+    _dnsPromises = null;
+  }
+  return _dnsPromises;
+}
+
+/** Test seam: force the DNS module (or `null` to simulate a runtime without one). */
+export function _setDnsModuleForTests(mod) {
+  _dnsPromises = mod;
+}
+
+/**
+ * Resolves `host` and throws if ANY address it resolves to is internal.
+ *
+ * SECURITY (2026-08-04): until now `net-guard` never resolved anything, so a
+ * public-looking HOSTNAME whose A record points at 127.0.0.1 or
+ * 169.254.169.254 sailed through every check -- the module's original scope
+ * note disclosed this rather than hiding it, and it stayed open through two
+ * rounds of guard fixes. Every address is checked, not just the first: a name
+ * resolving to one public and one private address is exactly how this gets
+ * slipped past a first-hit check.
+ *
+ * TWO LIMITS, STATED PLAINLY BECAUSE THEY ARE NOT OBVIOUS FROM THE CODE:
+ *
+ * 1. **This does not stop DNS rebinding.** We resolve, check, and then hand
+ *    the HOSTNAME to `fetch`, which resolves independently. An attacker
+ *    serving a 0-TTL record that answers public on the first lookup and
+ *    private on the second still wins. Closing that means connecting to the
+ *    verified IP with a `Host` header and a TLS SNI override, which is not
+ *    reachable portably with zero dependencies across Bun, Deno and Node.
+ *    What this DOES close is the far more common case: a hostname that simply
+ *    resolves to a private address.
+ *
+ * 2. **On a runtime with no `node:dns`, the check is skipped**, and behaviour
+ *    is exactly what it was before this function existed. That is a
+ *    deliberate fail-open on THIS check alone: failing closed would mean
+ *    `net-guard` blocks every outbound request on Cloudflare Workers, turning
+ *    a hardening step into an outage on a supported platform. The literal-IP
+ *    checks still apply everywhere.
+ *
+ * @param {string} host  hostname or IP literal, IPv6 already unbracketed
+ */
+export async function assertPublicDns(host) {
+  // An IP literal has already faced assertPublicLiteral and needs no lookup.
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host.includes(':')) return;
+
+  const dns = await _getDns();
+  if (!dns) return; // limit 2 above
+
+  let addresses;
+  try {
+    addresses = await dns.lookup(host, { all: true });
+  } catch (err) {
+    // A name that does not resolve is not a guard failure -- let `fetch`
+    // produce its own, more accurate error rather than masking it as an SSRF
+    // block, which would send someone hunting for a security problem that
+    // isn't there.
+    if (err?.code === 'ENOTFOUND' || err?.code === 'EAI_AGAIN' || err?.code === 'ENODATA') return;
+    throw err;
+  }
+
+  for (const { address } of addresses) {
+    try {
+      assertPublicLiteral(address);
+    } catch {
+      throw new Error(
+        `net-guard: blocked internal destination: ${host} resolves to ${address}`
+      );
+    }
+  }
 }
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
@@ -203,6 +319,13 @@ const CREDENTIAL_HEADERS = ['authorization', 'cookie', 'proxy-authorization'];
 export async function safeFetch(url, init = {}, opts = {}) {
   const maxRedirects = opts.maxRedirects ?? 5;
   let current = assertPublicUrl(String(url));
+  // Hostname resolution is checked HERE rather than inside assertPublicUrl:
+  // that function is synchronous and has callers (triggers.js registering a
+  // trigger, connector.js, nodes.js) that only validate a URL without ever
+  // making the request. Making it async would change every one of their
+  // signatures. safeFetch is the single point every actual outbound call
+  // funnels through, so the check lands once and covers all of them.
+  await assertPublicDns(current.hostname.replace(/^\[|\]$/g, ''));
   let request = { ...init };
 
   for (let hop = 0; ; hop++) {
@@ -228,6 +351,10 @@ export async function safeFetch(url, init = {}, opts = {}) {
     // original URL, so an internal target is refused however many public
     // hosts were chained in front of it.
     assertPublicUrl(next.toString());
+    // Same reason the literal check is repeated per hop: a redirect to a
+    // public-looking name that resolves internally is the identical attack
+    // one indirection later.
+    await assertPublicDns(next.hostname.replace(/^\[|\]$/g, ''));
 
     if (next.origin !== current.origin && request.headers) {
       const headers = { ...request.headers };

@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, afterEach } from 'bun:test';
-import { assertPublicUrl, safeFetch } from '../core/net-guard.js';
+import { assertPublicUrl, safeFetch, assertPublicDns, _setDnsModuleForTests } from '../core/net-guard.js';
 
 const blocks = (url) => expect(() => assertPublicUrl(url)).toThrow();
 const allows = (url) => expect(() => assertPublicUrl(url)).not.toThrow();
@@ -160,5 +160,117 @@ describe('safeFetch: the guard applies to every hop, not just the first', () => 
     globalThis.fetch = async () => new Response(null, { status: 302 });
     const res = await safeFetch('https://a.test/');
     expect(res.status).toBe(302);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DNS resolution checking (2026-08-04)
+//
+// net-guard performed NO resolution until now, so a public-looking hostname
+// whose A record points at 127.0.0.1 or 169.254.169.254 passed every check.
+// The module's own scope note disclosed this rather than hiding it, and it
+// survived two earlier rounds of guard fixes.
+//
+// These tests inject a fake DNS module instead of resolving for real: the
+// suite must not depend on a network, on a third-party name continuing to
+// resolve the way it does today, or on running online at all. The real-DNS
+// path was verified live separately -- `safeFetch('http://localtest.me/')`,
+// a genuine public hostname that resolves to loopback, is blocked with
+// "resolves to ::1", and public names still pass.
+// ---------------------------------------------------------------------------
+describe('DNS-based SSRF blocking', () => {
+  const fakeDns = (map) => ({
+    lookup: async (host) => {
+      const v = map[host];
+      if (!v) { const e = new Error('not found'); e.code = 'ENOTFOUND'; throw e; }
+      if (v instanceof Error) throw v;
+      return v;
+    },
+  });
+
+  afterEach(() => {
+    // Back to the real lazy import so no later test sees a stubbed module.
+    _setDnsModuleForTests(undefined);
+  });
+
+  it('blocks a public hostname that resolves to loopback', async () => {
+    _setDnsModuleForTests(fakeDns({ 'evil.example': [{ address: '127.0.0.1', family: 4 }] }));
+    await expect(assertPublicDns('evil.example')).rejects.toThrow(/resolves to 127\.0\.0\.1/);
+  });
+
+  it('blocks a hostname that resolves to the cloud metadata address', async () => {
+    _setDnsModuleForTests(fakeDns({ 'meta.example': [{ address: '169.254.169.254', family: 4 }] }));
+    await expect(assertPublicDns('meta.example')).rejects.toThrow(/169\.254\.169\.254/);
+  });
+
+  it('blocks a hostname that resolves to an RFC1918 address', async () => {
+    _setDnsModuleForTests(fakeDns({ 'lan.example': [{ address: '10.0.0.5', family: 4 }] }));
+    await expect(assertPublicDns('lan.example')).rejects.toThrow(/blocked internal destination/);
+  });
+
+  it('blocks an IPv6 loopback result', async () => {
+    _setDnsModuleForTests(fakeDns({ 'six.example': [{ address: '::1', family: 6 }] }));
+    await expect(assertPublicDns('six.example')).rejects.toThrow(/resolves to ::1/);
+  });
+
+  it('blocks a unique-local IPv6 result', async () => {
+    _setDnsModuleForTests(fakeDns({ 'ula.example': [{ address: 'fd00::1', family: 6 }] }));
+    await expect(assertPublicDns('ula.example')).rejects.toThrow(/blocked internal destination/);
+  });
+
+  // The interesting case: checking only the first address is exactly how this
+  // gets slipped past, so every returned address must face the rule.
+  it('blocks when only ONE of several addresses is internal', async () => {
+    _setDnsModuleForTests(fakeDns({
+      'mixed.example': [
+        { address: '93.184.216.34', family: 4 },
+        { address: '127.0.0.1', family: 4 },
+      ],
+    }));
+    await expect(assertPublicDns('mixed.example')).rejects.toThrow(/resolves to 127\.0\.0\.1/);
+  });
+
+  it('allows a hostname that resolves only to public addresses', async () => {
+    _setDnsModuleForTests(fakeDns({ 'good.example': [{ address: '93.184.216.34', family: 4 }] }));
+    await expect(assertPublicDns('good.example')).resolves.toBeUndefined();
+  });
+
+  it('does not resolve an IP literal, which the literal check already covered', async () => {
+    _setDnsModuleForTests({ lookup: async () => { throw new Error('should not be called'); } });
+    await expect(assertPublicDns('93.184.216.34')).resolves.toBeUndefined();
+    await expect(assertPublicDns('2606:4700::1')).resolves.toBeUndefined();
+  });
+
+  // A name that does not resolve is fetch's problem to report. Masking it as
+  // an SSRF block would send someone hunting a security bug that isn't there.
+  it('passes an unresolvable name through instead of reporting a block', async () => {
+    _setDnsModuleForTests(fakeDns({}));
+    await expect(assertPublicDns('nope.invalid')).resolves.toBeUndefined();
+  });
+
+  it('propagates an unexpected resolver error rather than swallowing it', async () => {
+    const boom = new Error('resolver exploded');
+    boom.code = 'ESERVFAIL';
+    _setDnsModuleForTests(fakeDns({ 'x.example': boom }));
+    await expect(assertPublicDns('x.example')).rejects.toThrow(/resolver exploded/);
+  });
+
+  // Deliberate fail-open on THIS check only: failing closed would make
+  // net-guard block every outbound request on Cloudflare Workers, which has
+  // no node:dns at all -- an outage rather than a hardening.
+  it('skips the check on a runtime with no DNS module', async () => {
+    _setDnsModuleForTests(null);
+    await expect(assertPublicDns('evil.example')).resolves.toBeUndefined();
+  });
+
+  it('still blocks IP literals when the DNS module is unavailable', () => {
+    _setDnsModuleForTests(null);
+    expect(() => assertPublicUrl('http://127.0.0.1/')).toThrow(/blocked internal destination/);
+    expect(() => assertPublicUrl('http://[::ffff:169.254.169.254]/')).toThrow(/blocked internal destination/);
+  });
+
+  it('applies the DNS check inside safeFetch, not only when called directly', async () => {
+    _setDnsModuleForTests(fakeDns({ 'sneaky.example': [{ address: '192.168.1.1', family: 4 }] }));
+    await expect(safeFetch('http://sneaky.example/data')).rejects.toThrow(/resolves to 192\.168\.1\.1/);
   });
 });
