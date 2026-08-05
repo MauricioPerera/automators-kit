@@ -1,7 +1,7 @@
 # AGENTS.md - Automators Kit
 
 Zero-dependency hackeable toolkit: CMS + workflow engine + agent shell + vector search + agent memory.
-By automators.work | 1438 tests | 0 deps | 27 core modules
+By automators.work | 1451 tests | 0 deps | 27 core modules
 
 ## Architecture
 
@@ -31,7 +31,7 @@ cron.js            Cron scheduler: 5-field expressions, tick, enable/disable
 connector.js       HTTP client: auth presets, retries, timeout (Slack/Discord/REST)
 memory.js          Agent memory: semantic + episodic + working, recall with decay
 parallel.js        Task orchestration: race/merge/all strategies, timeout, weighted scoring
-net-guard.js       SSRF guard: blocks loopback/RFC1918/link-local/cloud-metadata destinations, IPv4 + IPv6 (incl. IPv4-mapped and unique-local)
+net-guard.js       SSRF guard: blocks loopback/RFC1918/link-local/cloud-metadata destinations, IPv4 + IPv6 (incl. IPv4-mapped and unique-local), and resolves hostnames to catch names pointing at internal addresses. Does NOT stop DNS rebinding
 log.js             Structured logging: leveled, JSON-per-line entries, pluggable sink
 metrics.js         In-process metrics: counters/gauges/histograms, Prometheus text exposition format
 csv.js             CSV parsing: RFC-4180 quoted fields, embedded delimiters/newlines, escaped quotes
@@ -2202,6 +2202,11 @@ items 31-36 came from a plugin doing by hand something `core/` already did caref
 | `path.split('.').reduce(…)` | `getNestedValue(obj, path)` | `core/db.js` |
 | hand-matching a route pattern | `compilePattern(pattern)` | `core/http.js` |
 
+Note `safeFetch` rather than `assertPublicUrl` in that first row. `assertPublicUrl` is synchronous and
+only inspects the URL's literal host — it is the right call when you are validating a stored config
+value without making a request, but it does **not** resolve DNS. `safeFetch` applies the literal check,
+the DNS check and the per-redirect-hop re-check. If you are about to make the request, use `safeFetch`.
+
 `getNestedValue` **throws** on a `__proto__`/`constructor`/`prototype` segment rather than returning
 `undefined`. If you call it in a loop over user-defined items, catch per item — otherwise one bad path
 aborts the whole batch. That is exactly the trap `plugins/automations`'s hook loop needed handling for.
@@ -3070,13 +3075,38 @@ code. The trigger-filter test passes on the old code too, because an unguarded `
 simply did not match and the workflow was skipped anyway — that test guards the `try`/`catch` introduced
 here, not the original defect. Counting all three as catching the old bug would have overstated it.
 
+**2026-08-04 — the DNS hole closed, and a scope note replaced rather than deleted.** Item 37. `net-guard`
+had disclosed from its first line that it did no DNS resolution; that disclosure survived two rounds of
+guard fixes without being acted on. It resolves now, and a public-looking name pointing at a private
+address is refused on the initial URL and every redirect hop.
+
+The part worth carrying forward is what happened to the scope note. It was not deleted — it was
+**replaced with a narrower, more precise one**. The old note said "no DNS resolution"; the new one says
+"resolves, but cannot stop DNS rebinding, because the check hands a NAME to `fetch` which resolves
+again, and pinning the verified IP needs a `Host` header plus a TLS SNI override that is not reachable
+portably with zero dependencies." A fix that closes most of a hole is an invitation to quietly upgrade
+the documentation to "covered"; the honest move is to redraw the line, not erase it. Anyone reading
+`net-guard` now knows exactly which attack still works and why it was not attempted, instead of
+believing DNS is handled.
+
+Same for the fail-open on runtimes without `node:dns`: recorded as a decision with its reason (failing
+closed would block every outbound request on Cloudflare Workers — an outage, not a hardening) rather
+than left as an unexplained gap for someone to "fix" later by making it strict.
+
+Fifth time in this sweep that the fix needed an existing hardened helper rather than a new one:
+`assertPublicLiteral` was extracted so resolved addresses face the same rule the literal path uses. And
+one measurement note — unlike the earlier items, these tests cannot be run against the pre-fix code to
+show them failing. The file does not compile without the new exports. That is expected for new API
+surface, but it means the usual "N of M fail pre-fix" evidence is unavailable here, and claiming it
+would have been false.
+
 Current posture:
 - JWT auth with PBKDF2-SHA256 password hashing (Web Crypto), random per-instance secret unless configured explicitly; long-lived API keys as an alternative (SHA-256 hash only, raw key shown once)
 - AES-256-GCM encryption (database-level and field-level) with random per-installation PBKDF2 salts
 - Workflow credential-vault master key: random per-instance unless `opts.secret` is configured explicitly, via `createApp()` or `WorkflowEngine` directly (no hardcoded fallback either way)
 - Timing-safe password comparison (byte-level XOR)
 - Credential vault with encrypted storage, random per-installation PBKDF2 salt
-- SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions **and by the bundled plugins** (`webhooks`, `automations` — raw `fetch` until 2026-08-04, see item 32), covering IPv4 and IPv6 (including IPv4-mapped/compatible forms and unique-local `fc00::/7`), plus a real, enforced HTTP header for webhook secrets. Redirects are covered for callers using `safeFetch` (every workflow-driven outbound call), with credential headers dropped on cross-origin hops; DNS resolution is still NOT covered — see the open item at the end of Known Security Gaps
+- SSRF guard (`net-guard.js`) on outbound fetches driven by workflow/trigger definitions **and by the bundled plugins** (`webhooks`, `automations` — raw `fetch` until 2026-08-04, see item 32), covering IPv4 and IPv6 (including IPv4-mapped/compatible forms and unique-local `fc00::/7`), plus a real, enforced HTTP header for webhook secrets. Redirects are covered for callers using `safeFetch` (every workflow-driven outbound call), with credential headers dropped on cross-origin hops. DNS resolution IS checked since 2026-08-04 (item 37): a hostname resolving to any internal address is refused, on the initial URL and every redirect hop. **DNS rebinding remains uncovered** — see the open item at the end of Known Security Gaps
 - RBAC: 4 roles (CMS, with `:own`-scope enforcement genuinely wired through the entry routes) + 4 agent profiles (Shell, fail-closed default, `profile` alone now actually restricts)
 - Collection names validated at the `DocStore.collection()` chokepoint (positive allowlist), so no caller can turn one into a path traversal; internal (`_`-prefixed) collections unreachable from both untrusted surfaces (`/api/db/:col` and the `data.table` node) via one shared check
 - Prototype-chain segments (`__proto__`/`constructor`/`prototype`) refused on every user-influenced path write/read: `db.js` dot-paths, `workflow.js` `{{ref}}`s, `shell.js` projections, `a2e.js` `outputPath`/`StoreData` keys
@@ -3093,7 +3123,7 @@ Current posture:
 - Public registration cannot self-assign an elevated role (always `viewer`; promotion is an existing-admin action)
 - Workflow read/run/toggle/execution-history gated by project membership when the workflow belongs to a project (unassigned workflows unaffected)
 
-## Known Security Gaps (items 1-36 resolved; open items listed at the end)
+## Known Security Gaps (items 1-37 resolved; open items listed at the end)
 
 Items 1-5 found across two rounds of independent, no-prior-context audits (fresh GLM instances given only
 the repo + this file, no knowledge of any work done in the session that built the features around them —
@@ -3706,7 +3736,43 @@ to expose" are different questions, and a clean audit of the former says nothing
    the hardened one is not mechanical; it inherits the original's failure behaviour, and that has to be
    checked at the call site.
 
-Items 1-4 and 6-36 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
+37. **RESOLVED (2026-08-04), HIGH — partially, and the remainder is disclosed below.** `net-guard`
+   performed no DNS resolution at all, so a public-looking HOSTNAME whose A record pointed at
+   `127.0.0.1` or `169.254.169.254` passed every check the module made. This was the module's own
+   original scope note, carried openly through two later rounds of guard fixes (items 12 and 18)
+   without being attempted. New `assertPublicDns` resolves a hostname and refuses it if **any** address
+   it resolves to is internal — every address, not the first, since a name answering with one public
+   and one private address is exactly how a first-hit check gets slipped past. Verified live against
+   real resolution: `safeFetch('http://localtest.me/')`, a genuine public hostname that resolves to
+   loopback, is blocked with `resolves to ::1`, and public names still pass.
+   **What it does NOT close: DNS rebinding** — see the open item at the end of this section. That is a
+   limit of the architecture, not an omission.
+   Three decisions inside the fix worth knowing:
+   (a) The check lands in `safeFetch`, not `assertPublicUrl`. The latter is synchronous and has callers
+   that only validate a URL without ever making a request (`triggers.js` at registration time); making
+   it async would change all of their signatures. `safeFetch` is the single point real outbound traffic
+   funnels through, so one call covers every caller, for the initial URL and each redirect hop alike.
+   (b) `assertPublicLiteral` was extracted from `assertPublicUrl` so resolved addresses face the exact
+   same rule — writing a second "is this address internal" for the DNS path is precisely the mistake
+   items 31-36 fixed four times over.
+   (c) On a runtime with no `node:dns` the check is **skipped**, a deliberate fail-open on this check
+   alone: failing closed would make `net-guard` block every outbound request on Cloudflare Workers,
+   turning a hardening step into an outage on a supported platform. IP-literal checks still apply
+   everywhere. A name that does not resolve also passes through, so `fetch` reports its own error rather
+   than the guard masking it as an SSRF block and sending someone hunting a problem that isn't there.
+   13 new tests, driven by an injected resolver through an exported seam so the suite depends on no
+   network, no third-party name continuing to resolve as it does today, and works offline.
+   **A cost this carries, found only by running the full suite after the fix shipped:** resolve-then-
+   fetch inherently resolves TWICE, since there is no portable way to hand `fetch` an already-resolved
+   address. The OS resolver caches (~1ms steady state), but the first call to any host pays a real
+   round-trip — ~800ms measured against a cold resolver for a name that does not exist. That was not
+   hypothetical: it immediately made `examples-trigger-hub` and `examples-poll-to-queue` flaky (1 fail /
+   0 fail / 1 fail across three runs), because their syntactically-public placeholder host was suddenly
+   being resolved for real on every poll. Both now inject a resolver. No app-level cache was added on
+   purpose: caching a security check's result means a stale answer can allow a destination that current
+   DNS would refuse, and the OS resolver already provides the cheap win.
+
+Items 1-4 and 6-37 verified: 2 full-suite runs + 20 isolated runs of the affected test files each, all
 clean. Also verified live over real spawned servers/instances, each reproducing the exact exploit (or
 lockout scenario) before the fix and confirming it's blocked after. Item 5 verified separately as
 described above (its own test file).
@@ -3724,11 +3790,17 @@ looks missing. A one-sided guard is harder to spot than an absent one — review
 the value can be, not whether a check exists. When a parameter has a natural range, constrain BOTH ends
 or state in a comment why one is unbounded.
 
-**Still open, disclosed rather than quietly carried:** `net-guard` performs no DNS resolution, so a
-public-looking HOSTNAME that resolves to a private IP is still not caught — the module's original scope
-note called this out and it remains true. Items 12 and 18 closed the two holes that were NOT disclaimed
-(IPv6 literal parsing, and redirect following); DNS-based blocking is a genuinely different piece of work
-and has not been attempted.
+**Still open, disclosed rather than quietly carried:** `net-guard` resolves hostnames as of item 37, so
+a public-looking name pointing at a private IP is now refused — but **DNS rebinding is not covered and
+cannot be with this architecture**. The guard resolves a name, checks every address it gets, and then
+hands the NAME to `fetch`, which resolves independently; an attacker serving a 0-TTL record that answers
+public on the first lookup and private on the second still wins. Closing it requires connecting to the
+verified IP with a `Host` header and a TLS SNI override, which is not reachable portably with zero
+dependencies across Bun, Deno and Node — so this is a limit of the design, not a task someone forgot.
+Separately, on a runtime with no `node:dns` (Cloudflare Workers) the DNS check is skipped entirely and
+only the IP-literal checks apply; that fail-open is deliberate and explained in `assertPublicDns`.
+Items 12, 18 and 37 closed the three holes that were reachable this way (IPv6 literal parsing, redirect
+following, and hostname resolution).
 
 **Other audit findings confirmed but not yet fixed** — recorded here rather than dropped, since a finding
 that is real and unlisted is worse than one that is real and known:

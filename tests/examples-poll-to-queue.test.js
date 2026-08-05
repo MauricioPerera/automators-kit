@@ -13,6 +13,7 @@ import { JobQueue } from '../core/queue.js';
 import { buildMockFeedApi } from '../examples/poll-to-queue/mock-feed-api.js';
 import { buildIncidentHandlers } from '../examples/poll-to-queue/handlers.js';
 import { buildPollToQueue, registerPollTrigger, POLL_TARGET_URL } from '../examples/poll-to-queue/hub.js';
+import { _setDnsModuleForTests } from '../core/net-guard.js';
 
 let server, baseUrl, queue, processed, failNextFor, tm, realFetch;
 
@@ -44,6 +45,16 @@ beforeAll(async () => {
   queue.register('process-incident', handlerSet.handlers['process-incident']);
   queue.start();
 
+  // net-guard resolves hostnames since 2026-08-04, so this placeholder host
+  // would otherwise trigger a REAL DNS lookup on every poll -- ~800ms on a
+  // cold resolver, which made this test's timing assertions flaky. Inject a
+  // resolver that answers with a public address, matching the placeholder's
+  // intent (a syntactically-public host) and keeping the test offline and
+  // deterministic. Restored in afterAll.
+  _setDnsModuleForTests({
+    lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+  });
+
   realFetch = globalThis.fetch;
   globalThis.fetch = (input, opts) => {
     const url = typeof input === 'string' ? input : input?.url;
@@ -72,6 +83,7 @@ afterAll(() => {
   queue.stop();
   server.stop(true);
   globalThis.fetch = realFetch;
+  _setDnsModuleForTests(undefined);
 });
 
 describe('Poll to queue: baseline seeding', () => {

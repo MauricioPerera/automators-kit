@@ -16,6 +16,7 @@ import { Shell } from '../core/shell.js';
 import { shellRoutes } from '../routes/shell.js';
 import { buildMockStatusApi } from '../examples/trigger-hub/mock-status-api.js';
 import { buildTriggerHub, registerDemoTriggers, POLL_TARGET_URL } from '../examples/trigger-hub/hub.js';
+import { _setDnsModuleForTests } from '../core/net-guard.js';
 
 let server, baseUrl, tm, events, bumpVersion, failNextCalls, realFetch;
 
@@ -75,6 +76,16 @@ beforeAll(() => {
   // syntactically-public placeholder (assertPublicUrl has no opt-out for
   // poll triggers, unlike connector.js's blockInternalHosts), redirected
   // here to this test server's own local mock.
+  // net-guard resolves hostnames since 2026-08-04, so this placeholder host
+  // would otherwise trigger a REAL DNS lookup on every poll -- ~800ms on a
+  // cold resolver, which made this test's timing assertions flaky. Inject a
+  // resolver that answers with a public address, matching the placeholder's
+  // intent (a syntactically-public host) and keeping the test offline and
+  // deterministic. Restored in afterAll.
+  _setDnsModuleForTests({
+    lookup: async () => [{ address: '93.184.216.34', family: 4 }],
+  });
+
   realFetch = globalThis.fetch;
   globalThis.fetch = (input, opts) => {
     const url = typeof input === 'string' ? input : input?.url;
@@ -87,6 +98,7 @@ afterAll(() => {
   tm.stop();
   server.stop(true);
   globalThis.fetch = realFetch;
+  _setDnsModuleForTests(undefined);
 });
 
 describe('Trigger hub: registration', () => {

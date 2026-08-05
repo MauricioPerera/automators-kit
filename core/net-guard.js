@@ -242,7 +242,20 @@ export function _setDnsModuleForTests(mod) {
  *    What this DOES close is the far more common case: a hostname that simply
  *    resolves to a private address.
  *
- * 2. **On a runtime with no `node:dns`, the check is skipped**, and behaviour
+ * 2. **This adds a DNS lookup that `fetch` then immediately repeats.** Resolve-
+ *    then-fetch inherently resolves twice; there is no portable way to hand
+ *    `fetch` an already-resolved address. The OS resolver caches, so the
+ *    steady-state cost measured here is ~1ms, but the FIRST call to any host
+ *    pays a full round-trip — ~800ms was observed against a cold resolver for
+ *    a name that does not exist. That is not hypothetical: it made two
+ *    poll-trigger example tests flaky the moment this shipped, because their
+ *    placeholder host was being resolved for real on every poll. Those tests
+ *    now inject a resolver through `_setDnsModuleForTests`. No app-level cache
+ *    is added on purpose — caching the result of a security check means a
+ *    stale answer can allow a destination the current DNS would refuse, and
+ *    the OS resolver already provides the cheap win.
+ *
+ * 3. **On a runtime with no `node:dns`, the check is skipped**, and behaviour
  *    is exactly what it was before this function existed. That is a
  *    deliberate fail-open on THIS check alone: failing closed would mean
  *    `net-guard` blocks every outbound request on Cloudflare Workers, turning
