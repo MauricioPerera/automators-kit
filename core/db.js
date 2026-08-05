@@ -68,6 +68,14 @@ function _validateRegexPattern(src) {
  * adding a `case` without adding it here fails loudly on first use rather
  * than silently matching everything (see the comment at the dispatch site).
  */
+// Field name `$elemMatch` parks an array element under when its target is an
+// operator expression, so the element can be run back through matchFilter's
+// own operator switch instead of a duplicate of it. Any name works — both
+// sides of the comparison are constructed here — but it must contain no dot
+// (which would be read as a nested path) and must not be one of the segments
+// `_checkPathSegment` refuses.
+const ELEM_MATCH_FIELD = 'elem';
+
 const KNOWN_QUERY_OPERATORS = new Set([
   '$eq', '$ne', '$gt', '$gte', '$lt', '$lte', '$in', '$nin', '$exists',
   '$regex', '$options', '$between', '$contains', '$containsAny',
@@ -208,7 +216,39 @@ function matchFilter(doc, filter) {
         }
         case '$elemMatch': {
           if (!Array.isArray(val)) return false;
-          if (!val.some(elem => matchFilter(typeof elem === 'object' && elem !== null ? elem : { '': elem }, target))) return false;
+          // Two target shapes, matching MongoDB's own split:
+          //
+          //  - An OPERATOR EXPRESSION (`{ $gt: 0 }`) applies the operators to
+          //    each element directly. This did not work before 2026-08-04:
+          //    every element was wrapped as `{ '': elem }` and the target was
+          //    then read as a document query, so `$gt` was looked up as a
+          //    FIELD NAME on the wrapper, resolved to undefined, and the match
+          //    failed. `{ x: [1] }` did not match `{ x: { $elemMatch: { $gt: 0 } } }`
+          //    even though it plainly should. Recorded as a known limitation
+          //    at the time (verified pre-existing, not caused by the operator
+          //    allowlist) and closed here.
+          //
+          //  - A DOCUMENT QUERY (`{ price: { $gt: 100 } }`) recurses into each
+          //    element, unchanged from before, wrapper and all — a primitive
+          //    element still cannot satisfy a field query, which is correct.
+          //
+          // The operator branch deliberately re-enters matchFilter with the
+          // element under a real field key rather than evaluating operators
+          // here: the switch above IS the operator semantics, and a second
+          // copy of it would drift from this one (see the plugin items).
+          // A mixed target (`{ price: 1, $gt: 5 }`) is not an operator
+          // expression by this test and falls to the document-query branch,
+          // where the `$gt` key simply finds no such field — MongoDB rejects
+          // mixing outright, and neither shape silently matches everything.
+          const keys = target && typeof target === 'object' && !Array.isArray(target)
+            ? Object.keys(target) : [];
+          const isOperatorTarget = keys.length > 0 && keys.every(k => k.startsWith('$'));
+
+          if (isOperatorTarget) {
+            if (!val.some(elem => matchFilter({ [ELEM_MATCH_FIELD]: elem }, { [ELEM_MATCH_FIELD]: target }))) return false;
+          } else if (!val.some(elem => matchFilter(typeof elem === 'object' && elem !== null ? elem : { '': elem }, target))) {
+            return false;
+          }
           break;
         }
         default: break;

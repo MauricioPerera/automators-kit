@@ -285,14 +285,57 @@ describe('Query operators: unknown operators are rejected, not satisfied', () =>
     expect(matchFilter({ x: [{ a: 1 }] }, { x: { $elemMatch: { a: 1 } } })).toBe(true);
   });
 
-  it('documents a PRE-EXISTING $elemMatch limitation (not introduced by the operator allowlist)', () => {
-    // `$elemMatch` over an array of PRIMITIVES with an operator target does
-    // not match: the handler wraps each primitive as `{ '': elem }`, so the
-    // target's `$gt` key is looked up as a FIELD on that wrapper and resolves
-    // to undefined. Verified against the pre-change code — this returned
-    // false there too, so it is a separate long-standing gap, recorded here
-    // rather than silently asserted away. Object elements work fine (above).
-    expect(matchFilter({ x: [1] }, { x: { $elemMatch: { $gt: 0 } } })).toBe(false);
+  // This block replaces a test that DOCUMENTED the limitation below as
+  // unfixed (recorded 2026-08-03 after verifying it was pre-existing rather
+  // than caused by the operator allowlist). Closed 2026-08-04: every element
+  // used to be wrapped as `{ '': elem }` and the target read as a document
+  // query, so `$gt` was looked up as a FIELD on the wrapper, resolved to
+  // undefined, and the match failed.
+  describe('$elemMatch with an operator-expression target', () => {
+    it('matches an array of primitives against a comparison operator', () => {
+      expect(matchFilter({ x: [1] }, { x: { $elemMatch: { $gt: 0 } } })).toBe(true);
+      expect(matchFilter({ x: [1, 2, 3] }, { x: { $elemMatch: { $gt: 2 } } })).toBe(true);
+      expect(matchFilter({ x: [1, 2, 3] }, { x: { $elemMatch: { $gt: 5 } } })).toBe(false);
+    });
+
+    it('supports the other operators through the same switch, not a copy', () => {
+      expect(matchFilter({ x: [1, 2] }, { x: { $elemMatch: { $in: [2] } } })).toBe(true);
+      expect(matchFilter({ x: ['foo'] }, { x: { $elemMatch: { $regex: '^f' } } })).toBe(true);
+      expect(matchFilter({ x: ['foo'] }, { x: { $elemMatch: { $regex: '^z' } } })).toBe(false);
+      expect(matchFilter({ x: [5] }, { x: { $elemMatch: { $between: [1, 10] } } })).toBe(true);
+    });
+
+    it('still refuses an unknown operator inside the target', () => {
+      expect(() => matchFilter({ x: [1] }, { x: { $elemMatch: { $nope: 1 } } })).toThrow(/Unknown query operator/);
+    });
+
+    // The document-query shape is unchanged.
+    it('leaves object-element document queries working exactly as before', () => {
+      const doc = { items: [{ price: 150 }, { price: 50 }] };
+      expect(matchFilter(doc, { items: { $elemMatch: { price: { $gt: 100 } } } })).toBe(true);
+      expect(matchFilter(doc, { items: { $elemMatch: { price: { $gt: 200 } } } })).toBe(false);
+      expect(matchFilter(doc, { items: { $elemMatch: { price: 150 } } })).toBe(true);
+    });
+
+    it('does not let a primitive element satisfy a field query', () => {
+      expect(matchFilter({ x: [1] }, { x: { $elemMatch: { price: 1 } } })).toBe(false);
+    });
+
+    // MongoDB rejects mixing the two shapes. This treats a mixed target as a
+    // document query, where the `$`-key finds no such field — the point being
+    // that neither reading silently matches everything.
+    it('does not treat a mixed target as match-everything', () => {
+      expect(matchFilter({ x: [{ price: 150 }] }, { x: { $elemMatch: { price: 150, $gt: 5 } } })).toBe(false);
+    });
+
+    it('still requires the field to be an array', () => {
+      expect(matchFilter({ x: 5 }, { x: { $elemMatch: { $gt: 0 } } })).toBe(false);
+      expect(matchFilter({ x: null }, { x: { $elemMatch: { $gt: 0 } } })).toBe(false);
+    });
+
+    it('does not match on an empty target', () => {
+      expect(matchFilter({ x: [1] }, { x: { $elemMatch: {} } })).toBe(true);
+    });
   });
 });
 
