@@ -7,6 +7,7 @@ import {
   WorkflowExecutor, AuditMiddleware, CacheMiddleware,
   getPath, setPath, resolvePath, buildDAG, evalCondition,
 } from '../core/a2e.js';
+import { _setDnsModuleForTests } from '../core/net-guard.js';
 
 // ---------------------------------------------------------------------------
 // Data model helpers
@@ -802,11 +803,13 @@ describe('Recursion depth guard', () => {
 // Helper: install a fetch spy that records calls and returns a synthetic
 // response. Returns { calls, restore }. If the guard works, calls stays empty
 // for the blocked-destination tests.
-function installFetchSpy() {
+function installFetchSpy(respond) {
   const calls = [];
   const original = globalThis.fetch;
+  _setDnsModuleForTests({ lookup: async () => [{ address: '93.184.216.34', family: 4 }] });
   globalThis.fetch = function spy(url, opts) {
     calls.push({ url: String(url), opts });
+    if (respond) return Promise.resolve(respond(String(url), opts, calls.length));
     return Promise.resolve({
       ok: true,
       status: 200,
@@ -817,7 +820,10 @@ function installFetchSpy() {
   };
   return {
     calls,
-    restore: () => { globalThis.fetch = original; },
+    restore: () => {
+      globalThis.fetch = original;
+      _setDnsModuleForTests(undefined);
+    },
   };
 }
 
@@ -865,11 +871,26 @@ describe('SSRF guard: ApiCall', () => {
 describe('SSRF guard: ExecuteN8nWorkflow', () => {
   // Ensure a deterministic env for the API-key source across these tests.
   const prevKey = process.env.N8N_API_KEY;
-  beforeEach(() => { delete process.env.N8N_API_KEY; });
+  const prevUrl = process.env.N8N_URL;
+  beforeEach(() => {
+    delete process.env.N8N_API_KEY;
+    delete process.env.N8N_URL;
+  });
   afterEach(() => {
     if (prevKey === undefined) delete process.env.N8N_API_KEY;
     else process.env.N8N_API_KEY = prevKey;
+    if (prevUrl === undefined) delete process.env.N8N_URL;
+    else process.env.N8N_URL = prevUrl;
   });
+
+  const executeN8n = async (config = {}) => {
+    const ex = new WorkflowExecutor();
+    ex.load({
+      operations: [{ id: 'wf', op: 'ExecuteN8nWorkflow', workflowId: '123', ...config }],
+      execute: 'wf',
+    });
+    return ex.execute();
+  };
 
   it('rejects an internal n8nUrl (169.254.169.254) without fetching', async () => {
     const spy = installFetchSpy();
@@ -929,14 +950,17 @@ describe('SSRF guard: ExecuteN8nWorkflow', () => {
       expect(spy.calls.length).toBe(1);
       const sentHeaders = spy.calls[0].opts.headers;
       expect(sentHeaders['X-N8N-API-KEY']).not.toBe('LEAKED-KEY');
-      expect(sentHeaders['X-N8N-API-KEY']).toBe('');
+      expect(sentHeaders['X-N8N-API-KEY']).toBeUndefined();
     } finally {
       spy.restore();
     }
   });
 
-  it('uses N8N_API_KEY from env for a public n8nUrl', async () => {
-    process.env.N8N_API_KEY = 'env-secret';
+  // Previously this test required the server key to be sent to an arbitrary
+  // public n8nUrl WITHOUT N8N_URL, which encoded the credential disclosure.
+  it('uses N8N_API_KEY only for the origin authorized by server N8N_URL', async () => {
+    process.env.N8N_API_KEY = 'fake-server-key';
+    process.env.N8N_URL = 'https://n8n.example.com';
     const spy = installFetchSpy();
     try {
       const ex = new WorkflowExecutor();
@@ -948,10 +972,152 @@ describe('SSRF guard: ExecuteN8nWorkflow', () => {
       });
       await ex.execute();
       expect(spy.calls.length).toBe(1);
-      expect(spy.calls[0].opts.headers['X-N8N-API-KEY']).toBe('env-secret');
+      expect(spy.calls[0].opts.headers['X-N8N-API-KEY']).toBe('fake-server-key');
     } finally {
       spy.restore();
     }
+  });
+
+  for (const [trusted, destination] of [
+    ['https://n8n.example.test/base', undefined],
+    ['https://N8N.example.test:443', 'https://n8n.example.test/other-base'],
+    ['http://n8n.example.test:80', 'http://N8N.example.test'],
+    ['https://n8n.example.test:8443', 'https://n8n.example.test:8443/path'],
+  ]) {
+    it(`keeps the key for the same normalized origin: ${trusted} -> ${destination ?? 'server default'}`, async () => {
+      process.env.N8N_URL = trusted;
+      process.env.N8N_API_KEY = 'fake-server-key';
+      const spy = installFetchSpy();
+      try {
+        const result = await executeN8n({ n8nUrl: destination, payload: { a: 1 }, n8nApiKey: 'fake-caller-key' });
+        expect(result.errors.wf).toBeUndefined();
+        expect(spy.calls).toHaveLength(1);
+        expect(new URL(spy.calls[0].url).origin).toBe(new URL(trusted).origin);
+        expect(spy.calls[0].opts.headers['X-N8N-API-KEY']).toBe('fake-server-key');
+        expect(spy.calls[0].opts.method).toBe('POST');
+        expect(JSON.parse(spy.calls[0].opts.body)).toEqual({ data: { a: 1 } });
+      } finally { spy.restore(); }
+    });
+  }
+
+  for (const destination of [
+    'https://other.example.test',
+    'https://child.n8n.example.test',
+    'https://n8n.example.test.attacker.test',
+    'https://n8n.example.test:8443',
+    'http://n8n.example.test',
+  ]) {
+    it(`allows a public caller destination without the server key: ${destination}`, async () => {
+      process.env.N8N_URL = 'https://n8n.example.test';
+      process.env.N8N_API_KEY = 'fake-server-key';
+      const spy = installFetchSpy();
+      try {
+        const result = await executeN8n({ n8nUrl: destination });
+        expect(result.errors.wf).toBeUndefined();
+        expect(spy.calls).toHaveLength(1);
+        expect(spy.calls[0].opts.headers['X-N8N-API-KEY']).toBeUndefined();
+      } finally { spy.restore(); }
+    });
+  }
+
+  for (const trusted of [undefined, '', '/relative', 'not a URL', 'ftp://n8n.example.test']) {
+    it(`omits the server key when server N8N_URL is missing or invalid: ${trusted}`, async () => {
+      if (trusted !== undefined) process.env.N8N_URL = trusted;
+      process.env.N8N_API_KEY = 'fake-server-key';
+      const spy = installFetchSpy();
+      try {
+        const result = await executeN8n({ n8nUrl: 'https://n8n.example.test' });
+        expect(result.errors.wf).toBeUndefined();
+        expect(spy.calls).toHaveLength(1);
+        expect(spy.calls[0].opts.headers['X-N8N-API-KEY']).toBeUndefined();
+      } finally { spy.restore(); }
+    });
+  }
+
+  it('allows the server destination without a configured API key', async () => {
+    process.env.N8N_URL = 'https://n8n.example.test';
+    const spy = installFetchSpy();
+    try {
+      const result = await executeN8n();
+      expect(result.errors.wf).toBeUndefined();
+      expect(spy.calls).toHaveLength(1);
+      expect(spy.calls[0].opts.headers['X-N8N-API-KEY']).toBeUndefined();
+    } finally { spy.restore(); }
+  });
+
+  it('does not authorize a default HTTPS port against a different server port', async () => {
+    process.env.N8N_URL = 'https://n8n.example.test:8443';
+    process.env.N8N_API_KEY = 'fake-server-key';
+    const spy = installFetchSpy();
+    try {
+      const result = await executeN8n({ n8nUrl: 'https://n8n.example.test:443' });
+      expect(result.errors.wf).toBeUndefined();
+      expect(spy.calls[0].opts.headers['X-N8N-API-KEY']).toBeUndefined();
+    } finally { spy.restore(); }
+  });
+
+  for (const status of [301, 302, 303, 307, 308]) {
+    for (const target of [
+      'https://other.example.test/next',
+      'https://n8n.example.test:8443/next',
+      'http://n8n.example.test/next',
+      '/next',
+    ]) {
+      it(`binds the key to its origin across a ${status} redirect to ${target}`, async () => {
+        process.env.N8N_URL = 'https://n8n.example.test';
+        process.env.N8N_API_KEY = 'fake-server-key';
+        const spy = installFetchSpy((_url, _opts, call) => call === 1
+          ? new Response(null, { status, headers: { Location: target } })
+          : Response.json({ ok: true }));
+        try {
+          const result = await executeN8n();
+          expect(result.errors.wf).toBeUndefined();
+          expect(spy.calls).toHaveLength(2);
+          expect(spy.calls[0].opts.headers['X-N8N-API-KEY']).toBe('fake-server-key');
+          expect(spy.calls[1].opts.headers['X-N8N-API-KEY']).toBe(target === '/next' ? 'fake-server-key' : undefined);
+          expect(spy.calls.every(call => call.opts.redirect === 'manual')).toBe(true);
+          expect(spy.calls[1].opts.method).toBe(status === 307 || status === 308 ? 'POST' : 'GET');
+        } finally { spy.restore(); }
+      });
+    }
+  }
+
+  it('does not reattach the key after redirecting away and back to the trusted origin', async () => {
+    process.env.N8N_URL = 'https://n8n.example.test';
+    process.env.N8N_API_KEY = 'fake-server-key';
+    const spy = installFetchSpy((_url, _opts, call) => call < 3
+      ? new Response(null, { status: 307, headers: { Location: call === 1 ? 'https://other.example.test/next' : 'https://n8n.example.test/back' } })
+      : Response.json({ ok: true }));
+    try {
+      const result = await executeN8n();
+      expect(result.errors.wf).toBeUndefined();
+      expect(spy.calls).toHaveLength(3);
+      expect(spy.calls[1].opts.headers['X-N8N-API-KEY']).toBeUndefined();
+      expect(spy.calls[2].opts.headers['X-N8N-API-KEY']).toBeUndefined();
+    } finally { spy.restore(); }
+  });
+
+  it('still refuses an internal redirect without issuing the second fetch', async () => {
+    process.env.N8N_URL = 'https://n8n.example.test';
+    process.env.N8N_API_KEY = 'fake-server-key';
+    const spy = installFetchSpy(() => new Response(null, { status: 307, headers: { Location: 'http://169.254.169.254/' } }));
+    try {
+      const result = await executeN8n();
+      expect(result.errors.wf).toContain('net-guard');
+      expect(spy.calls).toHaveLength(1);
+    } finally { spy.restore(); }
+  });
+
+  it('still checks DNS for a trusted origin before sending its key', async () => {
+    process.env.N8N_URL = 'https://n8n.example.test';
+    process.env.N8N_API_KEY = 'fake-server-key';
+    const spy = installFetchSpy();
+    _setDnsModuleForTests({ lookup: async () => [{ address: '127.0.0.1', family: 4 }] });
+    try {
+      const result = await executeN8n();
+      expect(result.errors.wf).toContain('resolves to 127.0.0.1');
+      expect(spy.calls).toHaveLength(0);
+    } finally { spy.restore(); }
   });
 });
 

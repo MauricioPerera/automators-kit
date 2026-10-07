@@ -297,7 +297,7 @@ export async function assertPublicDns(host) {
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 // Dropped when a redirect crosses to a different origin, so a workflow's
 // credentials are never handed to a host the caller never named.
-const CREDENTIAL_HEADERS = ['authorization', 'cookie', 'proxy-authorization'];
+const CREDENTIAL_HEADERS = ['authorization', 'cookie', 'proxy-authorization', 'x-n8n-api-key'];
 
 /**
  * `fetch` with the SSRF guard applied to EVERY hop, not just the first.

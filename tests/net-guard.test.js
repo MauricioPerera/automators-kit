@@ -2,7 +2,7 @@
  * Tests: core/net-guard.js (SSRF guard)
  */
 
-import { describe, it, expect, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { assertPublicUrl, safeFetch, assertPublicDns, _setDnsModuleForTests } from '../core/net-guard.js';
 
 const blocks = (url) => expect(() => assertPublicUrl(url)).toThrow();
@@ -91,14 +91,20 @@ describe('safeFetch: the guard applies to every hop, not just the first', () => 
     seen = [];
     globalThis.fetch = async (url, init) => {
       const u = String(url);
-      seen.push({ url: u, method: init?.method ?? 'GET', auth: init?.headers?.Authorization ?? null, body: init?.body ?? null });
+      seen.push({ url: u, method: init?.method ?? 'GET', auth: init?.headers?.Authorization ?? null, body: init?.body ?? null, headers: { ...init?.headers } });
       const r = routes[u];
       if (r) return new Response(null, { status: r.status, headers: { Location: r.to } });
       return new Response('FINAL', { status: 200 });
     };
   };
 
-  afterEach(() => { globalThis.fetch = realFetch; });
+  beforeEach(() => {
+    _setDnsModuleForTests({ lookup: async () => [{ address: '93.184.216.34', family: 4 }] });
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    _setDnsModuleForTests(undefined);
+  });
 
   it('refuses a redirect from an allowed public host into loopback', async () => {
     stubRoutes({ 'https://evil.test/': { status: 302, to: 'http://127.0.0.1:9/' } });
@@ -137,6 +143,24 @@ describe('safeFetch: the guard applies to every hop, not just the first', () => 
     await safeFetch('https://same.test/', { headers: { Authorization: 'Bearer SECRET' } });
     expect(seen[1].auth).toBe('Bearer SECRET');
   });
+
+  for (const key of ['X-N8N-API-KEY', 'x-n8n-api-key', 'X-N8n-Api-Key']) {
+    it(`drops ${key} on a cross-origin hop without mutating the caller's headers`, async () => {
+      stubRoutes({ 'https://a.test/': { status: 307, to: 'https://other.test/x' } });
+      const headers = { [key]: 'fake-n8n-key', 'Content-Type': 'application/json' };
+      await safeFetch('https://a.test/', { headers });
+      expect(seen[0].headers[key]).toBe('fake-n8n-key');
+      expect(seen[1].headers[key]).toBeUndefined();
+      expect(seen[1].headers['Content-Type']).toBe('application/json');
+      expect(headers[key]).toBe('fake-n8n-key');
+    });
+
+    it(`keeps ${key} on a same-origin hop`, async () => {
+      stubRoutes({ 'https://a.test/': { status: 307, to: '/next' } });
+      await safeFetch('https://a.test/', { headers: { [key]: 'fake-n8n-key' } });
+      expect(seen[1].headers[key]).toBe('fake-n8n-key');
+    });
+  }
 
   it('rewrites method/body the way fetch itself would (303 -> GET, 307 preserves)', async () => {
     stubRoutes({ 'https://p.test/': { status: 303, to: 'https://p.test/done' } });
