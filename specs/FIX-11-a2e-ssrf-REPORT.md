@@ -253,3 +253,51 @@ como evidencia local.
 - Durante la preparación y validación local no se hizo publicación,
   deploy, rotación ni cambio de secretos o configuración de producción.
   La publicación posterior autorizada se limita a una PR borrador.
+
+## CI reproducible en la PR borrador (2026-10-07)
+
+El workflow `.github/workflows/test.yml` ejecuta la suite en eventos
+`pull_request` hacia `master` (incluidas PRs borrador) y `push` a
+`master`. Usa el runner estándar `ubuntu-24.04`, un timeout de 10 minutos,
+Bun `1.3.14` y actions fijadas por SHA. No instala dependencias: la suite
+predeterminada no necesita paquetes externos; los imports opcionales de
+Postgres solo se ejecutan con `POSTGRES_TEST_URL`.
+
+Se verificaron las versiones y sus fuentes oficiales:
+[checkout v6](https://github.com/actions/checkout/tree/d23441a48e516b6c34aea4fa41551a30e30af803),
+[setup-bun v2.2.0](https://github.com/oven-sh/setup-bun/tree/0c5077e51419868618aeaa5fe8019c62421857d6)
+y [Bun 1.3.14](https://github.com/oven-sh/bun/releases/tag/bun-v1.3.14).
+Los permisos del workflow se limitan a `contents: read`; checkout no
+persiste credenciales, setup-bun recibe token vacío y el cache está
+desactivado. No se usan secretos del repositorio, `pull_request_target`,
+servicios externos ni configuración de producción.
+
+El preload `.github/ci/offline-preload.js` conserva el comportamiento del
+runner de aislamiento local: elimina las variables N8N y Postgres sin
+leer sus valores, sustituye DNS por una IP pública ficticia y bloquea el
+fetch nativo fuera de loopback, incluidos redirects automáticos. Los
+tests conservan sus mocks específicos y las credenciales ficticias de las
+regresiones. Este aislamiento cubre DNS/fetch de la suite actual; **no es
+un sandbox de red del sistema operativo**, ni verifica que cada servidor
+de loopback sea propiedad de un test.
+
+No se cambiaron pruebas ni código de aplicación para introducir CI. Las
+cinco pruebas opcionales de integración Postgres conservan sus skips
+explícitos; no se añade un servicio ni credenciales reales.
+
+Validación local del comando exacto del workflow, con Bun 1.3.14:
+
+```text
+bun test --preload ./.github/ci/offline-preload.js tests/
+ 1503 pass
+ 5 skip
+ 0 fail
+ 3891 expect() calls
+Ran 1508 tests across 85 files. [51.26s]
+```
+
+La revisión independiente de CI no encontró defectos accionables ni
+bloqueantes. El resultado remoto y su SHA exacto se registran en la
+descripción de la PR después de verificar que el run llegue a estado
+terminal. No se modifican protecciones, permisos de repositorio ni
+controles de seguridad.
