@@ -274,21 +274,31 @@ async function handleApiCall(config, state) {
 }
 
 async function handleExecuteN8nWorkflow(config, state) {
-  const n8nUrl = config.n8nUrl || process.env.N8N_URL || 'http://localhost:5678';
-  // API key is taken ONLY from the environment / vault, never from the
-  // operation config. config.n8nUrl may be attacker-controlled; reading the
-  // key from config.* would let a leaked key be sent to an attacker host.
-  const apiKey = process.env.N8N_API_KEY || '';
+  const serverN8nUrl = process.env.N8N_URL;
+  const n8nUrl = config.n8nUrl || serverN8nUrl || 'http://localhost:5678';
   const payload = config.payload ? resolvePath(state, config.payload) : {};
 
   // SSRF guard: reject internal destinations before the fetch. NOTE: this also
   // blocks the historical default `http://localhost:5678`. Operators who run a
   // co-located n8n must now expose it via a public N8N_URL; see FIX-11 report.
-  assertPublicUrl(n8nUrl);
+  const requestUrl = `${n8nUrl}/api/v1/workflows/${config.workflowId}/run`;
+  const destination = assertPublicUrl(requestUrl);
 
-  const res = await safeFetch(`${n8nUrl}/api/v1/workflows/${config.workflowId}/run`, {
+  // Only server configuration authorizes an origin for the server's key.
+  // A caller-selected public URL still works without that credential. Missing
+  // or invalid N8N_URL authorizes no origin; never infer trust from config.*.
+  let trustedOrigin;
+  if (serverN8nUrl) {
+    try { trustedOrigin = assertPublicUrl(serverN8nUrl).origin; } catch { /* no trusted origin */ }
+  }
+  const headers = { 'Content-Type': 'application/json' };
+  if (destination.origin === trustedOrigin && process.env.N8N_API_KEY) {
+    headers['X-N8N-API-KEY'] = process.env.N8N_API_KEY;
+  }
+
+  const res = await safeFetch(requestUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-N8N-API-KEY': apiKey },
+    headers,
     body: JSON.stringify({ data: payload }),
   });
   return await res.json();

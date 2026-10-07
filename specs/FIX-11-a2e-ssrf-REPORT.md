@@ -1,5 +1,10 @@
 # FIX-11 — SSRF en `core/a2e.js` (`ApiCall` y `ExecuteN8nWorkflow`)
 
+> Seguimiento local 2026-10-07: el cambio (b) original no impedía filtrar la
+> clave del servidor. Se rectifica abajo y se documentan la corrección del
+> primer destino, los redirects y la evidencia nueva al final del informe.
+> El scope y los resultados originales siguientes son históricos.
+
 **Scope:** `core/a2e.js` y `tests/a2e.test.js` únicamente. No se tocó el guard de profundidad de recursión preexistente (`this.maxDepth` / `depth` en `_executeOp`), ni `core/nodes.js`, `core/triggers.js`, `core/net-guard.js`, `core/plugins.js`. Se importó y reusó `assertPublicUrl` de `core/net-guard.js` sin reimplementar lógica.
 
 ## Verificación del código real vs. evidencia de auditoría
@@ -34,7 +39,7 @@ por:
 ```js
 const apiKey = process.env.N8N_API_KEY || '';
 ```
-Así una key legítima (env/vault) no puede filtrarse a un host atacante que controle `config.n8nUrl`. El campo `config.n8nApiKey` deja de ser leído. (El reporte describía exactamente este patrón y existía en el código real, por lo que sí se aplicó la parte b.)
+El campo `config.n8nApiKey` deja de ser leído, pero **esto no impide filtrar la clave del servidor**: en el commit `727ac0e1857df07a9fd60952775cd1291a408051`, el primer request todavía adjunta `N8N_API_KEY` de env al `config.n8nUrl` elegido por el caller. La afirmación anterior de confidencialidad era incorrecta. Además, `safeFetch` no retiraba `X-N8N-API-KEY` en redirects entre orígenes. Ambos caminos requieren corrección; ver el seguimiento al final.
 
 ## Hallazgo 2 — SSRF en `ApiCall`
 
@@ -78,14 +83,14 @@ error: expect(received).toBeGreaterThan(expected)
 Expected: > 0
 Received: 0
 
-      at <anonymous> (D:\Repo\projecto\automators-kit\tests\memory.test.js:320:32)
+      at <anonymous> (<checkout>/tests/memory.test.js:320:32)
 (fail) Dream Cycle > dream heuristic merges duplicates [0.85ms]
 
 tests\plugins.test.js:
 [Hook] Error in err: boom
 [Plugins] Failed to load 'evil': Plugin path escapes plugins directory: ../../../../etc/passwd
 [Plugins] Loaded: fixture v1.2.3
-[Plugins] Failed to load 'evil2': Plugin path escapes plugins directory: C:\Users\ADMINI~1\AppData\Local\Temp\akit-plugins-outside-WssMvw\evil.js
+[Plugins] Failed to load 'evil2': Plugin path escapes plugins directory: <temp>/akit-plugins-outside-WssMvw/evil.js
 
  475 pass
  1 fail
@@ -94,3 +99,157 @@ Ran 476 tests across 20 files. [4.32s]
 ```
 
 **Resumen:** 475 pass, 1 fail. El único fail es `memory.test.js` ("dream heuristic merges duplicates", `duration_ms` = 0) — el fallo preexistente y conocido de timing flaky, no relacionado con este fix y excluido del baseline. **0 fallos nuevos** respecto al baseline. Los 7 tests nuevos de SSRF pasan (a2e.test.js solo: 39 pass, 0 fail).
+
+## Seguimiento local: clave del servidor vinculada al origen (2026-10-07)
+
+Base verificada: `master` en `727ac0e1857df07a9fd60952775cd1291a408051`.
+Rama de corrección: `fix/a2e-n8n-key-origin`, preparada en un clon aislado.
+Los cambios ajenos del checkout existente se conservaron.
+
+### Decisión y contrato de credenciales
+
+El único origen autorizado para recibir la clave del servidor es el de
+`N8N_URL` del **entorno del servidor**. `config.n8nUrl` sigue eligiendo un
+destino público, pero no crea confianza. Se valida y compara el origen del
+request completo, usando el parser URL y `assertPublicUrl` existentes:
+esquema, hostname normalizado y puerto efectivo. Los paths no son una
+frontera de confianza. Puertos predeterminados explícitos y cambios de
+mayúsculas del hostname equivalen al mismo origen; un subdominio, otro
+puerto o un cambio HTTP/HTTPS son orígenes distintos.
+
+| Configuración / destino | Resultado |
+| --- | --- |
+| `N8N_URL` público válido + clave, destino del mismo origen | POST con `X-N8N-API-KEY` del servidor |
+| Destino público de otro origen | POST sin esa cabecera |
+| Falta `N8N_URL`, es vacío o inválido, y caller da URL pública | POST sin esa cabecera, incluso si existe clave |
+| Falta clave, con destino público permitido | POST sin esa cabecera |
+| Falta URL de caller y servidor | El default localhost sigue bloqueado por el guard |
+| Destino interno, esquema no permitido o DNS interno | Error del guard antes del fetch de ese destino |
+| Redirect dentro del mismo origen | Conserva la cabecera y el comportamiento de método/body existente |
+| Redirect a otro origen | Retira la cabecera, sin volver a adjuntarla aunque la cadena regrese al origen inicial |
+
+Omitir la cabecera cuando no hay autorización conserva las solicitudes
+públicas sin clave ya permitidas. El servidor remoto puede rechazar una
+solicitud sin autenticar; no se inventa un fallback que envíe la clave.
+Un operador que configure explícitamente un origen HTTP puede autorizarlo,
+como antes; no se impone HTTPS a ese contrato. Una redirección HTTPS a HTTP
+cambia de origen y pierde la cabecera.
+
+### Archivos y alcance
+
+- `core/a2e.js`: vincula la clave a `N8N_URL` del servidor antes del primer
+  envío. Solo usa `N8N_API_KEY` del entorno; no incorpora credenciales de
+  `config.*` ni una integración con vault inexistente en este handler.
+- `core/net-guard.js`: añade `x-n8n-api-key` a la lista existente de
+  cabeceras retiradas en redirects entre orígenes, sin alterar el guard
+  DNS/SSRF ni el algoritmo de redirects. Este cambio de una línea amplía el
+  scope histórico de FIX-11 para cerrar el segundo camino pedido en este
+  seguimiento; protege también a otros callers de `safeFetch` que usen la
+  misma cabecera como objeto de headers.
+- `tests/a2e.test.js` y `tests/net-guard.test.js`: 45 casos nuevos; se
+  ajustan las expectativas antiguas de cabecera vacía y de envío de la
+  clave a cualquier URL pública sin `N8N_URL`. Esta última codificaba el
+  defecto, y ahora exige autorización del origen por el servidor.
+- Este informe rectifica la afirmación incorrecta del cambio (b).
+
+Las rutas públicas de A2E, la autenticación global, el guard de recursión,
+la resolución de payload y el formato de respuestas siguen sus contratos.
+La validación DNS y la validación por cada hop siguen pasando por
+`safeFetch`. No se añade dependencia ni configuración de producción.
+
+Se leyeron `AGENTS.md` y el spec/report de FIX-11. No existen
+`.agents/skills`, contratos `knowledge/contracts/` ni un validador
+determinista aplicable a FIX-11 en este pin. `AGENTS.md` conserva KDD como
+metodología externa para contratos específicos de otras integraciones.
+No se crearon ni adoptaron nuevas bases metodológicas ni contratos KDD.
+
+### Evidencia reproducible sin servicios externos
+
+Los tests pertinentes inyectan tanto `fetch` como DNS mediante
+`_setDnsModuleForTests`, y restauran ambos al terminar. Solo usan claves
+ficticias (`fake-server-key`, `fake-caller-key`, `fake-n8n-key`). Cubren
+primer origen distinto, puertos predeterminados y distintos, esquemas,
+hostname engañoso, configuración ausente/inválida, todos los redirects
+301/302/303/307/308, cadenas que salen y regresan, y bloqueo DNS/interno.
+Los tests del guard prueban casing de cabecera y que no se mutan los
+headers entregados por el caller.
+
+El runner local `../evidence/offline-preload.js` elimina las variables
+N8N y `POSTGRES_TEST_URL` antes de importar tests, sustituye también el
+import DNS lazy y bloquea fetch externo. El fetch nativo queda limitado
+a loopback, donde la suite crea sus propios servidores mock, y no sigue
+redirects automáticamente. No se leyó ni usó
+ninguna clave real, `.env` o dato de producción. No hubo requests a n8n,
+servicios externos de prueba ni Postgres real.
+
+Resultados reales (salidas completas preservadas como evidencia local;
+las rutas de máquina del log histórico se omitieron de este informe):
+
+```text
+Baseline, core y tests originales:
+bun test --preload ../evidence/offline-preload.js tests/
+ 1458 pass
+ 5 skip
+ 0 fail
+ 3689 expect() calls
+Ran 1463 tests across 85 files. [54.82s]
+
+Regresiones actualizadas contra el core original:
+bun test --preload ../evidence/offline-preload.js tests/a2e.test.js tests/net-guard.test.js
+ 119 pass
+ 32 fail
+ 381 expect() calls
+Ran 151 tests across 2 files. [1119.00ms]
+
+Mismas regresiones contra el core corregido:
+ 151 pass
+ 0 fail
+ 418 expect() calls
+Ran 151 tests across 2 files. [475.00ms]
+
+Pruebas pertinentes autónomas, sin preload (env N8N eliminada antes):
+bun test tests/a2e.test.js tests/net-guard.test.js
+ 151 pass
+ 0 fail
+ 418 expect() calls
+Ran 151 tests across 2 files. [461.00ms]
+
+Suite completa con la corrección:
+bun test --preload ../evidence/offline-preload.js tests/
+ 1503 pass
+ 5 skip
+ 0 fail
+ 3891 expect() calls
+Ran 1508 tests across 85 files. [51.81s]
+```
+
+Las cinco omisiones son las mismas pruebas de integraciones Postgres del
+baseline. El guard de profundidad preexistente pasa. `git diff --check`
+no reporta errores. No hay fallos nuevos en la suite offline.
+
+### Revisión independiente
+
+Un revisor separado inspeccionó el diff y contrastó los logs, sin editar
+archivos ni repetir la suite completa. Concluyó que no hay hallazgos
+bloqueantes ni defectos accionables. Ejecutó 12 checks adicionales con
+DNS/fetch simulados y clave ficticia: **12 pass, 0 fail**, cubriendo
+userinfo, query, fragment, hostname escapado, Unicode/punycode, IPv4
+hexadecimal, IPv6 expandida, trailing dot, backslash y configuración
+inválida/interna. Estos checks complementarios no se cuentan como casos
+de la suite de 1508 tests. El resultado textual de la revisión se preservó
+como evidencia local.
+
+### Límites
+
+- Se demuestra comportamiento local con mocks y regresiones, no un
+  despliegue vulnerable, una explotación ni una filtración real.
+- Se confía en que el operador controla `N8N_URL` y el origen autorizado.
+  La comparación no restringe paths ni workflow IDs dentro de ese origen,
+  ni cambia quién puede invocar la ruta pública A2E.
+- DNS rebinding y el fail-open de DNS en runtimes sin `node:dns` son
+  límites preexistentes de `net-guard` y no se resuelven aquí.
+- La suite completa se ejecutó con aislamiento de red, no contra servicios
+  vivos ni la integración opcional Postgres.
+- Durante la preparación y validación local no se hizo publicación,
+  deploy, rotación ni cambio de secretos o configuración de producción.
+  La publicación posterior autorizada se limita a una PR borrador.
